@@ -1,0 +1,53 @@
+# Rust build output (includes cargo-bundle's .app output)
+/target/
+**/*.rs.bk
+*.pdb
+
+# Profiling and coverage
+*.profraw
+*.profdata
+/lcov.info
+flamegraph.svg
+perf.data*
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# macOS packaging and debug symbols
+*.dSYM/
+*.dmg
+*.pkg
+
+# Code signing material
+*.p12
+*.cer
+*.mobileprovision
+*.provisionprofile
+
+# Local secrets and environment
+.env
+.env.*
+!.env.example
+
+# Editors
+.idea/
+.vscode/
+.zed/
+*.swp
+*~
+
+# Local reference material
+/ref/
+/dev/
+
+# Agent instructions and tooling, kept local
+/AGENTS.md
+/CLAUDE.md
+/.claude/
+/.codex/
+
+# Working notes, kept local
+/docs/
