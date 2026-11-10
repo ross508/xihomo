@@ -1,12 +1,14 @@
 use crate::api::{Connection, LogLine};
-use crate::backend::{Cmd, Handle, Phase, Snapshot};
+use crate::backend::{Area, Cmd, Handle, Phase, Snapshot};
 use crate::icons;
+use crate::settings::Theme;
 use crate::tray::phase_label;
 use gpui::prelude::*;
 use gpui::{
-    App, ClickEvent, Context, ElementId, FocusHandle, Hsla, KeyDownEvent, PathPromptOptions,
-    ScrollStrategy, SharedString, Stateful, UniformListScrollHandle, Window, WindowAppearance,
-    WindowHandle, actions, div, hsla, px, uniform_list,
+    App, ClickEvent, Context, ElementId, FocusHandle, Hsla, KeyDownEvent, MouseButton,
+    PathPromptOptions, Pixels, Point, ScrollStrategy, SharedString, Stateful,
+    UniformListScrollHandle, Window, WindowAppearance, WindowHandle, actions, anchored, deferred,
+    div, px, rgb, uniform_list,
 };
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -79,9 +81,18 @@ pub struct AppState {
     log_paused: bool,
     log_scroll: UniformListScrollHandle,
     pub focus: FocusHandle,
+    /// The core version whose right-click menu is open, and where.
+    version_menu: Option<(String, Point<Pixels>)>,
+    /// The palette of the last frame, so tests can see what was drawn.
+    #[cfg(test)]
+    palette: Option<Palette>,
 }
 
-#[derive(Clone, Copy)]
+/// Room for the transparent title bar's traffic lights, measured on macOS 27; GPUI 0.2.2 does not
+/// expose the real height.
+const TITLEBAR_HEIGHT: Pixels = px(32.);
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct Palette {
     bg: Hsla,
     panel: Hsla,
@@ -94,37 +105,41 @@ struct Palette {
     danger: Hsla,
 }
 
-fn palette(appearance: WindowAppearance) -> Palette {
-    let dark = matches!(
-        appearance,
-        WindowAppearance::Dark | WindowAppearance::VibrantDark
-    );
-    let gray = |l: f32| hsla(0., 0., l, 1.);
-    let accent = hsla(211. / 360., 1., if dark { 0.56 } else { 0.47 }, 1.);
-    let danger = hsla(2. / 360., 0.8, if dark { 0.66 } else { 0.44 }, 1.);
+/// Two fixed palettes after an OS X El Capitan-inspired light theme and a Vibrant Dark-inspired
+/// dark one. `Auto` follows the window's appearance.
+fn palette(theme: Theme, appearance: WindowAppearance) -> Palette {
+    let dark = match theme {
+        Theme::Light => false,
+        Theme::Dark => true,
+        Theme::Auto => matches!(
+            appearance,
+            WindowAppearance::Dark | WindowAppearance::VibrantDark
+        ),
+    };
+    let c = |hex: u32| rgb(hex).into();
     if dark {
         Palette {
-            bg: gray(0.14),
-            panel: gray(0.19),
-            hover: gray(0.25),
-            text: gray(0.93),
-            dim: gray(0.62),
-            border: gray(0.27),
-            accent,
-            on_accent: gray(1.),
-            danger,
+            bg: c(0x2B2B2B),
+            panel: c(0x424242),
+            hover: c(0x4B4B4B),
+            text: c(0xEEEEEE),
+            dim: c(0xB8B8B8),
+            border: c(0x4D4D4D),
+            accent: c(0x286AC7),
+            on_accent: c(0xFFFFFF),
+            danger: c(0xF08178),
         }
     } else {
         Palette {
-            bg: gray(0.96),
-            panel: gray(1.),
-            hover: gray(0.9),
-            text: gray(0.1),
-            dim: gray(0.42),
-            border: gray(0.84),
-            accent,
-            on_accent: gray(1.),
-            danger,
+            bg: c(0xECECEC),
+            panel: c(0xFFFFFF),
+            hover: c(0xF5F5F5),
+            text: c(0x222222),
+            dim: c(0x636363),
+            border: c(0xC2C2C2),
+            accent: c(0x0067D9),
+            on_accent: c(0xFFFFFF),
+            danger: c(0xB52F2B),
         }
     }
 }
@@ -209,6 +224,9 @@ impl AppState {
             log_paused: false,
             log_scroll: UniformListScrollHandle::new(),
             focus: cx.focus_handle(),
+            version_menu: None,
+            #[cfg(test)]
+            palette: None,
         }
     }
 
@@ -246,35 +264,16 @@ impl AppState {
         move |_, _, _| handle.send(make())
     }
 
-    fn render_banner(&self, p: Palette) -> Option<gpui::Div> {
-        let s = &self.snap;
-        let failed = match &s.phase {
-            Phase::Failed(message) => Some(message.clone()),
-            _ => None,
-        };
-        let error = s.error.clone().or(failed);
-        if error.is_none() && s.notice.is_none() {
-            return None;
-        }
-        let mut banner = div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .p_2()
-            .mb_2()
-            .rounded(px(6.))
-            .bg(p.panel)
-            .border_1();
-        banner = banner
-            .border_color(if error.is_some() { p.danger } else { p.border })
-            .text_size(px(12.));
-        if let Some(error) = error {
-            banner = banner.child(div().text_color(p.danger).child(error));
-        }
-        if let Some(notice) = s.notice.clone() {
-            banner = banner.child(div().text_color(p.text).child(notice));
-        }
-        Some(banner)
+    /// One small line next to the area it is about: red for errors, dim otherwise.
+    fn note(&self, area: Area, p: Palette) -> Option<gpui::Div> {
+        let message = self.snap.message(area)?;
+        Some(
+            div()
+                .mt_1()
+                .text_size(px(12.))
+                .text_color(if message.error { p.danger } else { p.dim })
+                .child(message.text.clone()),
+        )
     }
 
     fn render_control(&mut self, p: Palette, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -286,17 +285,34 @@ impl AppState {
             _ => ("Start", || Cmd::Start),
         };
         let proxy_on = s.proxy_on;
-        let status = format!(
-            "{} · {} · mixed {} · controller {}",
-            phase_label(&s.phase),
-            s.core_version.as_deref().unwrap_or("no core"),
-            s.mixed_port,
-            s.controller_port,
-        );
+        let (proxy_label, proxy_enabled) = match s.proxy_busy {
+            Some(true) => ("System Proxy: Turning On…", false),
+            Some(false) => ("System Proxy: Turning Off…", false),
+            None if proxy_on => ("System Proxy: On", true),
+            None => ("System Proxy: Off", running),
+        };
+        let (status, status_color) = match &s.phase {
+            Phase::Failed(reason) => (format!("Failed: {reason}"), p.danger),
+            phase => (
+                format!(
+                    "{} · {} · mixed {} · controller {}",
+                    phase_label(phase),
+                    s.core_version.as_deref().unwrap_or("no core"),
+                    s.mixed_port,
+                    s.controller_port,
+                ),
+                p.text,
+            ),
+        };
 
         let mut column = div().flex().flex_col();
         column = column
-            .child(div().text_size(px(13.)).text_color(p.text).child(status))
+            .child(
+                div()
+                    .text_size(px(13.))
+                    .text_color(status_color)
+                    .child(status),
+            )
             .child(
                 div()
                     .flex()
@@ -312,17 +328,15 @@ impl AppState {
                     ))
                     .child(button(
                         "proxy",
-                        if proxy_on {
-                            "System Proxy: On"
-                        } else {
-                            "System Proxy: Off"
-                        },
+                        proxy_label,
                         p,
                         proxy_on,
-                        running || proxy_on,
+                        proxy_enabled,
                         self.cmd(move || Cmd::SetProxy(!proxy_on)),
                     )),
-            );
+            )
+            .children(self.note(Area::Core, p))
+            .children(self.note(Area::Proxy, p));
 
         let mut profiles = div().flex().flex_wrap().gap_1();
         for profile in s.profiles.iter() {
@@ -351,7 +365,10 @@ impl AppState {
                     .child("No profiles. Link a YAML file in Settings."),
             );
         }
-        column = column.child(section("PROFILE", p)).child(profiles);
+        column = column
+            .child(section("PROFILE", p))
+            .child(profiles)
+            .children(self.note(Area::Profiles, p));
         if s.edited {
             column = column.child(
                 div()
@@ -642,7 +659,7 @@ impl AppState {
             .into_any_element()
     }
 
-    fn render_settings(&mut self, p: Palette) -> gpui::AnyElement {
+    fn render_settings(&mut self, p: Palette, cx: &mut Context<Self>) -> gpui::AnyElement {
         let s = self.snap.clone();
         let mut column = div()
             .flex()
@@ -662,6 +679,23 @@ impl AppState {
             ));
         }
         column = column.child(section("MENU BAR ICON", p)).child(sets);
+
+        let mut themes = div().flex().gap_1();
+        for (theme, label) in [
+            (Theme::Auto, "auto"),
+            (Theme::Light, "light"),
+            (Theme::Dark, "dark"),
+        ] {
+            themes = themes.child(button(
+                format!("theme-{label}"),
+                label,
+                p,
+                s.theme == theme,
+                true,
+                self.cmd(move || Cmd::SetTheme(theme)),
+            ));
+        }
+        column = column.child(section("APPEARANCE", p)).child(themes);
 
         column = column.child(section("PROFILES", p));
         for profile in s.profiles.iter() {
@@ -700,6 +734,7 @@ impl AppState {
                     )),
             );
         }
+        column = column.children(self.note(Area::Profiles, p));
         let handle = self.handle.clone();
         let link = move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
             let paths = cx.prompt_for_paths(PathPromptOptions {
@@ -726,6 +761,14 @@ impl AppState {
                 .mt_1()
                 .child(button("link", "Link YAML File…", p, false, true, link))
                 .child(button(
+                    "check-now",
+                    "Check Now",
+                    p,
+                    false,
+                    true,
+                    self.cmd(|| Cmd::CheckNow),
+                ))
+                .child(button(
                     "config-dir",
                     "Reveal Config Folder",
                     p,
@@ -735,18 +778,35 @@ impl AppState {
                 )),
         );
         column = column.child(
-            div().mt_1().text_color(p.dim).child("Overrides: overrides.yaml in the config folder. Ports and per-profile homes: settings.json (read at launch)."),
-        );
+            div().mt_1().text_color(p.dim).child("Overrides: overrides.yaml in the config folder. Ports: settings.yaml there, read at launch."),
+        ).children(self.note(Area::Files, p));
 
-        column = column.child(section("MIHOMO CORE", p)).child(format!(
-            "Using {}{}",
-            s.core_version.as_deref().unwrap_or("none"),
-            s.previous_version
-                .as_deref()
-                .map(|v| format!(" · rollback available: {v}"))
-                .unwrap_or_default(),
-        ));
+        // Click switches; right-click offers Delete.
         let busy = s.update_busy.is_some();
+        let mut versions = div().flex().flex_wrap().gap_1();
+        for version in &s.installed {
+            let (pick, menu) = (version.clone(), version.clone());
+            versions = versions.child(
+                button(
+                    format!("core-{version}"),
+                    version.clone(),
+                    p,
+                    s.core_version.as_deref() == Some(version),
+                    !busy,
+                    self.cmd(move || Cmd::ActivateVersion(pick.clone())),
+                )
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                        this.version_menu = Some((menu.clone(), event.position));
+                        cx.notify();
+                    }),
+                ),
+            );
+        }
+        if s.installed.is_empty() {
+            versions = versions.child(div().text_color(p.dim).child("No core installed"));
+        }
         let mut actions = div().flex().flex_wrap().gap_1().mt_1();
         actions = actions.child(button(
             "check",
@@ -756,48 +816,26 @@ impl AppState {
             !busy,
             self.cmd(|| Cmd::CheckUpdate),
         ));
-        if let Some(latest) = &s.latest {
-            let version = latest.version.clone();
-            if !s.installed.contains(&version) {
-                actions = actions.child(button(
-                    "download",
-                    format!("Download {version}"),
-                    p,
-                    false,
-                    !busy,
-                    self.cmd(|| Cmd::Download),
-                ));
-            } else if s.core_version.as_deref() != Some(&version) {
-                let label = format!("Use {version}");
-                actions = actions.child(button(
-                    "use",
-                    label,
-                    p,
-                    false,
-                    !busy,
-                    self.cmd(move || Cmd::ActivateVersion(version.clone())),
-                ));
-            }
-        }
-        if let Some(previous) = s
-            .previous_version
-            .clone()
-            .filter(|v| s.installed.contains(v))
+        if let Some(latest) = &s.latest
+            && s.core_version.as_deref() != Some(&latest.version)
         {
-            let label = format!("Roll Back to {previous}");
             actions = actions.child(button(
-                "rollback",
-                label,
+                "update",
+                format!("Update to {}", latest.version),
                 p,
                 false,
                 !busy,
-                self.cmd(move || Cmd::ActivateVersion(previous.clone())),
+                self.cmd(|| Cmd::Download),
             ));
         }
-        column = column.child(actions);
-        if let Some(status) = &s.update_busy {
-            column = column.child(div().mt_1().text_color(p.dim).child(status.clone()));
-        }
+        column = column
+            .child(section("MIHOMO CORE", p))
+            .child(versions)
+            .child(actions);
+        column = match &s.update_busy {
+            Some(status) => column.child(div().mt_1().text_color(p.dim).child(status.clone())),
+            None => column.children(self.note(Area::Update, p)),
+        };
         div()
             .id("settings")
             .size_full()
@@ -830,13 +868,64 @@ impl AppState {
 
 impl Render for AppState {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let p = palette(window.appearance());
-        let banner = self.render_banner(p);
+        let p = palette(self.snap.theme, window.appearance());
+        #[cfg(test)]
+        {
+            self.palette = Some(p);
+        }
+        let menu = self.version_menu.clone().map(|(version, position)| {
+            let in_use = self.snap.core_version.as_deref() == Some(&version);
+            let delete = div()
+                .id("delete-version")
+                .debug_selector(|| "delete-version".to_owned())
+                .px_2()
+                .py_1()
+                .rounded(px(4.))
+                .text_size(px(12.))
+                .text_color(if in_use { p.dim } else { p.danger })
+                .child("Delete");
+            let delete = if in_use {
+                delete
+            } else {
+                delete
+                    .cursor_pointer()
+                    .hover(move |st| st.bg(p.hover))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.handle.send(Cmd::DeleteVersion(version.clone()));
+                        this.version_menu = None;
+                        cx.notify();
+                    }))
+            };
+            deferred(
+                anchored().position(position).child(
+                    div()
+                        // Clicks on the menu must not reach the controls under it.
+                        .occlude()
+                        .min_w(px(120.))
+                        .p_1()
+                        .rounded(px(6.))
+                        .border_1()
+                        .border_color(p.border)
+                        .bg(p.panel)
+                        .shadow_md()
+                        // A right-click elsewhere may be opening this menu on another version.
+                        .on_mouse_down_out(cx.listener(
+                            |this, event: &gpui::MouseDownEvent, _, cx| {
+                                if event.button == MouseButton::Left {
+                                    this.version_menu = None;
+                                    cx.notify();
+                                }
+                            },
+                        ))
+                        .child(delete),
+                ),
+            )
+        });
         let body = match self.tab {
             Tab::Control => self.render_control(p, cx),
             Tab::Connections => self.render_connections(p, cx),
             Tab::Logs => self.render_logs(p, cx),
-            Tab::Settings => self.render_settings(p),
+            Tab::Settings => self.render_settings(p, cx),
         };
         let mut tabs = div().flex().gap_1().mb_3();
         for (tab, label, id) in [
@@ -869,11 +958,24 @@ impl Render for AppState {
             .flex_col()
             .size_full()
             .p_3()
+            .pt_0()
             .bg(p.bg)
             .text_color(p.text)
+            .child(
+                // AppKit still drags the window here; GPUI only forwards the double-click.
+                div()
+                    .id("titlebar")
+                    .flex_none()
+                    .h(TITLEBAR_HEIGHT)
+                    .on_click(|event, window, _| {
+                        if event.click_count() == 2 {
+                            window.titlebar_double_click();
+                        }
+                    }),
+            )
             .child(tabs)
-            .children(banner)
             .child(div().flex_1().min_h_0().child(body))
+            .children(menu)
     }
 }
 
@@ -897,6 +999,19 @@ mod tests {
         assert_eq!(filter_logs(lines.iter(), "error", "").len(), 1);
         assert_eq!(filter_logs(lines.iter(), "all", "GITHUB").len(), 2);
         assert_eq!(filter_logs(lines.iter(), "error", "github").len(), 0);
+    }
+
+    #[test]
+    fn theme_overrides_the_window_appearance_only_when_fixed() {
+        let light = palette(Theme::Light, WindowAppearance::Light);
+        let dark = palette(Theme::Dark, WindowAppearance::Dark);
+        assert_ne!(light, dark);
+        for appearance in [WindowAppearance::Light, WindowAppearance::VibrantDark] {
+            assert_eq!(palette(Theme::Light, appearance), light);
+            assert_eq!(palette(Theme::Dark, appearance), dark);
+        }
+        assert_eq!(palette(Theme::Auto, WindowAppearance::VibrantLight), light);
+        assert_eq!(palette(Theme::Auto, WindowAppearance::VibrantDark), dark);
     }
 
     #[test]
@@ -996,6 +1111,24 @@ mod gpui_tests {
                 .unwrap_or_else(|| panic!("{selector} is not on screen"));
             self.cx
                 .simulate_click(bounds.center(), Modifiers::default());
+            self.frame();
+        }
+
+        fn right_click(&mut self, selector: &'static str) {
+            let position = self.cx.debug_bounds(selector).unwrap().center();
+            self.cx.simulate_event(gpui::MouseDownEvent {
+                button: MouseButton::Right,
+                position,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+                first_mouse: false,
+            });
+            self.cx.simulate_event(gpui::MouseUpEvent {
+                button: MouseButton::Right,
+                position,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+            });
             self.frame();
         }
 
@@ -1187,8 +1320,15 @@ mod gpui_tests {
         assert!(matches!(&ui.sent()[..], [Cmd::SetIconSet(set)] if set == "bars"));
         ui.click("check");
         assert!(matches!(ui.sent()[..], [Cmd::CheckUpdate]));
-        ui.click("rollback");
+        assert!(ui.cx.debug_bounds("rollback").is_none());
+        ui.click("core-v1.19.32");
         assert!(matches!(&ui.sent()[..], [Cmd::ActivateVersion(v)] if v == "v1.19.32"));
+
+        // Right-click offers Delete.
+        ui.right_click("core-v1.19.32");
+        ui.click("delete-version");
+        assert!(matches!(&ui.sent()[..], [Cmd::DeleteVersion(v)] if v == "v1.19.32"));
+        assert!(ui.read(|s| s.version_menu.is_none()));
 
         ui.set(|s| {
             let mut snap = (*s.snap).clone();
@@ -1199,7 +1339,7 @@ mod gpui_tests {
             });
             s.snap = Arc::new(snap);
         });
-        ui.click("download");
+        ui.click("update");
         assert!(matches!(ui.sent()[..], [Cmd::Download]));
         ui.set(|s| {
             s.snap = Arc::new(Snapshot {
@@ -1212,6 +1352,71 @@ mod gpui_tests {
             ui.sent().is_empty(),
             "update actions are disabled while one runs"
         );
+    }
+
+    #[gpui::test]
+    fn the_core_version_in_use_cannot_be_deleted(cx: &mut TestAppContext) {
+        let snapshot = Snapshot {
+            installed: vec!["v1.19.32".into(), "v1.19.33".into()],
+            ..running()
+        };
+        let mut ui = open(cx, snapshot);
+        ui.keys("cmd-4");
+        ui.drain();
+        ui.right_click("core-v1.19.33");
+        assert!(ui.read(|s| s.version_menu.is_some()));
+        ui.click("delete-version");
+        assert!(ui.sent().is_empty());
+    }
+
+    #[gpui::test]
+    fn proxy_button_is_disabled_while_switching(cx: &mut TestAppContext) {
+        let mut ui = open(cx, running());
+        ui.set(|s| {
+            s.snap = Arc::new(Snapshot {
+                proxy_busy: Some(true),
+                ..running()
+            })
+        });
+        ui.click("proxy");
+        assert!(ui.sent().is_empty());
+        // Another tool's proxy shows as on, and one click turns it off.
+        ui.set(|s| {
+            s.snap = Arc::new(Snapshot {
+                phase: Phase::Stopped,
+                proxy_on: true,
+                ..running()
+            })
+        });
+        ui.click("proxy");
+        assert!(matches!(ui.sent()[..], [Cmd::SetProxy(false)]));
+    }
+
+    #[gpui::test]
+    fn theme_choice_is_sent_and_the_window_follows_it(cx: &mut TestAppContext) {
+        let mut ui = open(cx, running());
+        ui.keys("cmd-4");
+        ui.drain();
+        ui.click("theme-dark");
+        assert!(matches!(ui.sent()[..], [Cmd::SetTheme(Theme::Dark)]));
+        ui.click("check-now");
+        assert!(matches!(ui.sent()[..], [Cmd::CheckNow]));
+
+        // The backend's answer arrives as a snapshot; the next frame uses its palette.
+        let appearance = ui.cx.update(|window, _| window.appearance());
+        for theme in [Theme::Dark, Theme::Light, Theme::Auto] {
+            ui.set(|s| {
+                s.snap = Arc::new(Snapshot {
+                    theme,
+                    ..(*s.snap).clone()
+                })
+            });
+            assert_eq!(
+                ui.read(|s| s.palette),
+                Some(palette(theme, appearance)),
+                "{theme:?}"
+            );
+        }
     }
 
     #[gpui::test]

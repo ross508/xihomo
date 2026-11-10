@@ -11,10 +11,12 @@ use tray_icon::{TrayIcon, TrayIconBuilder};
 pub const CORE: &str = "core";
 pub const PROXY: &str = "proxy";
 pub const RELOAD: &str = "reload";
+pub const CHECK_NOW: &str = "check-now";
 pub const OPEN: &str = "open";
 pub const SETTINGS: &str = "settings";
 pub const QUIT: &str = "quit";
 pub const PROFILE_PREFIX: &str = "profile:";
+pub const REMOVE_PREFIX: &str = "remove:";
 
 /// Owns the status item; dropping it would remove the icon, so it lives as long as the app.
 pub struct Tray {
@@ -82,6 +84,18 @@ pub fn menu_model(s: &Snapshot) -> Vec<Entry> {
             checked: Some(s.active.as_deref() == Some(&p.name)),
         })
         .collect::<Vec<_>>();
+    // Permanent: kept in its own submenu, away from the switching items.
+    let removable = s
+        .profiles
+        .iter()
+        .map(|p| {
+            item(
+                &format!("{REMOVE_PREFIX}{}", p.name),
+                &p.name,
+                s.active.as_deref() != Some(&p.name),
+            )
+        })
+        .collect::<Vec<_>>();
     let mut menu = vec![
         Entry::Item {
             id: None,
@@ -93,9 +107,14 @@ pub fn menu_model(s: &Snapshot) -> Vec<Entry> {
         item(CORE, label, enabled),
         Entry::Item {
             id: Some(PROXY.to_owned()),
-            label: "System Proxy".to_owned(),
+            label: match s.proxy_busy {
+                Some(true) => "System Proxy: Turning On…",
+                Some(false) => "System Proxy: Turning Off…",
+                None => "System Proxy",
+            }
+            .to_owned(),
             // Turning it off stays possible whatever the core is doing.
-            enabled: s.phase == Phase::Running || s.proxy_on,
+            enabled: s.proxy_busy.is_none() && (s.phase == Phase::Running || s.proxy_on),
             checked: Some(s.proxy_on),
         },
         Entry::Submenu {
@@ -103,11 +122,19 @@ pub fn menu_model(s: &Snapshot) -> Vec<Entry> {
             enabled: !profiles.is_empty(),
             items: profiles,
         },
+        Entry::Submenu {
+            label: "Remove Profile".to_owned(),
+            enabled: removable
+                .iter()
+                .any(|e| matches!(e, Entry::Item { enabled: true, .. })),
+            items: removable,
+        },
     ];
     if s.edited {
         menu.push(item(RELOAD, "Reload Edited Profile", true));
     }
     menu.extend([
+        item(CHECK_NOW, "Check Now", true),
         Entry::Separator,
         item(OPEN, "Open xihomo", true),
         item(SETTINGS, "Settings…", true),
@@ -133,12 +160,16 @@ pub fn menu_action(id: &str, s: &Snapshot) -> Option<MenuAction> {
         }),
         PROXY => MenuAction::Send(Cmd::SetProxy(!s.proxy_on)),
         RELOAD => MenuAction::Send(Cmd::Reload),
+        CHECK_NOW => MenuAction::Send(Cmd::CheckNow),
         OPEN => MenuAction::Open(None),
         SETTINGS => MenuAction::Open(Some(Tab::Settings)),
         QUIT => MenuAction::Quit,
-        other => MenuAction::Send(Cmd::Activate(
-            other.strip_prefix(PROFILE_PREFIX)?.to_owned(),
-        )),
+        other => match other.strip_prefix(REMOVE_PREFIX) {
+            Some(name) => MenuAction::Send(Cmd::RemoveProfile(name.to_owned())),
+            None => MenuAction::Send(Cmd::Activate(
+                other.strip_prefix(PROFILE_PREFIX)?.to_owned(),
+            )),
+        },
     })
 }
 
@@ -297,6 +328,11 @@ mod tests {
             state(&menu_model(&s), PROXY),
             ("System Proxy".into(), true, Some(true))
         );
+        s.proxy_busy = Some(false);
+        assert_eq!(
+            state(&menu_model(&s), PROXY),
+            ("System Proxy: Turning Off…".into(), false, Some(true))
+        );
     }
 
     #[test]
@@ -322,6 +358,22 @@ mod tests {
             enabled: false,
             items: vec![]
         }));
+    }
+
+    #[test]
+    fn remove_is_disabled_for_the_active_profile_only() {
+        let model = menu_model(&snapshot(Phase::Running));
+        assert_eq!(state(&model, "remove:home"), ("home".into(), false, None));
+        assert_eq!(state(&model, "remove:gone"), ("gone".into(), true, None));
+        let only_active = Snapshot {
+            profiles: snapshot(Phase::Running).profiles[..1].to_vec(),
+            ..snapshot(Phase::Running)
+        };
+        assert!(menu_model(&only_active).iter().any(|e| matches!(
+            e,
+            Entry::Submenu { label, enabled: false, .. } if label == "Remove Profile"
+        )));
+        assert_eq!(state(&model, CHECK_NOW), ("Check Now".into(), true, None));
     }
 
     #[test]
@@ -360,6 +412,13 @@ mod tests {
         assert!(
             matches!(menu_action("profile:a b/c", &on), Some(MenuAction::Send(Cmd::Activate(n))) if n == "a b/c")
         );
+        assert!(
+            matches!(menu_action("remove:profile:x", &on), Some(MenuAction::Send(Cmd::RemoveProfile(n))) if n == "profile:x")
+        );
+        assert!(matches!(
+            menu_action(CHECK_NOW, &on),
+            Some(MenuAction::Send(Cmd::CheckNow))
+        ));
         assert!(matches!(
             menu_action(OPEN, &on),
             Some(MenuAction::Open(None))

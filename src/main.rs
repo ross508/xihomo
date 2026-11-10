@@ -16,8 +16,11 @@ use gpui::{
     WindowOptions, px, size,
 };
 use objc2::MainThreadMarker;
-use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
-use settings::Paths;
+use objc2_app_kit::{
+    NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication,
+    NSApplicationActivationPolicy,
+};
+use settings::{Paths, Theme};
 use std::cell::RefCell;
 use std::fs::File;
 use std::rc::Rc;
@@ -46,8 +49,10 @@ fn open_window(state: &Entity<AppState>, tab: Option<Tab>, cx: &mut App) {
     let opened = cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
+            // The content draws under a transparent title bar, so it takes the theme's background.
             titlebar: Some(TitlebarOptions {
                 title: Some("xihomo".into()),
+                appears_transparent: true,
                 ..Default::default()
             }),
             window_min_size: Some(size(px(440.), px(360.))),
@@ -80,6 +85,24 @@ fn open_window(state: &Entity<AppState>, tab: Option<Tab>, cx: &mut App) {
     }
 }
 
+/// GPUI does not theme the title bar, so a fixed theme is set app-wide; `Auto` clears it to follow
+/// the system. GPUI's `window.appearance()` then reports the same choice.
+fn apply_theme(theme: Theme) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    // SAFETY: AppKit's appearance name constants are immutable statics.
+    let name = unsafe {
+        match theme {
+            Theme::Auto => None,
+            Theme::Light => Some(NSAppearanceNameAqua),
+            Theme::Dark => Some(NSAppearanceNameDarkAqua),
+        }
+    };
+    let appearance = name.and_then(NSAppearance::appearanceNamed);
+    NSApplication::sharedApplication(mtm).setAppearance(appearance.as_deref());
+}
+
 fn on_menu(id: &str, state: &Entity<AppState>, cx: &mut App) {
     let (handle, snap) = {
         let this = state.read(cx);
@@ -98,6 +121,8 @@ fn run_app(handle: Handle, cx: &mut App) -> Result<()> {
     let mtm = MainThreadMarker::new().context("not on the main thread")?;
     NSApplication::sharedApplication(mtm)
         .setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    let mut theme = handle.snapshot.borrow().theme;
+    apply_theme(theme);
 
     cx.bind_keys([
         KeyBinding::new("cmd-w", ui::CloseWindow, None),
@@ -135,6 +160,10 @@ fn run_app(handle: Handle, cx: &mut App) -> Result<()> {
         cx.spawn(async move |cx| {
             while rx.changed().await.is_ok() {
                 let snap = rx.borrow_and_update().clone();
+                if snap.theme != theme {
+                    theme = snap.theme;
+                    apply_theme(theme);
+                }
                 tray.borrow_mut().update(&snap);
                 let _ = state.update(cx, |this, cx| {
                     this.snap = snap;

@@ -1,6 +1,6 @@
-//! System proxy, write-only like Bettbox: on writes xihomo's HTTP, HTTPS and SOCKS proxy (Mihomo's
-//! mixed port serves all three) into every enabled network service, off turns all three off. Prior
-//! values are neither read, checked nor restored.
+//! System proxy. On writes xihomo's HTTP, HTTPS and SOCKS proxy (Mihomo's mixed port serves all
+//! three) into every enabled network service, off turns all three off. Both are idempotent. The
+//! effective state is read back for display and safety; earlier values are never restored.
 //!
 //! Writes go through Apple's `/usr/sbin/networksetup`. Tested on the target Mac: authorized
 //! SCPreferences from this unentitled app prompts for an administrator password again once the 30s
@@ -8,7 +8,6 @@
 //! networksetup carries Apple's private entitlement for the same right and needs neither a prompt
 //! nor any privileged code of ours. configd serializes the writes (about 0.12s each), so their
 //! number is what costs time: three per service in each direction.
-use crate::settings::{Paths, write_private};
 use anyhow::{Context, Result, bail};
 use core_foundation::array::CFArray;
 use core_foundation::base::{CFType, CFTypeRef, TCFType, kCFAllocatorDefault};
@@ -16,22 +15,12 @@ use core_foundation::boolean::CFBoolean;
 use core_foundation::dictionary::CFDictionary;
 use core_foundation::number::CFNumber;
 use core_foundation::string::CFString;
-use serde::{Deserialize, Serialize};
-use std::fs;
-use std::path::PathBuf;
 use std::time::Duration;
 use tokio::process::Command;
 use tokio::task::JoinSet;
 
 const TOOL: &str = "/usr/sbin/networksetup";
 const HOST: &str = "127.0.0.1";
-
-/// On disk while the proxy is on, so a crashed or killed xihomo turns it off on the next launch.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Marker {
-    pub port: u16,
-    pub services: Vec<String>,
-}
 
 async fn run<const N: usize>(args: [&str; N]) -> Result<()> {
     // Layer 1 tests must never change this Mac's network settings.
@@ -73,6 +62,7 @@ mod sc {
         pub fn SCNetworkServiceGetEnabled(service: CFTypeRef) -> u8;
         pub fn SCNetworkServiceGetName(service: CFTypeRef) -> CFStringRef;
         pub fn SCNetworkServiceGetServiceID(service: CFTypeRef) -> CFStringRef;
+        pub fn SCDynamicStoreCopyProxies(store: CFTypeRef) -> CFDictionaryRef;
     }
 }
 
@@ -145,22 +135,49 @@ pub fn services() -> Result<Vec<String>> {
     Ok(out)
 }
 
-fn marker_path(paths: &Paths) -> PathBuf {
-    paths.state().join("proxy-on.json")
+/// The system's effective proxy, as `scutil --proxy` shows it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct State {
+    /// HTTP, HTTPS or SOCKS is enabled, whoever set it.
+    pub on: bool,
+    /// One of them points at xihomo's mixed port.
+    pub ours: bool,
 }
 
-pub fn read_marker(paths: &Paths) -> Result<Option<Marker>> {
-    match fs::read(marker_path(paths)) {
-        Ok(bytes) => Ok(Some(
-            serde_json::from_slice(&bytes).context("parse proxy marker")?,
-        )),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
+fn parse(d: &Dict, port: u16) -> State {
+    let mut state = State::default();
+    for (enable, host, port_key) in [
+        ("HTTPEnable", "HTTPProxy", "HTTPPort"),
+        ("HTTPSEnable", "HTTPSProxy", "HTTPSPort"),
+        ("SOCKSEnable", "SOCKSProxy", "SOCKSPort"),
+    ] {
+        if !flag(d, enable) {
+            continue;
+        }
+        state.on = true;
+        let host = d
+            .find(CFString::new(host))
+            .and_then(|v| v.downcast::<CFString>())
+            .is_some_and(|h| h == HOST);
+        let same_port = d
+            .find(CFString::new(port_key))
+            .and_then(|v| v.downcast::<CFNumber>())
+            .and_then(|n| n.to_i64())
+            == Some(port.into());
+        state.ours |= host && same_port;
     }
+    state
 }
 
-fn write_marker(paths: &Paths, marker: &Marker) -> Result<()> {
-    write_private(&marker_path(paths), &serde_json::to_vec_pretty(marker)?)
+/// Read-only and in-process; an unreadable store counts as no proxy.
+pub fn state(port: u16) -> State {
+    unsafe {
+        let dict = sc::SCDynamicStoreCopyProxies(std::ptr::null());
+        if dict.is_null() {
+            return State::default();
+        }
+        parse(&Dict::wrap_under_create_rule(dict), port)
+    }
 }
 
 /// Each set command also turns its proxy on, so no separate state write.
@@ -197,61 +214,18 @@ async fn run_all<const N: usize>(commands: Vec<[String; N]>) -> Result<()> {
     first_error.map_or(Ok(()), Err)
 }
 
-async fn set_on(services: &[String], port: u16) -> Result<()> {
+pub async fn enable(services: &[String], port: u16) -> Result<()> {
     run_all(services.iter().flat_map(|s| on_args(s, port)).collect()).await
 }
 
-/// Marker first, so a crash between writes is still turned off on the next launch.
-pub async fn enable(paths: &Paths, port: u16) -> Result<()> {
-    let services = services()?;
-    write_marker(
-        paths,
-        &Marker {
-            port,
-            services: services.clone(),
-        },
-    )?;
-    if let Err(e) = set_on(&services, port).await {
-        let _ = disable(paths).await;
-        return Err(e);
-    }
-    Ok(())
-}
-
-/// A network service that appeared while the proxy is on gets it too.
-pub async fn sync_new_services(paths: &Paths) -> Result<()> {
-    let Some(mut marker) = read_marker(paths)? else {
-        return Ok(());
-    };
-    let new: Vec<String> = services()?
-        .into_iter()
-        .filter(|s| !marker.services.contains(s))
-        .collect();
-    if new.is_empty() {
-        return Ok(());
-    }
-    marker.services.extend(new.iter().cloned());
-    write_marker(paths, &marker)?;
-    set_on(&new, marker.port).await
-}
-
-/// Turns HTTP, HTTPS and SOCKS proxy off on every enabled service, but only if xihomo turned it on:
-/// stopping the core must not clear another tool's proxy. The marker stays if a write fails.
-pub async fn disable(paths: &Paths) -> Result<()> {
-    if read_marker(paths)?.is_none() {
-        return Ok(());
-    }
-    run_all(services()?.iter().flat_map(|s| off_args(s)).collect()).await?;
-    match fs::remove_file(marker_path(paths)) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
-        _ => Ok(()),
-    }
+/// Turns HTTP, HTTPS and SOCKS proxy off on every enabled service.
+pub async fn disable() -> Result<()> {
+    run_all(services()?.iter().flat_map(|s| off_args(s)).collect()).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::temp_paths;
 
     #[test]
     fn writes_xihomos_http_https_and_socks_proxy() {
@@ -274,20 +248,50 @@ mod tests {
     }
 
     #[test]
-    fn missing_marker_means_proxy_off() {
-        let paths = temp_paths("proxy");
-        assert!(read_marker(&paths).unwrap().is_none());
-        fs::write(marker_path(&paths), "{bad").unwrap();
-        assert!(
-            read_marker(&paths).is_err(),
-            "corrupt marker is reported, not ignored"
+    fn state_is_on_for_any_proxy_and_ours_only_for_our_port() {
+        let dict = |pairs: &[(&str, CFType)]| {
+            let pairs: Vec<_> = pairs
+                .iter()
+                .map(|(k, v)| (CFString::new(k), v.clone()))
+                .collect();
+            CFDictionary::from_CFType_pairs(&pairs)
+        };
+        let num = |n: i64| CFNumber::from(n).as_CFType();
+        let text = |s: &str| CFString::new(s).as_CFType();
+        assert_eq!(parse(&dict(&[]), 10999), State::default());
+        let other = dict(&[
+            ("HTTPEnable", num(1)),
+            ("HTTPProxy", text("127.0.0.1")),
+            ("HTTPPort", num(7890)),
+        ]);
+        assert_eq!(
+            parse(&other, 10999),
+            State {
+                on: true,
+                ours: false
+            }
         );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn disable_without_marker_writes_nothing() {
-        // `run` panics under test, so any networksetup write would fail this test.
-        disable(&temp_paths("proxy-off")).await.unwrap();
+        let ours = dict(&[
+            ("HTTPEnable", num(0)),
+            ("HTTPProxy", text("127.0.0.1")),
+            ("HTTPPort", num(10999)),
+            ("SOCKSEnable", num(1)),
+            ("SOCKSProxy", text("127.0.0.1")),
+            ("SOCKSPort", num(10999)),
+        ]);
+        assert_eq!(
+            parse(&ours, 10999),
+            State {
+                on: true,
+                ours: true
+            }
+        );
+        let disabled_ours = dict(&[
+            ("HTTPEnable", num(0)),
+            ("HTTPProxy", text("127.0.0.1")),
+            ("HTTPPort", num(10999)),
+        ]);
+        assert_eq!(parse(&disabled_ours, 10999), State::default());
     }
 
     /// Read-only cross-check on this Mac: the in-process list matches networksetup's.

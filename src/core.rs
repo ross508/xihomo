@@ -329,7 +329,7 @@ pub(crate) mod tests {
         tokio::task::LocalSet::new()
             .run_until(async {
                 let paths = temp_paths("stop");
-                let exe = paths.root.join("stubborn");
+                let exe = paths.data.join("stubborn");
                 write_private(
                     &exe,
                     b"#!/bin/sh\ntrap '' TERM\necho hello\nwhile :; do sleep 0.1; done\n",
@@ -337,7 +337,7 @@ pub(crate) mod tests {
                 .unwrap();
                 fs::set_permissions(&exe, std::os::unix::fs::PermissionsExt::from_mode(0o700))
                     .unwrap();
-                let core = Core::spawn(&exe, &paths, &paths.root, &paths.candidate()).unwrap();
+                let core = Core::spawn(&exe, &paths, &paths.data, &paths.candidate()).unwrap();
                 let pid = core.pid;
                 assert!(journal_path(&paths).exists());
                 core.stop().await.unwrap();

@@ -24,14 +24,20 @@ fn actor(name: &str) -> Option<(Actor, mpsc::UnboundedReceiver<Cmd>)> {
     // Distinct, per-process ports so parallel tests and any real instance cannot collide.
     let base =
         21000 + (std::process::id() % 500) as u16 * 40 + NEXT_PORT.fetch_add(2, Ordering::SeqCst);
-    let settings = Settings {
+    Settings {
         mixed_port: base,
         controller_port: base + 1,
+        ..Settings::default()
+    }
+    .save(&paths)
+    .unwrap();
+    AppData {
         core_version: Some(VERSION.into()),
         active_profile: Some("good".into()),
-        ..Settings::default()
-    };
-    settings.save(&paths).unwrap();
+        ..AppData::default()
+    }
+    .save(&paths)
+    .unwrap();
     let (tx, rx) = mpsc::unbounded_channel();
     let (actor, ..) = Actor::new(paths, tx, Arc::new(AtomicBool::new(false))).unwrap();
     Some((actor, rx))
@@ -53,13 +59,13 @@ macro_rules! local_test {
     };
 }
 
-fn saved(actor: &Actor) -> Settings {
-    Settings::load(&actor.paths).unwrap().0
+fn saved(actor: &Actor) -> AppData {
+    AppData::load(&actor.paths).unwrap().0
 }
 
 local_test!(start_control_stop, a, _rx, {
     a.handle(Cmd::Start).await;
-    assert_eq!(a.snap.phase, Phase::Running, "{:?}", a.snap.error);
+    assert_eq!(a.snap.phase, Phase::Running, "{:?}", a.snap.error());
     assert_eq!(a.api.version().await.unwrap(), VERSION);
 
     // The source's secret and port are gone: the generated secret is the one that authenticates.
@@ -83,7 +89,7 @@ local_test!(start_control_stop, a, _rx, {
 
     // A second Start is a no-op, not a second process.
     a.handle(Cmd::Start).await;
-    assert!(a.snap.error.is_none());
+    assert!(a.snap.error().is_none());
 
     a.handle(Cmd::Stop).await;
     assert_eq!(a.snap.phase, Phase::Stopped);
@@ -106,9 +112,9 @@ local_test!(failed_activation_keeps_selection_and_core, a, _rx, {
     .unwrap();
     a.handle(Cmd::Activate("bad".into())).await;
     assert!(
-        a.snap.error.as_deref().unwrap().contains("rejected"),
+        a.snap.error().as_deref().unwrap().contains("rejected"),
         "{:?}",
-        a.snap.error
+        a.snap.error()
     );
     assert_eq!(saved(&a).active_profile.as_deref(), Some("good"));
     assert_eq!(fs::read(a.paths.last_good()).unwrap(), last_good);
@@ -120,9 +126,15 @@ local_test!(failed_activation_keeps_selection_and_core, a, _rx, {
     )
     .unwrap();
     a.handle(Cmd::Activate("other".into())).await;
-    assert_eq!(a.snap.error, None);
+    assert_eq!(a.snap.error(), None);
     assert_eq!(saved(&a).active_profile.as_deref(), Some("other"));
     assert_eq!(a.snap.mode, "direct");
+    assert_eq!(a.core.as_ref().unwrap().home, a.paths.home("other"));
+
+    // The running core's home survives reconciliation even after its profile file is gone.
+    fs::remove_file(a.paths.profiles().join("other.yaml")).unwrap();
+    a.handle(Cmd::CheckNow).await;
+    assert!(a.paths.home("other").is_dir());
     a.handle(Cmd::Stop).await;
 });
 
@@ -140,7 +152,7 @@ local_test!(external_edit_is_only_offered_never_applied, a, _rx, {
     // A broken save: reload fails, the running config stays, the offer stays.
     fs::write(&path, "a: [").unwrap();
     a.handle(Cmd::Reload).await;
-    assert!(a.snap.error.is_some());
+    assert!(a.snap.error().is_some());
     a.check_edits();
     assert!(a.snap.edited);
     assert!(a.api.version().await.is_ok());
@@ -157,7 +169,13 @@ local_test!(start_recovers_with_last_good_once, a, _rx, {
     fs::remove_file(a.paths.profiles().join("good.yaml")).unwrap();
     a.handle(Cmd::Start).await;
     assert_eq!(a.snap.phase, Phase::Running);
-    assert!(a.snap.notice.as_deref().unwrap().contains("last-good"));
+    assert!(
+        a.snap
+            .message(Area::Core)
+            .unwrap()
+            .text
+            .contains("last-good")
+    );
     assert!(a.snap.edited);
     a.handle(Cmd::Stop).await;
 
@@ -196,12 +214,15 @@ local_test!(unexpected_exit_fails_without_restart, a, rx, {
 local_test!(core_crash_queues_proxy_restore, a, rx, {
     a.handle(Cmd::Start).await;
     // Marks the state only; this test never changes real proxy settings.
-    a.snap.proxy_on = true;
+    a.read_proxy = |_| proxy::State {
+        on: true,
+        ours: true,
+    };
     let pid = a.core.as_ref().unwrap().pid();
     unsafe { libc::kill(pid, libc::SIGKILL) };
     let status = wait_core(&mut a.core).await;
     a.on_core_exit(status).await;
-    assert!(matches!(rx.try_recv(), Ok(Cmd::SetProxy(false))));
+    assert!(matches!(rx.try_recv(), Ok(Cmd::GuardProxy)));
 });
 
 local_test!(broken_core_update_rolls_back_to_running_version, a, _rx, {
@@ -219,7 +240,7 @@ local_test!(broken_core_update_rolls_back_to_running_version, a, _rx, {
     fs::set_permissions(&bad, fs::Permissions::from_mode(0o755)).unwrap();
 
     a.handle(Cmd::ActivateVersion("v9.9.9".into())).await;
-    let error = a.snap.error.clone().unwrap();
+    let error = a.snap.error().clone().unwrap();
     assert!(
         error.contains("back on") && error.contains("boom"),
         "{error}"
@@ -240,7 +261,7 @@ local_test!(version_switch_while_stopped_and_rollback, a, _rx, {
     fs::create_dir_all(other.parent().unwrap()).unwrap();
     std::os::unix::fs::symlink(real_core().unwrap(), &other).unwrap();
     a.handle(Cmd::ActivateVersion("v1.0.0".into())).await;
-    assert_eq!(a.snap.error, None);
+    assert_eq!(a.snap.error(), None);
     let s = saved(&a);
     assert_eq!(
         (
@@ -259,7 +280,7 @@ local_test!(version_switch_while_stopped_and_rollback, a, _rx, {
         (Some(VERSION), Some("v1.0.0"))
     );
     a.handle(Cmd::ActivateVersion("../../evil".into())).await;
-    assert!(a.snap.error.as_deref().unwrap().contains("not installed"));
+    assert!(a.snap.error().as_deref().unwrap().contains("not installed"));
 });
 
 local_test!(logs_stream_into_the_bounded_buffer, a, _rx, {
@@ -314,7 +335,7 @@ async fn dev_profiles_validate_after_overrides() {
         )
         .unwrap_or_else(|_| panic!("composition failed"));
         write_private(&paths.candidate(), yaml.as_bytes()).unwrap();
-        let home = paths.root.join("home");
+        let home = paths.data.join("home");
         fs::create_dir_all(&home).unwrap();
         let ok = core::validate(&exe, &paths, &home, &paths.candidate(), "x")
             .await
@@ -323,21 +344,211 @@ async fn dev_profiles_validate_after_overrides() {
     }
 }
 
-/// No core needed: an unread error survives background refreshes, and the next user action clears it.
+/// No core needed: an unread message survives background work, a user action in its area
+/// replaces it, and actions in other areas leave it alone.
 #[tokio::test(flavor = "current_thread")]
-async fn background_refresh_keeps_unread_messages() {
+async fn messages_stay_next_to_their_area() {
     let paths = temp_paths("messages");
     let (tx, _rx) = mpsc::unbounded_channel();
     let (mut a, ..) = Actor::new(paths, tx, Arc::new(AtomicBool::new(false))).unwrap();
-    a.snap.error = Some("unread".into());
+    a.handle(Cmd::Activate("missing".into())).await;
+    let error = a.snap.message(Area::Profiles).unwrap().clone();
+    assert!(
+        error.error && error.text.contains("No Mihomo core"),
+        "{error:?}"
+    );
+    assert!(
+        a.logs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.text.contains("No Mihomo core")),
+        "every message is also in Logs"
+    );
     for cmd in [
         Cmd::Refresh,
         Cmd::WatchConnections(true),
-        Cmd::WatchConnections(false),
+        Cmd::SetIconSet("bars".into()),
     ] {
         a.handle(cmd).await;
-        assert_eq!(a.snap.error.as_deref(), Some("unread"));
+        assert_eq!(a.snap.message(Area::Profiles), Some(&error));
     }
-    a.handle(Cmd::SetIconSet("bars".into())).await;
-    assert_eq!(a.snap.error, None);
+    a.handle(Cmd::CheckNow).await;
+    assert_eq!(a.snap.message(Area::Profiles), None);
 }
+
+/// An actor with no core, for the file-handling paths.
+fn idle(name: &str) -> Actor {
+    let paths = temp_paths(name);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    Actor::new(paths, tx, Arc::new(AtomicBool::new(false)))
+        .unwrap()
+        .0
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn startup_creates_the_default_profile_once() {
+    let mut a = idle("default-profile");
+    a.startup().await;
+    let names: Vec<_> = a.snap.profiles.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["default"]);
+    assert_eq!(a.app.active_profile, None, "nothing is selected or started");
+    assert!(a.core.is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn theme_choice_is_stored_in_settings_yaml() {
+    let mut a = idle("theme");
+    a.handle(Cmd::SetTheme(Theme::Dark)).await;
+    a.publish();
+    assert_eq!(a.snap.theme, Theme::Dark);
+    let (settings, _) = Settings::load(&a.paths).unwrap();
+    assert_eq!(settings.theme, Theme::Dark);
+    assert!(
+        !a.paths.app_data().exists(),
+        "preferences never go to app.json"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn active_profile_cannot_be_removed() {
+    let mut a = idle("remove-active");
+    for name in ["a", "b"] {
+        fs::write(a.paths.profiles().join(format!("{name}.yaml")), "a: 1\n").unwrap();
+        fs::create_dir_all(a.paths.home(name)).unwrap();
+    }
+    a.app.active_profile = Some("a".into());
+    a.handle(Cmd::RemoveProfile("a".into())).await;
+    assert!(a.snap.error().as_deref().unwrap().contains("active"));
+    assert!(a.paths.home("a").exists());
+    a.handle(Cmd::RemoveProfile("b".into())).await;
+    assert_eq!(a.snap.error(), None);
+    assert!(!a.paths.home("b").exists());
+    assert_eq!(a.snap.profiles.len(), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn reconciliation_runs_first_then_only_on_list_changes() {
+    let mut a = idle("reconcile-trigger");
+    fs::write(a.paths.profiles().join("p.yaml"), "a: 1\n").unwrap();
+    let orphan = a.paths.home("orphan");
+    let last_good = a.paths.home("renamed");
+    for home in [&orphan, &last_good] {
+        fs::create_dir_all(home).unwrap();
+    }
+    a.app.last_good_home = Some(last_good.clone());
+    a.periodic().await;
+    assert!(!orphan.exists(), "the first tick always reconciles");
+    assert!(last_good.exists(), "protected by path");
+
+    // Same list: the next tick does not touch the disk.
+    fs::create_dir_all(&orphan).unwrap();
+    a.periodic().await;
+    assert!(orphan.exists());
+    a.handle(Cmd::CheckNow).await;
+    assert!(!orphan.exists(), "Check now always reconciles");
+
+    fs::create_dir_all(&orphan).unwrap();
+    fs::write(a.paths.profiles().join("q.yaml"), "a: 1\n").unwrap();
+    a.periodic().await;
+    assert!(!orphan.exists(), "a changed list reconciles");
+
+    // A failed listing skips the run entirely.
+    fs::create_dir_all(&orphan).unwrap();
+    let profiles = a.paths.profiles();
+    let moved = a.paths.config.join("profiles-moved");
+    fs::rename(&profiles, &moved).unwrap();
+    a.handle(Cmd::CheckNow).await;
+    assert!(a.snap.error().is_some());
+    assert!(orphan.exists());
+    fs::rename(&moved, &profiles).unwrap();
+}
+
+/// The generated first-run profile must pass the real core's own test, not just `compose`.
+#[tokio::test(flavor = "current_thread")]
+async fn default_profile_passes_the_real_core() {
+    let Some(exe) = real_core() else { return };
+    let paths = temp_paths("default-validates");
+    profiles::ensure_default(&paths).unwrap();
+    let candidate =
+        profiles::write_candidate(&paths, &Settings::default(), "default", "x").unwrap();
+    core::validate(&exe, &paths, &candidate.home, &paths.candidate(), "x")
+        .await
+        .unwrap();
+}
+
+fn install(a: &Actor, versions: &[&str]) {
+    for v in versions {
+        fs::create_dir_all(a.paths.bin().join(v)).unwrap();
+        fs::write(a.paths.core_exe(v), "x").unwrap();
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_downloaded_core_is_used_right_away() {
+    let mut a = idle("downloaded");
+    install(&a, &["v1.0.0", "v2.0.0", "v3.0.0"]);
+    a.app.core_version = Some("v1.0.0".into());
+    a.app.previous_core_version = Some("v3.0.0".into());
+    a.handle(Cmd::Staged(Ok("v2.0.0".into()))).await;
+    assert_eq!(a.snap.error(), None);
+    assert_eq!(a.app.core_version.as_deref(), Some("v2.0.0"));
+    assert_eq!(a.app.previous_core_version.as_deref(), Some("v1.0.0"));
+    assert_eq!(update::installed(&a.paths), ["v1.0.0", "v2.0.0"]);
+    assert_eq!(
+        a.snap.message(Area::Update),
+        None,
+        "success is not announced"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn only_unused_versions_can_be_deleted() {
+    let mut a = idle("delete-version");
+    install(&a, &["v1.0.0", "v2.0.0"]);
+    a.app.core_version = Some("v2.0.0".into());
+    a.app.previous_core_version = Some("v1.0.0".into());
+    a.handle(Cmd::DeleteVersion("v2.0.0".into())).await;
+    assert!(a.snap.error().unwrap().contains("in use"));
+    a.handle(Cmd::DeleteVersion("../state".into())).await;
+    assert!(a.paths.state().exists());
+    a.handle(Cmd::DeleteVersion("v1.0.0".into())).await;
+    assert_eq!(a.snap.error(), None);
+    assert_eq!(update::installed(&a.paths), ["v2.0.0"]);
+    assert_eq!(saved(&a).previous_core_version, None);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn restore_picks_the_default_profile_and_skips_without_a_core() {
+    let mut a = idle("restore-default");
+    a.startup().await;
+    a.handle(Cmd::Restore).await;
+    assert_eq!(a.app.active_profile.as_deref(), Some("default"));
+    assert_eq!(a.snap.phase, Phase::Stopped, "no core installed");
+    assert_eq!(a.snap.error(), None);
+}
+
+local_test!(launch_restores_the_remembered_state, a, _rx, {
+    a.handle(Cmd::Restore).await;
+    assert_eq!(a.snap.phase, Phase::Running, "core_on defaults to true");
+
+    // Stop is remembered, and also clears the proxy choice.
+    a.app.proxy_on = true;
+    a.handle(Cmd::Stop).await;
+    let s = saved(&a);
+    assert!(!s.core_on && !s.proxy_on);
+    a.handle(Cmd::Restore).await;
+    assert_eq!(a.snap.phase, Phase::Stopped);
+
+    a.handle(Cmd::Start).await;
+    assert!(saved(&a).core_on);
+    a.handle(Cmd::Stop).await;
+});
+
+local_test!(failed_start_shows_its_reason_once, a, _rx, {
+    fs::write(a.paths.profiles().join("good.yaml"), "a: [").unwrap();
+    a.handle(Cmd::Start).await;
+    assert!(matches!(a.snap.phase, Phase::Failed(_)));
+    assert_eq!(a.snap.message(Area::Core), None, "the phase carries it");
+    assert!(saved(&a).core_on, "a failed start keeps the choice");
+});

@@ -320,7 +320,7 @@ mod tests {
     #[test]
     fn unpack_rejects_corrupt_oversized_and_foreign_binaries() {
         let paths = temp_paths("unpack");
-        let dest = paths.root.join("mihomo");
+        let dest = paths.data.join("mihomo");
         let good = gz(&macho(16));
         assert!(
             unpack(&good, &"0".repeat(64), &dest, 1024)

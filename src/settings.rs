@@ -1,42 +1,54 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-/// Everything xihomo owns on disk. Tests point this at a temporary directory.
+/// Everything xihomo reads or owns on disk: `config` is the user's, `data` is xihomo's.
+/// Tests point both at a temporary directory.
 #[derive(Clone, Debug)]
 pub struct Paths {
-    pub root: PathBuf,
+    pub config: PathBuf,
+    pub data: PathBuf,
 }
 
 impl Paths {
     pub fn user_default() -> Result<Self> {
-        let home = std::env::var_os("HOME").context("HOME is not set")?;
+        let home = PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?);
         Ok(Self {
-            root: PathBuf::from(home).join(".config/xihomo"),
+            config: home.join(".config/xihomo"),
+            data: home.join("Library/Application Support/xihomo"),
         })
     }
 
     pub fn settings(&self) -> PathBuf {
-        self.root.join("settings.json")
+        self.config.join("settings.yaml")
     }
     pub fn overrides(&self) -> PathBuf {
-        self.root.join("overrides.yaml")
+        self.config.join("overrides.yaml")
     }
     pub fn profiles(&self) -> PathBuf {
-        self.root.join("profiles")
+        self.config.join("profiles")
     }
     pub fn bin(&self) -> PathBuf {
-        self.root.join("bin")
+        self.data.join("bin")
+    }
+    pub fn homes(&self) -> PathBuf {
+        self.data.join("homes")
+    }
+    /// Mihomo's `-d` for a profile. Profile names never contain `/` and are never `.` or `..`.
+    pub fn home(&self, profile: &str) -> PathBuf {
+        self.homes().join(profile)
     }
     pub fn runtime(&self) -> PathBuf {
-        self.root.join("runtime")
+        self.data.join("runtime")
     }
     pub fn state(&self) -> PathBuf {
-        self.root.join("state")
+        self.data.join("state")
+    }
+    pub fn app_data(&self) -> PathBuf {
+        self.state().join("app.json")
     }
     pub fn candidate(&self) -> PathBuf {
         self.runtime().join("candidate.yaml")
@@ -51,9 +63,11 @@ impl Paths {
     /// Generated configs hold credentials, so every owned directory is private.
     pub fn ensure(&self) -> Result<()> {
         for dir in [
-            self.root.clone(),
+            self.config.clone(),
             self.profiles(),
+            self.data.clone(),
             self.bin(),
+            self.homes(),
             self.runtime(),
             self.state(),
         ] {
@@ -103,62 +117,117 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     result.with_context(|| format!("write {}", path.display()))
 }
 
+/// A missing file gives defaults. An unparseable one is set aside rather than overwritten, and
+/// reported to the caller.
+fn load_or_set_aside<T: Default>(
+    path: &Path,
+    parse: impl FnOnce(&[u8]) -> Result<T>,
+) -> Result<(T, Option<String>)> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+    match parse(&bytes) {
+        Ok(value) => Ok((value, None)),
+        Err(e) => {
+            let mut aside = path.as_os_str().to_owned();
+            aside.push(".invalid");
+            fs::rename(path, &aside)?;
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            Ok((
+                T::default(),
+                Some(format!(
+                    "{name} was invalid ({e:#}); moved to {}",
+                    Path::new(&aside).display()
+                )),
+            ))
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum Theme {
+    #[default]
+    Auto,
+    Light,
+    Dark,
+}
+
+/// `settings.yaml`: only what the user edits. xihomo rewrites it only when a preference changes
+/// in the GUI.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Settings {
-    pub active_profile: Option<String>,
-    pub icon_set: String,
-    pub core_version: Option<String>,
-    pub previous_core_version: Option<String>,
     pub mixed_port: u16,
     pub controller_port: u16,
-    /// Optional per-profile Mihomo home; defaults to the resolved profile's parent directory.
-    pub homes: BTreeMap<String, PathBuf>,
-    pub last_good_home: Option<PathBuf>,
+    pub icon_set: String,
+    pub theme: Theme,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            active_profile: None,
-            icon_set: "orbit".into(),
-            core_version: None,
-            previous_core_version: None,
             mixed_port: 10999,
             controller_port: 11000,
-            homes: BTreeMap::new(),
-            last_good_home: None,
+            icon_set: "orbit".into(),
+            theme: Theme::Auto,
         }
     }
 }
 
 impl Settings {
-    /// Unparseable settings are set aside rather than overwritten, and reported to the caller.
     pub fn load(paths: &Paths) -> Result<(Self, Option<String>)> {
-        let path = paths.settings();
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
-            Err(e) => return Err(e).context("read settings.json"),
-        };
-        match serde_json::from_slice(&bytes) {
-            Ok(settings) => Ok((settings, None)),
-            Err(e) => {
-                let aside = path.with_extension("json.invalid");
-                fs::rename(&path, &aside)?;
-                Ok((
-                    Self::default(),
-                    Some(format!(
-                        "settings.json was invalid ({e}); moved to {}",
-                        aside.display()
-                    )),
-                ))
-            }
-        }
+        load_or_set_aside(&paths.settings(), |bytes| {
+            // An empty or comment-only file is a valid "all defaults".
+            Ok(match yaml_serde::from_slice::<yaml_serde::Value>(bytes)? {
+                yaml_serde::Value::Null => Self::default(),
+                value => yaml_serde::from_value(value)?,
+            })
+        })
     }
 
     pub fn save(&self, paths: &Paths) -> Result<()> {
-        write_private(&paths.settings(), &serde_json::to_vec_pretty(self)?)
+        write_private(&paths.settings(), yaml_serde::to_string(self)?.as_bytes())
+    }
+}
+
+/// `state/app.json`: what xihomo maintains.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct AppData {
+    pub active_profile: Option<String>,
+    pub core_version: Option<String>,
+    pub previous_core_version: Option<String>,
+    pub last_good_home: Option<PathBuf>,
+    /// The user's last Start/Stop and System Proxy choices, restored at launch.
+    pub core_on: bool,
+    pub proxy_on: bool,
+}
+
+impl Default for AppData {
+    fn default() -> Self {
+        Self {
+            active_profile: None,
+            core_version: None,
+            previous_core_version: None,
+            last_good_home: None,
+            core_on: true,
+            proxy_on: false,
+        }
+    }
+}
+
+impl AppData {
+    pub fn load(paths: &Paths) -> Result<(Self, Option<String>)> {
+        load_or_set_aside(&paths.app_data(), |bytes| {
+            Ok(serde_json::from_slice(bytes)?)
+        })
+    }
+
+    pub fn save(&self, paths: &Paths) -> Result<()> {
+        write_private(&paths.app_data(), &serde_json::to_vec_pretty(self)?)
     }
 }
 
@@ -166,7 +235,10 @@ impl Settings {
 pub fn temp_paths(name: &str) -> Paths {
     let root = std::env::temp_dir().join(format!("xihomo-test-{}-{name}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
-    let paths = Paths { root };
+    let paths = Paths {
+        config: root.join("config"),
+        data: root.join("data"),
+    };
     paths.ensure().unwrap();
     paths
 }
@@ -176,23 +248,79 @@ mod tests {
     use super::*;
 
     #[test]
-    fn invalid_settings_are_set_aside_not_overwritten() {
-        let paths = temp_paths("settings");
-        fs::write(paths.settings(), "{nope").unwrap();
+    fn missing_keys_and_empty_files_take_defaults() {
+        let paths = temp_paths("settings-defaults");
+        assert_eq!(Settings::load(&paths).unwrap(), (Settings::default(), None));
+        fs::write(paths.settings(), "# only a comment\n").unwrap();
+        assert_eq!(Settings::load(&paths).unwrap().0, Settings::default());
+        fs::write(
+            paths.settings(),
+            "theme: dark\nmixed_port: 7000\nunknown: 1\n",
+        )
+        .unwrap();
         let (settings, notice) = Settings::load(&paths).unwrap();
-        assert_eq!(settings, Settings::default());
-        assert!(notice.unwrap().contains("invalid"));
+        assert_eq!(notice, None);
         assert_eq!(
-            fs::read_to_string(paths.settings().with_extension("json.invalid")).unwrap(),
-            "{nope"
+            settings,
+            Settings {
+                theme: Theme::Dark,
+                mixed_port: 7000,
+                ..Settings::default()
+            }
         );
+        settings.save(&paths).unwrap();
+        assert_eq!(Settings::load(&paths).unwrap().0, settings);
+        assert_eq!(AppData::load(&paths).unwrap(), (AppData::default(), None));
+    }
+
+    #[test]
+    fn invalid_files_are_set_aside_not_overwritten() {
+        let paths = temp_paths("settings-invalid");
+        for (path, bad) in [
+            (paths.settings(), "theme: purple\n"),
+            (paths.settings(), "a: ["),
+            (paths.app_data(), "{nope"),
+        ] {
+            fs::write(&path, bad).unwrap();
+            let notice = if path == paths.settings() {
+                let (settings, notice) = Settings::load(&paths).unwrap();
+                assert_eq!(settings, Settings::default());
+                notice
+            } else {
+                let (data, notice) = AppData::load(&paths).unwrap();
+                assert_eq!(data, AppData::default());
+                notice
+            };
+            assert!(notice.unwrap().contains("invalid"));
+            let mut aside = path.into_os_string();
+            aside.push(".invalid");
+            assert_eq!(fs::read_to_string(aside).unwrap(), bad);
+        }
+    }
+
+    #[test]
+    fn app_data_lives_in_the_data_root() {
+        let paths = temp_paths("app-data");
+        let data = AppData {
+            active_profile: Some("p".into()),
+            core_version: Some("v1".into()),
+            ..AppData::default()
+        };
+        data.save(&paths).unwrap();
+        assert!(paths.app_data().starts_with(&paths.data));
+        assert!(
+            !paths.settings().exists(),
+            "app state never writes settings.yaml"
+        );
+        assert_eq!(AppData::load(&paths).unwrap().0, data);
+        assert_eq!(paths.home("p"), paths.data.join("homes/p"));
     }
 
     #[test]
     fn write_private_replaces_symlink_without_touching_target() {
         let paths = temp_paths("write");
-        let target = paths.root.join("target");
-        let link = paths.root.join("link");
+        let target = paths.data.join("target");
+        let link = paths.data.join("link");
         fs::write(&target, "original").unwrap();
         std::os::unix::fs::symlink(&target, &link).unwrap();
         write_private(&link, b"new").unwrap();

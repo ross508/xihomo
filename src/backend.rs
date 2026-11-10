@@ -1,12 +1,13 @@
-//! One actor on one Tokio thread owns the child, settings and proxy marker, so lifecycle work is
+//! One actor on one Tokio thread owns the child, settings and system proxy, so lifecycle work is
 //! serialized. The UI only sends commands and observes coalescing `watch` snapshots.
-use crate::api::{Api, Connection, Group, LineSplitter, LogBuffer, parse_log_line};
+use crate::api::{Api, Connection, Group, LineSplitter, LogBuffer, LogLine, parse_log_line};
 use crate::core::{self, Core};
 use crate::profiles::{self, Profile};
 use crate::proxy;
-use crate::settings::{Paths, Settings, write_private};
+use crate::settings::{AppData, Paths, Settings, Theme, write_private};
 use crate::update::{self, Release};
 use anyhow::{Context, Result, anyhow, bail};
+use std::collections::BTreeMap;
 use std::fs;
 use std::future::pending;
 use std::path::{Path, PathBuf};
@@ -32,6 +33,22 @@ pub enum Phase {
     Failed(String),
 }
 
+/// Where a message is shown: next to the part of the UI it is about. There is no global banner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Area {
+    Core,
+    Proxy,
+    Profiles,
+    Files,
+    Update,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Message {
+    pub text: String,
+    pub error: bool,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Snapshot {
     pub phase: Phase,
@@ -44,15 +61,33 @@ pub struct Snapshot {
     pub edited: bool,
     pub mode: String,
     pub groups: Vec<Group>,
+    /// The system proxy is on, whoever set it.
     pub proxy_on: bool,
-    pub error: Option<String>,
-    pub notice: Option<String>,
+    /// A proxy write is running: `Some(true)` turning on, `Some(false)` turning off.
+    pub proxy_busy: Option<bool>,
+    /// At most one message per area; a later user action in that area replaces it.
+    pub messages: BTreeMap<Area, Message>,
     pub icon_set: String,
+    pub theme: Theme,
     pub mixed_port: u16,
     pub controller_port: u16,
     pub latest: Option<Release>,
     pub update_busy: Option<String>,
     pub config_dir: PathBuf,
+}
+
+impl Snapshot {
+    pub fn message(&self, area: Area) -> Option<&Message> {
+        self.messages.get(&area)
+    }
+
+    #[cfg(test)]
+    pub fn error(&self) -> Option<String> {
+        self.messages
+            .values()
+            .find(|m| m.error)
+            .map(|m| m.text.clone())
+    }
 }
 
 pub enum Cmd {
@@ -61,7 +96,10 @@ pub enum Cmd {
     Activate(String),
     Reload,
     SetMode(String),
-    Select { group: String, proxy: String },
+    Select {
+        group: String,
+        proxy: String,
+    },
     Refresh,
     CloseConnection(String),
     CloseAll,
@@ -70,11 +108,56 @@ pub enum Cmd {
     CheckUpdate,
     Download,
     ActivateVersion(String),
+    DeleteVersion(String),
     SetIconSet(String),
+    SetTheme(Theme),
     LinkProfile(PathBuf),
+    RemoveProfile(String),
+    /// The 30-second periodic work, now.
+    CheckNow,
     Checked(Result<Release, String>),
     Staged(Result<String, String>),
+    /// Restores the remembered core and proxy state; queued once at launch.
+    Restore,
+    /// Turns off a system proxy that points at us while no core of ours serves it.
+    GuardProxy,
     Shutdown(std_mpsc::Sender<()>),
+}
+
+impl Cmd {
+    fn area(&self) -> Area {
+        match self {
+            Cmd::SetProxy(_) | Cmd::GuardProxy => Area::Proxy,
+            Cmd::Activate(_)
+            | Cmd::Reload
+            | Cmd::Refresh
+            | Cmd::LinkProfile(_)
+            | Cmd::RemoveProfile(_)
+            | Cmd::CheckNow => Area::Profiles,
+            Cmd::CheckUpdate
+            | Cmd::Download
+            | Cmd::ActivateVersion(_)
+            | Cmd::DeleteVersion(_)
+            | Cmd::Checked(_)
+            | Cmd::Staged(_) => Area::Update,
+            Cmd::SetIconSet(_) | Cmd::SetTheme(_) => Area::Files,
+            _ => Area::Core,
+        }
+    }
+
+    /// Background work must not wipe a message the user has not read yet.
+    fn is_user_action(&self) -> bool {
+        !matches!(
+            self,
+            Cmd::Refresh
+                | Cmd::WatchConnections(_)
+                | Cmd::Checked(_)
+                | Cmd::Staged(_)
+                | Cmd::Restore
+                | Cmd::GuardProxy
+                | Cmd::Shutdown(_)
+        )
+    }
 }
 
 /// The UI's side. Stop and quit also raise `cancel`, which interrupts a pending readiness wait.
@@ -154,6 +237,7 @@ pub fn spawn(paths: Paths) -> Result<Handle> {
 struct Actor {
     paths: Paths,
     settings: Settings,
+    app: AppData,
     secret: String,
     api: Api,
     tx: mpsc::UnboundedSender<Cmd>,
@@ -168,6 +252,12 @@ struct Actor {
     log_task: Option<JoinHandle<()>>,
     conn_task: Option<JoinHandle<()>>,
     watching_connections: bool,
+    /// Profile names at the last reconciliation; `None` forces the next one.
+    reconciled: Option<Vec<String>>,
+    proxy: proxy::State,
+    /// Services that got our proxy, so ones appearing later can be added.
+    proxied: Vec<String>,
+    read_proxy: fn(u16) -> proxy::State,
 }
 
 type Parts = (
@@ -187,28 +277,36 @@ async fn wait_core(core: &mut Option<Core>) -> std::io::Result<std::process::Exi
 
 impl Actor {
     fn new(paths: Paths, tx: mpsc::UnboundedSender<Cmd>, cancel: Arc<AtomicBool>) -> Result<Parts> {
-        let (settings, notice) = Settings::load(&paths)?;
+        let (settings, settings_notice) = Settings::load(&paths)?;
+        let (app, app_notice) = AppData::load(&paths)?;
+        let notices: Vec<String> = settings_notice.into_iter().chain(app_notice).collect();
+        let mut messages = BTreeMap::new();
+        if !notices.is_empty() {
+            let text = notices.join("; ");
+            messages.insert(Area::Files, Message { text, error: true });
+        }
         let secret = paths.secret()?;
         let api = Api::new(settings.controller_port, &secret)?;
         let snap = Snapshot {
             phase: Phase::Stopped,
-            core_version: settings.core_version.clone(),
-            previous_version: settings.previous_core_version.clone(),
+            core_version: app.core_version.clone(),
+            previous_version: app.previous_core_version.clone(),
             installed: update::installed(&paths),
             profiles: profiles::list(&paths).unwrap_or_default(),
-            active: settings.active_profile.clone(),
+            active: app.active_profile.clone(),
             edited: false,
             mode: String::new(),
             groups: Vec::new(),
             proxy_on: false,
-            error: None,
-            notice,
+            proxy_busy: None,
+            messages,
             icon_set: settings.icon_set.clone(),
+            theme: settings.theme,
             mixed_port: settings.mixed_port,
             controller_port: settings.controller_port,
             latest: None,
             update_busy: None,
-            config_dir: paths.root.clone(),
+            config_dir: paths.config.clone(),
         };
         let (snap_tx, snap_rx) = watch::channel(Arc::new(snap.clone()));
         let (conn_tx, conn_rx) = watch::channel(Arc::new(Vec::new()));
@@ -217,6 +315,7 @@ impl Actor {
         let actor = Actor {
             paths,
             settings,
+            app,
             secret,
             api,
             tx,
@@ -231,6 +330,15 @@ impl Actor {
             log_task: None,
             conn_task: None,
             watching_connections: false,
+            reconciled: None,
+            proxy: proxy::State::default(),
+            proxied: Vec::new(),
+            // Tests must not depend on this Mac's proxy settings.
+            read_proxy: if cfg!(test) {
+                |_| proxy::State::default()
+            } else {
+                proxy::state
+            },
         };
         Ok((actor, snap_rx, conn_rx, log_rx, logs))
     }
@@ -267,10 +375,11 @@ impl Actor {
     }
 
     fn publish(&mut self) {
-        self.snap.core_version = self.settings.core_version.clone();
-        self.snap.previous_version = self.settings.previous_core_version.clone();
-        self.snap.active = self.settings.active_profile.clone();
+        self.snap.core_version = self.app.core_version.clone();
+        self.snap.previous_version = self.app.previous_core_version.clone();
+        self.snap.active = self.app.active_profile.clone();
         self.snap.icon_set = self.settings.icon_set.clone();
+        self.snap.theme = self.settings.theme;
         self.snap.installed = update::installed(&self.paths);
         self.snap_tx.send_if_modified(|current| {
             let changed = **current != self.snap;
@@ -284,43 +393,57 @@ impl Actor {
     /// Clean up after a previous xihomo that did not get to quit properly.
     async fn startup(&mut self) {
         match core::recover_orphan(&self.paths).await {
-            Ok(true) => {
-                self.snap.notice = Some("Stopped a core left behind by a previous run".to_owned())
-            }
+            Ok(true) => self.log(false, "Stopped a core left behind by a previous run"),
             Ok(false) => {}
-            Err(e) => self.snap.error = Some(format!("{e:#}")),
+            Err(e) => self.say(Area::Core, format!("{e:#}"), true),
         }
-        match proxy::read_marker(&self.paths) {
-            Ok(Some(_)) => match proxy::disable(&self.paths).await {
-                Ok(()) => {
-                    self.snap.notice =
-                        Some("Turned off the system proxy left on by a previous run".to_owned())
-                }
-                Err(e) => {
-                    self.snap.proxy_on = true;
-                    self.snap.error = Some(format!("{e:#}"));
-                }
-            },
-            Ok(None) => {}
-            Err(e) => self.snap.error = Some(format!("{e:#}")),
+        if let Err(e) = profiles::ensure_default(&self.paths) {
+            self.say(Area::Files, format!("{e:#}"), true);
         }
         self.refresh_profiles();
+        self.read_proxy_state();
+        // Queued, so the window shows the launch state before a core starts.
+        let _ = self.tx.send(Cmd::Restore);
+    }
+
+    fn log(&mut self, error: bool, text: &str) {
+        let mut logs = self.logs.lock().unwrap();
+        logs.push(LogLine {
+            level: if error { "error" } else { "info" }.into(),
+            text: format!("xihomo: {text}").into(),
+        });
+        self.log_tx.send_replace(logs.generation);
+    }
+
+    /// Shown next to `area` and kept in Logs.
+    fn say(&mut self, area: Area, text: String, error: bool) {
+        self.log(error, &text);
+        self.snap.messages.insert(area, Message { text, error });
+    }
+
+    /// Only user choices are remembered; crashes, failed starts and Quit leave them alone.
+    fn remember(&mut self, core_on: bool, proxy_on: bool) -> Result<()> {
+        self.app.core_on = core_on;
+        self.app.proxy_on = proxy_on;
+        self.app.save(&self.paths)
     }
 
     async fn handle(&mut self, cmd: Cmd) {
-        // Background refreshes must not wipe a message the user has not read yet.
-        if !matches!(
-            cmd,
-            Cmd::Refresh | Cmd::WatchConnections(_) | Cmd::Checked(_) | Cmd::Staged(_)
-        ) {
-            self.snap.error = None;
-            self.snap.notice = None;
+        let area = cmd.area();
+        if cmd.is_user_action() {
+            self.snap.messages.remove(&area);
         }
         let result = match cmd {
-            Cmd::Start => self.start().await,
-            Cmd::Stop => self.stop().await,
+            Cmd::Start => match self.remember(true, self.app.proxy_on) {
+                Ok(()) => self.start().await,
+                Err(e) => Err(e),
+            },
+            Cmd::Stop => match self.remember(false, false) {
+                Ok(()) => self.stop().await,
+                Err(e) => Err(e),
+            },
             Cmd::Activate(name) => self.activate(&name).await,
-            Cmd::Reload => match self.settings.active_profile.clone() {
+            Cmd::Reload => match self.app.active_profile.clone() {
                 Some(name) => self.activate(&name).await,
                 None => Err(anyhow!("Choose a profile first")),
             },
@@ -329,6 +452,7 @@ impl Actor {
             Cmd::Refresh => {
                 self.refresh_profiles();
                 self.check_edits();
+                self.read_proxy_state();
                 if self.core.is_some() {
                     self.refresh_runtime().await
                 } else {
@@ -337,35 +461,81 @@ impl Actor {
             }
             Cmd::CloseConnection(id) => self.api.close_connection(&id).await,
             Cmd::CloseAll => self.api.close_all().await,
-            Cmd::SetProxy(on) => self.set_proxy(on).await,
+            Cmd::SetProxy(on) => match self.remember(self.app.core_on, on) {
+                Ok(()) => self.apply_proxy(on).await,
+                Err(e) => Err(e),
+            },
+            Cmd::GuardProxy => self.guard_proxy().await,
+            Cmd::Restore => self.restore().await,
             Cmd::WatchConnections(on) => {
                 self.watching_connections = on;
                 self.reconcile_connection_task();
                 Ok(())
             }
             Cmd::CheckUpdate => self.check_update(),
-            Cmd::Download => self.download(),
+            Cmd::Download => match self.snap.latest.clone() {
+                Some(r) if update::installed(&self.paths).contains(&r.version) => {
+                    self.activate_version(&r.version).await
+                }
+                _ => self.download(),
+            },
             Cmd::ActivateVersion(version) => self.activate_version(&version).await,
+            Cmd::DeleteVersion(version) => self.delete_version(&version),
             Cmd::SetIconSet(set) => {
                 self.settings.icon_set = set;
                 self.settings.save(&self.paths)
             }
+            Cmd::SetTheme(theme) => {
+                self.settings.theme = theme;
+                self.settings.save(&self.paths)
+            }
             Cmd::LinkProfile(path) => profiles::link(&self.paths, &path).map(|name| {
-                self.snap.notice = Some(format!("Linked profile {name}"));
+                self.log(false, &format!("Linked profile {name}"));
                 self.refresh_profiles();
             }),
+            Cmd::RemoveProfile(name) => self.remove_profile(&name),
+            Cmd::CheckNow => {
+                self.reconciled = None;
+                self.periodic().await;
+                Ok(())
+            }
             Cmd::Checked(result) => self.on_checked(result),
-            Cmd::Staged(result) => self.on_staged(result),
+            Cmd::Staged(result) => self.on_staged(result).await,
             Cmd::Shutdown(_) => unreachable!("handled by the run loop"),
         };
         if let Err(e) = result {
-            self.snap.error = Some(format!("{e:#}"));
+            let text = format!("{e:#}");
+            // A failed start already shows its reason as the phase.
+            if self.snap.phase == Phase::Failed(text.clone()) {
+                self.log(true, &text);
+            } else {
+                self.say(area, text, true);
+            }
         }
+    }
+
+    /// The remembered state at launch. With no profile chosen yet, the generated default is used.
+    async fn restore(&mut self) -> Result<()> {
+        if self.app.active_profile.is_none()
+            && self.snap.profiles.iter().any(|p| p.name == "default")
+        {
+            self.app.active_profile = Some("default".to_owned());
+        }
+        let started = if self.app.core_on
+            && self.app.core_version.is_some()
+            && self.app.active_profile.is_some()
+        {
+            self.start().await
+        } else {
+            Ok(())
+        };
+        let guarded = self.guard_proxy().await;
+        started.and(guarded)
     }
 
     fn exe(&self) -> Result<(PathBuf, String)> {
         let version = self
-            .settings
+            .app
             .core_version
             .clone()
             .context("No Mihomo core installed yet: use Settings → Check for Update")?;
@@ -390,13 +560,13 @@ impl Actor {
     /// The only place selection is persisted, and it runs after activation has succeeded.
     fn commit(&mut self, name: &str, candidate: profiles::Candidate) -> Result<()> {
         write_private(&self.paths.last_good(), &fs::read(self.paths.candidate())?)?;
-        self.settings.active_profile = Some(name.to_owned());
-        self.settings.last_good_home = Some(candidate.home);
-        self.settings.save(&self.paths)?;
+        self.app.active_profile = Some(name.to_owned());
+        self.app.last_good_home = Some(candidate.home);
+        self.app.save(&self.paths)?;
         self.fingerprint = Some(candidate.fingerprint);
         self.snap.edited = false;
         if !candidate.notices.is_empty() {
-            self.snap.notice = Some(candidate.notices.join("; "));
+            self.say(Area::Profiles, candidate.notices.join("; "), false);
         }
         Ok(())
     }
@@ -476,13 +646,17 @@ impl Actor {
             };
             return result;
         }
-        self.refresh_runtime().await
+        self.refresh_runtime().await?;
+        if self.app.proxy_on {
+            self.apply_proxy(true).await?;
+        }
+        Ok(())
     }
 
     async fn start_inner(&mut self) -> Result<()> {
         let (exe, _) = self.exe()?;
         let name = self
-            .settings
+            .app
             .active_profile
             .clone()
             .context("Choose a profile first")?;
@@ -504,7 +678,7 @@ impl Actor {
         // One recovery attempt only: no restart loop.
         let last_good = self.paths.last_good();
         let Some(home) = self
-            .settings
+            .app
             .last_good_home
             .clone()
             .filter(|_| last_good.exists())
@@ -518,9 +692,11 @@ impl Actor {
             })?;
         self.fingerprint = None;
         self.snap.edited = true;
-        self.snap.notice = Some(format!(
-            "Running the last-good configuration because: {error:#}"
-        ));
+        self.say(
+            Area::Core,
+            format!("Running the last-good configuration because: {error:#}"),
+            false,
+        );
         Ok(())
     }
 
@@ -531,7 +707,7 @@ impl Actor {
         }
         self.snap.phase = Phase::Stopping;
         self.publish();
-        let proxy_result = self.restore_proxy().await;
+        let proxy_result = self.release_proxy().await;
         let stop_result = self.stop_child().await;
         self.snap.phase = Phase::Stopped;
         proxy_result.and(stop_result)
@@ -572,34 +748,75 @@ impl Actor {
         self.clear_runtime();
         let status = status.map_or_else(|e| e.to_string(), |s| s.to_string());
         self.snap.phase = Phase::Failed(format!("Mihomo exited unexpectedly ({status}): {tail}"));
-        self.schedule_proxy_restore();
-    }
-
-    /// A proxy pointing at a dead port blackholes the machine, so this cannot wait for the user.
-    /// It is queued as the next command because the exit handler must not block the select loop.
-    fn schedule_proxy_restore(&mut self) {
-        if self.snap.proxy_on {
-            let _ = self.tx.send(Cmd::SetProxy(false));
+        // Queued: the exit handler must not block the select loop on networksetup.
+        self.read_proxy_state();
+        if self.proxy.ours {
+            let _ = self.tx.send(Cmd::GuardProxy);
         }
     }
 
-    async fn restore_proxy(&mut self) -> Result<()> {
-        let result = proxy::disable(&self.paths).await;
-        self.snap.proxy_on = proxy::read_marker(&self.paths).ok().flatten().is_some();
-        result
+    fn read_proxy_state(&mut self) {
+        self.proxy = (self.read_proxy)(self.settings.mixed_port);
+        self.snap.proxy_on = self.proxy.on;
     }
 
-    async fn set_proxy(&mut self, on: bool) -> Result<()> {
-        if !on {
-            // Keep a Failed phase visible: its message explains why the proxy just went off.
-            return self.restore_proxy().await;
-        }
-        if self.core.is_none() {
+    /// Idempotent: on writes our proxy to every service, off clears every service.
+    async fn apply_proxy(&mut self, on: bool) -> Result<()> {
+        if on && self.core.is_none() {
             bail!("Start the core before enabling the system proxy");
         }
-        let result = proxy::enable(&self.paths, self.settings.mixed_port).await;
-        self.snap.proxy_on = result.is_ok();
+        self.snap.proxy_busy = Some(on);
+        self.publish();
+        let result = if on {
+            match proxy::services() {
+                Ok(services) => {
+                    let result = proxy::enable(&services, self.settings.mixed_port).await;
+                    self.proxied = services;
+                    result
+                }
+                Err(e) => Err(e),
+            }
+        } else {
+            proxy::disable().await
+        };
+        self.snap.proxy_busy = None;
+        self.read_proxy_state();
         result
+    }
+
+    /// Stop and Quit leave another tool's proxy alone.
+    async fn release_proxy(&mut self) -> Result<()> {
+        self.read_proxy_state();
+        if self.proxy.ours {
+            self.apply_proxy(false).await?;
+        }
+        Ok(())
+    }
+
+    /// A proxy pointing at our port with no core of ours behind it blackholes the machine.
+    async fn guard_proxy(&mut self) -> Result<()> {
+        if self.core.is_none() {
+            self.release_proxy().await?;
+        }
+        Ok(())
+    }
+
+    /// A network service that appeared while our proxy is on gets it too.
+    async fn sync_new_services(&mut self) -> Result<()> {
+        if !(self.app.proxy_on && self.core.is_some() && self.proxy.ours) {
+            return Ok(());
+        }
+        let services = proxy::services()?;
+        let new: Vec<String> = services
+            .iter()
+            .filter(|s| !self.proxied.contains(s))
+            .cloned()
+            .collect();
+        if !new.is_empty() {
+            proxy::enable(&new, self.settings.mixed_port).await?;
+        }
+        self.proxied = services;
+        Ok(())
     }
 
     async fn activate(&mut self, name: &str) -> Result<()> {
@@ -623,8 +840,9 @@ impl Actor {
             return self.refresh_runtime().await;
         }
         // A different home is a process argument, so this needs a managed restart.
-        let proxy_was_on = self.snap.proxy_on;
-        self.restore_proxy().await?;
+        self.read_proxy_state();
+        let proxy_was_on = self.proxy.ours;
+        self.release_proxy().await?;
         self.stop_child().await?;
         self.cancel.store(false, Ordering::SeqCst);
         let file = self.paths.candidate();
@@ -643,7 +861,7 @@ impl Actor {
 
     async fn relaunch_last_good(&mut self, exe: &Path, error: anyhow::Error) -> Result<()> {
         let home = self
-            .settings
+            .app
             .last_good_home
             .clone()
             .context("no last-good home")?;
@@ -663,8 +881,8 @@ impl Actor {
             return;
         }
         let _ = self.refresh_runtime().await;
-        if proxy_was_on && let Err(e) = self.set_proxy(true).await {
-            self.snap.error = Some(format!("{e:#}"));
+        if proxy_was_on && let Err(e) = self.apply_proxy(true).await {
+            self.say(Area::Proxy, format!("{e:#}"), true);
         }
     }
 
@@ -694,28 +912,84 @@ impl Actor {
         Ok(())
     }
 
-    fn refresh_profiles(&mut self) {
+    /// False when `profiles/` could not be listed; the previous list stays on screen.
+    fn refresh_profiles(&mut self) -> bool {
         match profiles::list(&self.paths) {
-            Ok(list) => self.snap.profiles = list,
-            Err(e) => self.snap.error = Some(format!("{e:#}")),
+            Ok(list) => {
+                self.snap.profiles = list;
+                true
+            }
+            Err(e) => {
+                self.say(Area::Profiles, format!("{e:#}"), true);
+                false
+            }
         }
+    }
+
+    /// Homes that must survive whatever the profile list says.
+    fn protected_homes(&self) -> Vec<PathBuf> {
+        let running = self.core.as_ref().map(|c| c.home.clone());
+        running
+            .into_iter()
+            .chain(self.app.last_good_home.clone())
+            .collect()
+    }
+
+    fn remove_profile(&mut self, name: &str) -> Result<()> {
+        if self.app.active_profile.as_deref() == Some(name) {
+            bail!("{name} is the active profile; switch to another one first");
+        }
+        let result = profiles::remove(&self.paths, name, &self.protected_homes());
+        self.refresh_profiles();
+        result?;
+        self.log(false, &format!("Removed profile {name}"));
+        Ok(())
+    }
+
+    /// Runs inside the actor, so it cannot interleave with an activation creating a home.
+    fn reconcile(&mut self) {
+        let names: Vec<String> = self.snap.profiles.iter().map(|p| p.name.clone()).collect();
+        if self.reconciled.as_ref() == Some(&names) {
+            return;
+        }
+        let versions: Vec<&str> = [
+            self.app.core_version.as_deref(),
+            self.app.previous_core_version.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        profiles::reconcile(
+            &self.paths,
+            &self.snap.profiles,
+            &self.protected_homes(),
+            &versions,
+        );
+        self.reconciled = Some(names);
     }
 
     /// Detect only. Applying is always the user's explicit Reload.
     fn check_edits(&mut self) {
-        if let (Some(name), true) = (self.settings.active_profile.clone(), self.core.is_some()) {
+        if let (Some(name), true) = (self.app.active_profile.clone(), self.core.is_some()) {
             let current = profiles::current_fingerprint(&self.paths, &name).ok();
             self.snap.edited = current != self.fingerprint;
         }
     }
 
     async fn periodic(&mut self) {
-        self.refresh_profiles();
+        let listed = self.refresh_profiles();
         self.check_edits();
-        if self.snap.proxy_on
-            && let Err(e) = proxy::sync_new_services(&self.paths).await
-        {
-            self.snap.error = Some(format!("{e:#}"));
+        self.read_proxy_state();
+        let proxy = match self.guard_proxy().await {
+            Ok(()) => self.sync_new_services().await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = proxy {
+            self.say(Area::Proxy, format!("{e:#}"), true);
+        }
+        // Without a trustworthy list every home would look orphaned.
+        if listed {
+            self.reconcile();
         }
     }
 
@@ -780,8 +1054,8 @@ impl Actor {
     fn on_checked(&mut self, result: Result<Release, String>) -> Result<()> {
         self.snap.update_busy = None;
         let release = result.map_err(|e| anyhow!("Update check failed: {e}"))?;
-        if self.settings.core_version.as_deref() == Some(&release.version) {
-            self.snap.notice = Some(format!("{} is the latest release", release.version));
+        if self.app.core_version.as_deref() == Some(&release.version) {
+            self.say(Area::Update, "Up to date".to_owned(), false);
         }
         self.snap.latest = Some(release);
         Ok(())
@@ -808,27 +1082,53 @@ impl Actor {
         Ok(())
     }
 
-    fn on_staged(&mut self, result: Result<String, String>) -> Result<()> {
+    /// A downloaded core is used right away; the first one starts like a launch would.
+    async fn on_staged(&mut self, result: Result<String, String>) -> Result<()> {
         self.snap.update_busy = None;
         let version = result.map_err(|e| anyhow!("Update failed: {e}"))?;
-        if self.settings.core_version.is_none() {
-            self.settings.core_version = Some(version.clone());
-            self.settings.save(&self.paths)?;
+        self.log(false, &format!("Installed {version}"));
+        if self.app.core_version.is_none() {
+            self.app.core_version = Some(version);
+            self.app.save(&self.paths)?;
+            return self.restore().await;
         }
-        self.snap.notice = Some(format!("Installed {version}"));
+        self.snap.update_busy = Some(format!("Switching to {version}…"));
+        self.publish();
+        let result = self.activate_version(&version).await;
+        self.snap.update_busy = None;
+        result
+    }
+
+    fn delete_version(&mut self, version: &str) -> Result<()> {
+        if self.app.core_version.as_deref() == Some(version) {
+            bail!("{version} is in use");
+        }
+        if !update::valid_version(version) {
+            bail!("{version} is not a core version");
+        }
+        fs::remove_dir_all(self.paths.bin().join(version))
+            .with_context(|| format!("delete {version}"))?;
+        if self.app.previous_core_version.as_deref() == Some(version) {
+            self.app.previous_core_version = None;
+            self.app.save(&self.paths)?;
+        }
+        self.log(false, &format!("Deleted core {version}"));
         Ok(())
     }
 
-    /// Switch core versions, used by both update and rollback. Settings change only after the new
-    /// core runs, so an interruption at any point leaves the previous selection in place.
+    /// Switch core versions, after an update or by choice. Settings change only after the new core
+    /// runs, so an interruption at any point leaves the previous selection in place.
     async fn activate_version(&mut self, target: &str) -> Result<()> {
+        if self.app.core_version.as_deref() == Some(target) {
+            return Ok(());
+        }
         let exe = self.paths.core_exe(target);
         if !update::valid_version(target) || !exe.is_file() {
             bail!("{target} is not installed");
         }
         let last_good = self.paths.last_good();
         if let Some(home) = self
-            .settings
+            .app
             .last_good_home
             .clone()
             .filter(|_| last_good.exists())
@@ -839,13 +1139,14 @@ impl Actor {
         }
         if self.core.is_some() {
             let home = self
-                .settings
+                .app
                 .last_good_home
                 .clone()
                 .context("no last-good home")?;
             let (old_exe, old_version) = self.exe()?;
-            let proxy_was_on = self.snap.proxy_on;
-            self.restore_proxy().await?;
+            self.read_proxy_state();
+            let proxy_was_on = self.proxy.ours;
+            self.release_proxy().await?;
             self.stop_child().await?;
             self.cancel.store(false, Ordering::SeqCst);
             if let Err(e) = self.launch(&exe, &home, &last_good).await {
@@ -864,21 +1165,17 @@ impl Actor {
             }
             self.after_restart(proxy_was_on).await;
         }
-        self.settings.previous_core_version = self.settings.core_version.replace(target.to_owned());
-        self.settings.save(&self.paths)?;
-        let previous = self
-            .settings
-            .previous_core_version
-            .clone()
-            .unwrap_or_default();
+        self.app.previous_core_version = self.app.core_version.replace(target.to_owned());
+        self.app.save(&self.paths)?;
+        let previous = self.app.previous_core_version.clone().unwrap_or_default();
         update::prune(&self.paths, &[target, &previous]);
-        self.snap.notice = Some(format!("Now using {target}"));
+        self.log(false, &format!("Now using {target}"));
         Ok(())
     }
 
     async fn shutdown(&mut self) {
-        if let Err(e) = self.restore_proxy().await {
-            // The marker stays on disk; the next launch retries.
+        if let Err(e) = self.release_proxy().await {
+            // The next launch's proxy guard retries.
             eprintln!("xihomo: restoring proxy settings failed: {e:#}");
         }
         if let Err(e) = self.stop_child().await {
