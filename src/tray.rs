@@ -1,10 +1,13 @@
 use crate::backend::{Cmd, Phase, Snapshot};
 use crate::icons::{self, State};
+use crate::settings::Theme;
 use crate::ui::Tab;
 use anyhow::Result;
+use objc2::{AnyThread, MainThreadMarker};
+use objc2_app_kit::{NSAppearance, NSAppearanceCustomization, NSApplication, NSImage, NSMenu};
 use tokio::sync::mpsc::UnboundedSender;
 use tray_icon::menu::{
-    CheckMenuItem, IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu,
+    CheckMenuItem, ContextMenu, IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu,
 };
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
@@ -16,13 +19,14 @@ pub const OPEN: &str = "open";
 pub const SETTINGS: &str = "settings";
 pub const QUIT: &str = "quit";
 pub const PROFILE_PREFIX: &str = "profile:";
-pub const REMOVE_PREFIX: &str = "remove:";
+pub const MODE_PREFIX: &str = "mode:";
+const MODES: [(&str, &str); 3] = [("rule", "Rule"), ("global", "Global"), ("direct", "Direct")];
 
 /// Owns the status item; dropping it would remove the icon, so it lives as long as the app.
 pub struct Tray {
     icon: TrayIcon,
     shown_icon: Option<(String, State)>,
-    shown_menu: Option<Vec<Entry>>,
+    shown_menu: Option<(Vec<Entry>, Theme)>,
 }
 
 pub fn phase_label(phase: &Phase) -> &'static str {
@@ -84,27 +88,28 @@ pub fn menu_model(s: &Snapshot) -> Vec<Entry> {
             checked: Some(s.active.as_deref() == Some(&p.name)),
         })
         .collect::<Vec<_>>();
-    // Permanent: kept in its own submenu, away from the switching items.
-    let removable = s
-        .profiles
-        .iter()
-        .map(|p| {
-            item(
-                &format!("{REMOVE_PREFIX}{}", p.name),
-                &p.name,
-                s.active.as_deref() != Some(&p.name),
-            )
-        })
-        .collect::<Vec<_>>();
     let mut menu = vec![
+        item(OPEN, "Open xihomo", true),
+        item(SETTINGS, "Settings…", true),
+        Entry::Separator,
         Entry::Item {
             id: None,
             label: status_line(s),
             enabled: false,
             checked: None,
         },
-        Entry::Separator,
         item(CORE, label, enabled),
+        Entry::Separator,
+    ];
+    // Enabled while stopped: the choice is remembered for the next start.
+    menu.extend(MODES.map(|(mode, label)| Entry::Item {
+        id: Some(format!("{MODE_PREFIX}{mode}")),
+        label: label.to_owned(),
+        enabled: s.phase != Phase::Stopping,
+        checked: Some(s.mode == mode),
+    }));
+    menu.extend([
+        Entry::Separator,
         Entry::Item {
             id: Some(PROXY.to_owned()),
             label: match s.proxy_busy {
@@ -117,27 +122,18 @@ pub fn menu_model(s: &Snapshot) -> Vec<Entry> {
             enabled: s.proxy_busy.is_none() && (s.phase == Phase::Running || s.proxy_on),
             checked: Some(s.proxy_on),
         },
+        Entry::Separator,
         Entry::Submenu {
             label: "Profile".to_owned(),
             enabled: !profiles.is_empty(),
             items: profiles,
         },
-        Entry::Submenu {
-            label: "Remove Profile".to_owned(),
-            enabled: removable
-                .iter()
-                .any(|e| matches!(e, Entry::Item { enabled: true, .. })),
-            items: removable,
-        },
-    ];
+    ]);
     if s.edited {
         menu.push(item(RELOAD, "Reload Edited Profile", true));
     }
     menu.extend([
         item(CHECK_NOW, "Check Now", true),
-        Entry::Separator,
-        item(OPEN, "Open xihomo", true),
-        item(SETTINGS, "Settings…", true),
         Entry::Separator,
         item(QUIT, "Quit xihomo", true),
     ]);
@@ -164,12 +160,18 @@ pub fn menu_action(id: &str, s: &Snapshot) -> Option<MenuAction> {
         OPEN => MenuAction::Open(None),
         SETTINGS => MenuAction::Open(Some(Tab::Settings)),
         QUIT => MenuAction::Quit,
-        other => match other.strip_prefix(REMOVE_PREFIX) {
-            Some(name) => MenuAction::Send(Cmd::RemoveProfile(name.to_owned())),
-            None => MenuAction::Send(Cmd::Activate(
-                other.strip_prefix(PROFILE_PREFIX)?.to_owned(),
-            )),
-        },
+        other => {
+            if let Some(mode) = other.strip_prefix(MODE_PREFIX) {
+                if s.phase == Phase::Stopping {
+                    return None;
+                }
+                MenuAction::Send(Cmd::SetMode(mode.to_owned()))
+            } else {
+                MenuAction::Send(Cmd::Activate(
+                    other.strip_prefix(PROFILE_PREFIX)?.to_owned(),
+                ))
+            }
+        }
     })
 }
 
@@ -214,6 +216,24 @@ fn build_menu(model: &[Entry]) -> Result<Menu> {
     Ok(menu)
 }
 
+/// macOS drops a menu's check mark column while no item in it is checked, which shifts every
+/// label left. A blank off-state image the size of the check mark keeps the column everywhere.
+/// A status menu follows the menu bar, not the app, so the app's fixed theme is copied onto it.
+fn style_menu(menu: &NSMenu, appearance: Option<&NSAppearance>) {
+    menu.setAppearance(appearance);
+    for item in menu.itemArray() {
+        if let Some(submenu) = item.submenu() {
+            style_menu(&submenu, appearance);
+        }
+        if let Some(check) = item.onStateImage()
+            && !item.isSeparatorItem()
+        {
+            let blank = NSImage::initWithSize(NSImage::alloc(), check.size());
+            item.setOffStateImage(Some(&blank));
+        }
+    }
+}
+
 impl Tray {
     /// Must run on the main thread after the application has finished launching.
     pub fn new(snapshot: &Snapshot, events: UnboundedSender<String>) -> Result<Self> {
@@ -245,10 +265,17 @@ impl Tray {
                 self.shown_icon = Some(wanted);
             }
         }
-        let signature = menu_model(s);
+        let signature = (menu_model(s), s.theme);
         if self.shown_menu.as_ref() != Some(&signature)
-            && let Ok(menu) = build_menu(&signature)
+            && let Ok(menu) = build_menu(&signature.0)
+            && let Some(mtm) = MainThreadMarker::new()
         {
+            let appearance = NSApplication::sharedApplication(mtm).appearance();
+            // Safety: on macOS `ns_menu` is the menu's live NSMenu, retained by `menu`.
+            style_menu(
+                unsafe { &*menu.ns_menu().cast::<NSMenu>() },
+                appearance.as_deref(),
+            );
             self.icon.set_menu(Some(Box::new(menu)));
             let _ = self
                 .icon
@@ -360,20 +387,62 @@ mod tests {
         }));
     }
 
+    fn labels(model: &[Entry]) -> Vec<&str> {
+        model
+            .iter()
+            .map(|e| match e {
+                Entry::Separator => "-",
+                Entry::Item { label, .. } | Entry::Submenu { label, .. } => label,
+            })
+            .collect()
+    }
+
     #[test]
-    fn remove_is_disabled_for_the_active_profile_only() {
-        let model = menu_model(&snapshot(Phase::Running));
-        assert_eq!(state(&model, "remove:home"), ("home".into(), false, None));
-        assert_eq!(state(&model, "remove:gone"), ("gone".into(), true, None));
-        let only_active = Snapshot {
-            profiles: snapshot(Phase::Running).profiles[..1].to_vec(),
+    fn menu_order_and_mode_items() {
+        let mut s = Snapshot {
+            edited: true,
+            mode: "global".into(),
             ..snapshot(Phase::Running)
         };
-        assert!(menu_model(&only_active).iter().any(|e| matches!(
-            e,
-            Entry::Submenu { label, enabled: false, .. } if label == "Remove Profile"
-        )));
-        assert_eq!(state(&model, CHECK_NOW), ("Check Now".into(), true, None));
+        let model = menu_model(&s);
+        assert_eq!(
+            labels(&model),
+            [
+                "Open xihomo",
+                "Settings…",
+                "-",
+                "Running · proxy off · home",
+                "Stop Core",
+                "-",
+                "Rule",
+                "Global",
+                "Direct",
+                "-",
+                "System Proxy",
+                "-",
+                "Profile",
+                "Reload Edited Profile",
+                "Check Now",
+                "-",
+                "Quit xihomo",
+            ]
+        );
+        let modes = |s: &Snapshot| {
+            let model = menu_model(s);
+            ["mode:rule", "mode:global", "mode:direct"].map(|id| {
+                let (_, enabled, checked) = state(&model, id);
+                (enabled, checked)
+            })
+        };
+        assert_eq!(
+            modes(&s),
+            [(true, Some(false)), (true, Some(true)), (true, Some(false))]
+        );
+        s.phase = Phase::Stopped;
+        s.mode = String::new();
+        assert_eq!(modes(&s), [(true, Some(false)); 3], "nothing recorded");
+        s.phase = Phase::Stopping;
+        assert_eq!(modes(&s), [(false, Some(false)); 3]);
     }
 
     #[test]
@@ -413,7 +482,8 @@ mod tests {
             matches!(menu_action("profile:a b/c", &on), Some(MenuAction::Send(Cmd::Activate(n))) if n == "a b/c")
         );
         assert!(
-            matches!(menu_action("remove:profile:x", &on), Some(MenuAction::Send(Cmd::RemoveProfile(n))) if n == "profile:x")
+            menu_action("remove:x", &on).is_none(),
+            "removal lives in the window"
         );
         assert!(matches!(
             menu_action(CHECK_NOW, &on),
@@ -429,5 +499,9 @@ mod tests {
         ));
         assert!(matches!(menu_action(QUIT, &on), Some(MenuAction::Quit)));
         assert!(menu_action("unknown", &on).is_none());
+        assert!(
+            matches!(menu_action("mode:direct", &stopped), Some(MenuAction::Send(Cmd::SetMode(m))) if m == "direct")
+        );
+        assert!(menu_action("mode:rule", &snapshot(Phase::Stopping)).is_none());
     }
 }

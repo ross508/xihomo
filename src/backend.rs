@@ -19,9 +19,29 @@ use tokio::task::JoinHandle;
 
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const PORT_GRACE: Duration = Duration::from_secs(5);
+const PROXY_SETTLE: Duration = Duration::from_secs(2);
 const LOG_LINES: usize = 2000;
 const LOG_BYTES: usize = 2 * 1024 * 1024;
 const LOG_LINE_BYTES: usize = 64 * 1024;
+const MODES: [&str; 3] = ["rule", "global", "direct"];
+/// Built-in outbounds that are never a useful default for GLOBAL.
+const BUILTIN: [&str; 5] = ["DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE"];
+
+/// What GLOBAL should select instead of DIRECT: its first member that is a proxy group, else
+/// its first member that is not built in. `None` leaves it alone.
+pub fn global_default(groups: &[Group]) -> Option<String> {
+    let global = groups.iter().find(|g| g.name == "GLOBAL")?;
+    if global.now != "DIRECT" {
+        return None;
+    }
+    let is_group = |m: &String| m != "GLOBAL" && groups.iter().any(|g| &g.name == m);
+    global
+        .all
+        .iter()
+        .find(|m| is_group(m))
+        .or_else(|| global.all.iter().find(|m| !BUILTIN.contains(&m.as_str())))
+        .cloned()
+}
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub enum Phase {
@@ -381,6 +401,9 @@ impl Actor {
         self.snap.icon_set = self.settings.icon_set.clone();
         self.snap.theme = self.settings.theme;
         self.snap.installed = update::installed(&self.paths);
+        if self.core.is_none() {
+            self.snap.mode = self.app.mode.clone().unwrap_or_default();
+        }
         self.snap_tx.send_if_modified(|current| {
             let changed = **current != self.snap;
             if changed {
@@ -544,7 +567,13 @@ impl Actor {
 
     /// Compose and test a candidate with the selected core. Nothing is activated or persisted.
     async fn prepare(&mut self, exe: &Path, name: &str) -> Result<profiles::Candidate> {
-        let candidate = profiles::write_candidate(&self.paths, &self.settings, name, &self.secret)?;
+        let candidate = profiles::write_candidate(
+            &self.paths,
+            &self.settings,
+            name,
+            &self.secret,
+            self.app.mode.as_deref(),
+        )?;
         core::validate(
             exe,
             &self.paths,
@@ -646,7 +675,7 @@ impl Actor {
             };
             return result;
         }
-        self.refresh_runtime().await?;
+        self.refresh_with_global_default().await?;
         if self.app.proxy_on {
             self.apply_proxy(true).await?;
         }
@@ -779,9 +808,26 @@ impl Actor {
         } else {
             proxy::disable().await
         };
+        if result.is_ok() {
+            self.settle_proxy(on).await;
+        } else {
+            self.read_proxy_state();
+        }
         self.snap.proxy_busy = None;
-        self.read_proxy_state();
         result
+    }
+
+    /// configd publishes the new state a moment after networksetup returns; reading it at once
+    /// can still show the old one until the next periodic check. Gives up after `PROXY_SETTLE`.
+    async fn settle_proxy(&mut self, on: bool) {
+        let deadline = Instant::now() + PROXY_SETTLE;
+        loop {
+            self.read_proxy_state();
+            if self.proxy.on == on || Instant::now() > deadline {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     /// Stop and Quit leave another tool's proxy alone.
@@ -828,7 +874,7 @@ impl Actor {
         if running_home == candidate.home {
             if let Err(e) = self.reload_running().await {
                 let recovery = self.api.reload(&self.paths.last_good()).await;
-                let _ = self.refresh_runtime().await;
+                let _ = self.refresh_with_global_default().await;
                 return Err(match recovery {
                     Ok(()) => e.context("reload failed; the last-good configuration was reloaded"),
                     Err(r) => e.context(format!(
@@ -837,7 +883,7 @@ impl Actor {
                 });
             }
             self.commit(name, candidate)?;
-            return self.refresh_runtime().await;
+            return self.refresh_with_global_default().await;
         }
         // A different home is a process argument, so this needs a managed restart.
         self.read_proxy_state();
@@ -880,7 +926,7 @@ impl Actor {
         if self.core.is_none() {
             return;
         }
-        let _ = self.refresh_runtime().await;
+        let _ = self.refresh_with_global_default().await;
         if proxy_was_on && let Err(e) = self.apply_proxy(true).await {
             self.say(Area::Proxy, format!("{e:#}"), true);
         }
@@ -893,10 +939,19 @@ impl Actor {
         Ok(())
     }
 
+    /// Always remembered; applied now if the core runs, otherwise at the next start.
+    /// Existing connections are left open.
     async fn set_mode(&mut self, mode: &str) -> Result<()> {
-        self.running_or_err()?;
+        if !MODES.contains(&mode) {
+            bail!("unknown mode {mode}");
+        }
+        self.app.mode = Some(mode.to_owned());
+        self.app.save(&self.paths)?;
+        if self.core.is_none() {
+            return Ok(());
+        }
         self.api.set_mode(mode).await?;
-        self.refresh_runtime().await
+        self.refresh_with_global_default().await
     }
 
     async fn select(&mut self, group: &str, proxy: &str) -> Result<()> {
@@ -909,6 +964,27 @@ impl Actor {
         let (mode, _) = self.api.runtime().await?;
         self.snap.mode = mode;
         self.snap.groups = self.api.groups().await?;
+        Ok(())
+    }
+
+    /// After a (re)load: applies the remembered mode, which `last-good.yaml` may predate, and
+    /// moves GLOBAL off DIRECT, where Mihomo starts it and where global acts like direct.
+    /// Only run after a start, a profile switch, a Reload or a mode switch, so a later manual
+    /// GLOBAL choice stays (Mihomo's cache.db remembers it per profile).
+    async fn refresh_with_global_default(&mut self) -> Result<()> {
+        self.refresh_runtime().await?;
+        if let Some(mode) = self.app.mode.clone()
+            && mode != self.snap.mode
+        {
+            self.api.set_mode(&mode).await?;
+            self.refresh_runtime().await?;
+        }
+        if self.snap.mode == "global"
+            && let Some(pick) = global_default(&self.snap.groups)
+        {
+            self.api.select("GLOBAL", &pick).await?;
+            self.refresh_runtime().await?;
+        }
         Ok(())
     }
 

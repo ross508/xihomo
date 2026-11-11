@@ -43,9 +43,9 @@ icon_set: orbit
 theme: auto        # auto | light | dark
 ```
 
-Ports always replace the profile's `mixed-port` and `external-controller` (bound to `127.0.0.1`), and are read at launch, so edit them while xihomo is not running. xihomo rewrites `settings.yaml` only when you change the icon set or theme in Settings, which drops comments. An unparseable file is moved to `settings.yaml.invalid` and defaults are used. What xihomo maintains itself (active profile, core versions, last-good home, and your last Start/Stop and System Proxy choices) lives in `state/app.json`.
+Ports always replace the profile's `mixed-port` and `external-controller` (bound to `127.0.0.1`), and are read at launch, so edit them while xihomo is not running. xihomo rewrites `settings.yaml` only when you change the icon set or theme in Settings, which drops comments. An unparseable file is moved to `settings.yaml.invalid` and defaults are used. What xihomo maintains itself (active profile, core versions, last-good home, your last Start/Stop and System Proxy choices, and your mode) lives in `state/app.json`.
 
-Effective configuration is: source profile, then `overrides.yaml`, then fields xihomo owns. Each step replaces whole top-level values; nothing is merged. `overrides.yaml` applies to every profile and may not set owned keys (`mixed-port`, `secret`, `tun`, `external-controller*`, `external-ui*`, `external-doh-server`). `tun` is forced off and TUN listeners are removed.
+Effective configuration is: source profile, then `overrides.yaml`, then fields xihomo owns. Each step replaces whole top-level values; nothing is merged. `overrides.yaml` applies to every profile and may not set owned keys (`mixed-port`, `secret`, `tun`, `external-controller*`, `external-ui*`, `external-doh-server`). `tun` is forced off and TUN listeners are removed. Once you pick a mode, it is also written as `mode` for every profile, replacing the profile's and `overrides.yaml`'s; until then each profile keeps its own.
 
 ### Profiles
 
@@ -53,7 +53,7 @@ Effective configuration is: source profile, then `overrides.yaml`, then fields x
 - Mihomo always runs with `-d homes/<profile>/` and `-f runtime/candidate.yaml`. Only the profile file itself is read; nothing next to a symlink's target is read or written, and relative paths in a profile resolve inside its home.
 - Each home keeps its own `cache.db`, so node selections are remembered per profile by Mihomo itself (`profile.store-selected`, which a profile or `overrides.yaml` may turn off). A home is created when its profile is first activated. Switching to another profile restarts the core.
 - Renaming a profile file changes its identity: its selections are lost and the old home is cleaned up.
-- **Remove Profile** in the menu is disabled for the active profile. It deletes a regular file permanently (not to the Trash), or only the link for a symlink, never its target, and deletes the profile's home in the same step.
+- **Remove** is in the right-click menu of a profile in Control, disabled for the active profile. It deletes a regular file permanently (not to the Trash), or only the link for a symlink, never its target, and deletes the profile's home in the same step.
 
 ### Cleanup
 
@@ -70,6 +70,9 @@ If `profiles/` cannot be listed, nothing is deleted. Orphaned homes go immediate
 - **Launch restores your last choices.** If a core is installed, it starts at launch unless you stopped it before quitting; the system proxy is off by default and comes back on only if you left it on. Only your own Start, Stop and System Proxy clicks are remembered; crashes, failed starts and Quit are not. Stop also turns the proxy off. Closing the window keeps the menu bar app running; Quit turns xihomo's proxy off and stops the child.
 - **Messages appear next to what they are about**, as one small line (red for errors), and are also written to Logs. A failed core shows its reason in the Control status line. There is no banner.
 - **External edits** are detected on window activation and every 30 seconds, and only ever offered as Reload.
+- **Mode** (rule, global, direct) is in Control and in the menu, also while the core is stopped. Your pick is remembered and survives Stop/Start, profile switches and Reload; while the core runs it applies immediately, without a restart, and open connections stay open. While stopped it applies at the next start.
+- **Global mode never routes everything direct by default.** Mihomo's GLOBAL group starts on DIRECT. Whenever the core runs in global mode with GLOBAL on DIRECT (after a start, a profile switch, a Reload or a switch to global), xihomo selects GLOBAL's first proxy group, or else its first node. A later choice of your own is kept: Mihomo remembers it per profile. In global mode Control lists GLOBAL first and leaves REJECT out of its choices.
+- **The menu**, top to bottom: Open xihomo and Settings…; the status line and Start/Stop Core; Rule, Global and Direct, checked on the current mode; System Proxy, checked when the system proxy is on; Profile, Reload Edited Profile (only after an edit) and Check Now; Quit xihomo.
 - **Check Now** (menu and Settings) runs the 30-second check immediately: refresh the profile list, detect edits, add the proxy to newly appeared network services, and clean up.
 - **Theme** in Settings applies immediately: `auto` follows the system appearance; `light` and `dark` fix the appearance of xihomo's window, including its title bar, and of its menus. The menu bar icon is a template image the system tints, whatever the theme.
 - **A profile is selected only after activation succeeds.** If it fails, the previous configuration stays; a failed Start retries once with `last-good.yaml`, never in a loop.

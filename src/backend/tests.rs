@@ -331,6 +331,7 @@ async fn dev_profiles_validate_after_overrides() {
                 mixed_port: 10999,
                 controller_port: 11000,
                 secret: "x",
+                mode: None,
             },
         )
         .unwrap_or_else(|_| panic!("composition failed"));
@@ -471,7 +472,7 @@ async fn default_profile_passes_the_real_core() {
     let paths = temp_paths("default-validates");
     profiles::ensure_default(&paths).unwrap();
     let candidate =
-        profiles::write_candidate(&paths, &Settings::default(), "default", "x").unwrap();
+        profiles::write_candidate(&paths, &Settings::default(), "default", "x", None).unwrap();
     core::validate(&exe, &paths, &candidate.home, &paths.candidate(), "x")
         .await
         .unwrap();
@@ -552,3 +553,154 @@ local_test!(failed_start_shows_its_reason_once, a, _rx, {
     assert_eq!(a.snap.message(Area::Core), None, "the phase carries it");
     assert!(saved(&a).core_on, "a failed start keeps the choice");
 });
+
+#[tokio::test(flavor = "current_thread")]
+async fn mode_is_recorded_while_stopped() {
+    let mut a = idle("mode-stopped");
+    a.publish();
+    assert_eq!(a.snap.mode, "", "nothing recorded, nothing shown");
+    a.handle(Cmd::SetMode("global".into())).await;
+    a.publish();
+    assert_eq!(a.snap.error(), None);
+    assert_eq!(saved(&a).mode.as_deref(), Some("global"));
+    assert_eq!(a.snap.mode, "global");
+    a.handle(Cmd::SetMode("bogus".into())).await;
+    assert!(a.snap.error().is_some());
+    assert_eq!(saved(&a).mode.as_deref(), Some("global"));
+}
+
+#[test]
+fn global_default_prefers_a_group_then_a_node() {
+    let group = |name: &str, now: &str, all: &[&str]| Group {
+        name: name.into(),
+        kind: "Selector".into(),
+        now: now.into(),
+        all: all.iter().map(|s| s.to_string()).collect(),
+    };
+    let built_in = ["DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE"];
+    let groups = [
+        group("GLOBAL", "DIRECT", &["DIRECT", "REJECT", "node", "A", "B"]),
+        group("A", "node", &["node"]),
+        group("B", "node", &["node"]),
+    ];
+    assert_eq!(global_default(&groups).as_deref(), Some("A"));
+    let only_nodes = [group(
+        "GLOBAL",
+        "DIRECT",
+        &[built_in.as_slice(), &["node"]].concat(),
+    )];
+    assert_eq!(global_default(&only_nodes).as_deref(), Some("node"));
+    assert_eq!(
+        global_default(&[group("GLOBAL", "DIRECT", &built_in)]),
+        None
+    );
+    let chosen = [
+        group("GLOBAL", "REJECT", &["DIRECT", "REJECT", "A"]),
+        group("A", "x", &["x"]),
+    ];
+    assert_eq!(global_default(&chosen), None, "only DIRECT is replaced");
+    assert_eq!(global_default(&groups[1..]), None, "no GLOBAL");
+    // A profile's own GLOBAL may list itself or groups in any order; the rule is the same.
+    let own = [
+        group("GLOBAL", "DIRECT", &["GLOBAL", "DIRECT", "B", "A"]),
+        group("A", "node", &["node"]),
+        group("B", "node", &["node"]),
+    ];
+    assert_eq!(global_default(&own).as_deref(), Some("B"));
+}
+
+fn global_now(a: &Actor) -> String {
+    a.snap
+        .groups
+        .iter()
+        .find(|g| g.name == "GLOBAL")
+        .unwrap()
+        .now
+        .clone()
+}
+
+local_test!(remembered_mode_survives_restart_and_reload, a, _rx, {
+    a.handle(Cmd::Start).await;
+    assert_eq!(a.snap.mode, "rule", "the profile's own mode");
+    a.handle(Cmd::SetMode("direct".into())).await;
+    assert_eq!(a.snap.mode, "direct");
+    a.handle(Cmd::Stop).await;
+    a.publish();
+    assert_eq!(a.snap.mode, "direct", "the recorded mode while stopped");
+    a.handle(Cmd::Start).await;
+    assert_eq!(a.snap.mode, "direct");
+    a.handle(Cmd::Reload).await;
+    assert_eq!((a.snap.mode.as_str(), a.snap.error()), ("direct", None));
+    a.handle(Cmd::Stop).await;
+});
+
+local_test!(global_mode_moves_off_direct_once, a, _rx, {
+    a.handle(Cmd::Start).await;
+    assert_eq!(global_now(&a), "DIRECT", "Mihomo's own default");
+    a.handle(Cmd::SetMode("global".into())).await;
+    assert_eq!(global_now(&a), "PICK", "the first proxy group");
+
+    // A manual choice is kept by Mihomo across a restart and not replaced.
+    a.handle(Cmd::Select {
+        group: "GLOBAL".into(),
+        proxy: "REJECT".into(),
+    })
+    .await;
+    a.handle(Cmd::Stop).await;
+    a.handle(Cmd::Start).await;
+    assert_eq!(a.snap.mode, "global");
+    assert_eq!(global_now(&a), "REJECT");
+    a.handle(Cmd::Stop).await;
+});
+
+local_test!(remembered_mode_beats_an_older_last_good, a, _rx, {
+    a.handle(Cmd::Start).await;
+    a.handle(Cmd::SetMode("global".into())).await;
+    // A version switch relaunches from last-good.yaml, written while the mode was still rule.
+    let other = a.paths.core_exe("v1.0.0");
+    fs::create_dir_all(other.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(real_core().unwrap(), &other).unwrap();
+    a.handle(Cmd::ActivateVersion("v1.0.0".into())).await;
+    assert_eq!((a.snap.mode.as_str(), a.snap.error()), ("global", None));
+    assert_eq!(global_now(&a), "PICK");
+    a.handle(Cmd::Stop).await;
+
+    // A broken profile falls back to last-good, still with the remembered mode.
+    a.handle(Cmd::SetMode("direct".into())).await;
+    fs::remove_file(a.paths.profiles().join("good.yaml")).unwrap();
+    a.handle(Cmd::Start).await;
+    assert_eq!(a.snap.phase, Phase::Running);
+    assert_eq!(a.snap.mode, "direct");
+    a.handle(Cmd::Stop).await;
+});
+
+/// The system proxy state lags behind networksetup; these readers stand in for configd.
+static LAGGING_READS: AtomicU16 = AtomicU16::new(0);
+fn lagging_off(_: u16) -> proxy::State {
+    let on = LAGGING_READS.fetch_add(1, Ordering::SeqCst) < 3;
+    proxy::State { on, ours: on }
+}
+fn stuck_on(_: u16) -> proxy::State {
+    proxy::State {
+        on: true,
+        ours: true,
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn proxy_state_is_read_until_it_settles() {
+    let mut a = idle("proxy-settle");
+    a.read_proxy = lagging_off;
+    let started = Instant::now();
+    a.settle_proxy(false).await;
+    assert!(!a.snap.proxy_on, "the lagging off is waited for");
+    assert_eq!(LAGGING_READS.load(Ordering::SeqCst), 4);
+    assert!(started.elapsed() < PROXY_SETTLE);
+
+    // A state that never matches is reported as read, after the deadline.
+    a.read_proxy = stuck_on;
+    let started = Instant::now();
+    a.settle_proxy(false).await;
+    assert!(a.snap.proxy_on);
+    assert!(started.elapsed() >= PROXY_SETTLE);
+}

@@ -213,6 +213,8 @@ pub struct Runtime<'a> {
     pub mixed_port: u16,
     pub controller_port: u16,
     pub secret: &'a str,
+    /// The user's remembered mode, which beats the profile's and the overrides'.
+    pub mode: Option<&'a str>,
 }
 
 /// source → overrides.yaml → xihomo-owned fields. Each step replaces whole top-level values:
@@ -251,6 +253,9 @@ pub fn compose(source: &[u8], overrides: &[u8], rt: &Runtime) -> Result<(String,
     let mut tun = Mapping::new();
     tun.insert("enable".into(), false.into());
     map.insert("tun".into(), tun.into());
+    if let Some(mode) = rt.mode {
+        map.insert("mode".into(), mode.into());
+    }
     Ok((yaml_serde::to_string(&map)?, notices))
 }
 
@@ -266,6 +271,7 @@ pub fn write_candidate(
     settings: &Settings,
     name: &str,
     secret: &str,
+    mode: Option<&str>,
 ) -> Result<Candidate> {
     let path = profile_path(paths, name)?;
     let target =
@@ -279,6 +285,7 @@ pub fn write_candidate(
             mixed_port: settings.mixed_port,
             controller_port: settings.controller_port,
             secret,
+            mode,
         },
     )
     .with_context(|| format!("profile {name}"))?;
@@ -320,6 +327,7 @@ mod tests {
         mixed_port: 10999,
         controller_port: 11000,
         secret: "s3",
+        mode: None,
     };
 
     fn parsed(yaml: &str) -> Value {
@@ -342,6 +350,29 @@ mod tests {
         );
         assert_eq!(v["rules"][0].as_str(), Some("MATCH,DIRECT"));
         assert!(notices.is_empty());
+    }
+
+    #[test]
+    fn remembered_mode_beats_profile_and_overrides() {
+        let mode = |source: &str, overrides: &str, rt: &Runtime| {
+            let (yaml, _) = compose(source.as_bytes(), overrides.as_bytes(), rt).unwrap();
+            parsed(&yaml)["mode"].as_str().map(str::to_owned)
+        };
+        let global = Runtime {
+            mode: Some("global"),
+            ..RT
+        };
+        assert_eq!(mode("mode: rule\n", "", &RT).as_deref(), Some("rule"));
+        assert_eq!(
+            mode("mode: rule\n", "mode: direct\n", &RT).as_deref(),
+            Some("direct")
+        );
+        assert_eq!(mode("a: 1\n", "", &RT), None);
+        assert_eq!(mode("mode: rule\n", "", &global).as_deref(), Some("global"));
+        assert_eq!(
+            mode("mode: rule\n", "mode: direct\n", &global).as_deref(),
+            Some("global")
+        );
     }
 
     #[test]
@@ -415,7 +446,7 @@ mod tests {
             !paths.home("home").exists(),
             "no home before first activation"
         );
-        let candidate = write_candidate(&paths, &Settings::default(), "home", "x").unwrap();
+        let candidate = write_candidate(&paths, &Settings::default(), "home", "x", None).unwrap();
         assert_eq!(candidate.home, paths.home("home"));
         assert!(candidate.home.is_dir());
         assert_eq!(fs::read_to_string(&target).unwrap(), "mixed-port: 1\n");
@@ -474,7 +505,7 @@ mod tests {
         link(&paths, &target).unwrap();
         fs::write(paths.profiles().join("own.yaml"), "a: 1\n").unwrap();
         for name in ["linked", "own"] {
-            write_candidate(&paths, &Settings::default(), name, "x").unwrap();
+            write_candidate(&paths, &Settings::default(), name, "x", None).unwrap();
             fs::write(paths.home(name).join("cache.db"), "x").unwrap();
         }
 
@@ -549,7 +580,7 @@ mod tests {
         fs::remove_file(&target).unwrap();
         let listed = list(&paths).unwrap();
         assert!(listed[0].is_link && listed[0].problem.is_some());
-        assert!(write_candidate(&paths, &Settings::default(), "t", "x").is_err());
+        assert!(write_candidate(&paths, &Settings::default(), "t", "x", None).is_err());
         assert!(
             !paths.candidate().exists(),
             "no snapshot from a broken link"

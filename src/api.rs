@@ -91,12 +91,13 @@ pub fn parse_groups(body: &Value) -> Vec<Group> {
         .and_then(|g| g["all"].as_array())
         .map(|a| a.iter().map(text).collect())
         .unwrap_or_default();
+    // GLOBAL first: it is the group that matters in global mode.
     let rank = |g: &Group| match g.name.as_str() {
-        "GLOBAL" => usize::MAX,
+        "GLOBAL" => 0,
         name => order
             .iter()
             .position(|o| o == name)
-            .unwrap_or(usize::MAX - 1),
+            .map_or(usize::MAX, |i| i + 1),
     };
     groups.sort_by_key(rank);
     groups
@@ -404,9 +405,9 @@ mod tests {
         let groups = parse_groups(&body);
         assert_eq!(
             groups.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(),
-            ["Auto/🇯🇵", "Zed", "GLOBAL"]
+            ["GLOBAL", "Auto/🇯🇵", "Zed"]
         );
-        assert!(!groups[0].selectable() && groups[1].selectable());
+        assert!(!groups[1].selectable() && groups[2].selectable());
 
         let api = Api::new(1, "s").unwrap();
         assert_eq!(

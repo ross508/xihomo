@@ -204,6 +204,8 @@ pub struct AppData {
     /// The user's last Start/Stop and System Proxy choices, restored at launch.
     pub core_on: bool,
     pub proxy_on: bool,
+    /// The user's outbound mode; `None` keeps each profile's own `mode`.
+    pub mode: Option<String>,
 }
 
 impl Default for AppData {
@@ -215,6 +217,7 @@ impl Default for AppData {
             last_good_home: None,
             core_on: true,
             proxy_on: false,
+            mode: None,
         }
     }
 }

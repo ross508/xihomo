@@ -81,11 +81,17 @@ pub struct AppState {
     log_paused: bool,
     log_scroll: UniformListScrollHandle,
     pub focus: FocusHandle,
-    /// The core version whose right-click menu is open, and where.
-    version_menu: Option<(String, Point<Pixels>)>,
+    /// What the open right-click menu would delete, and where it is.
+    context_menu: Option<(Deletable, Point<Pixels>)>,
     /// The palette of the last frame, so tests can see what was drawn.
     #[cfg(test)]
     palette: Option<Palette>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum Deletable {
+    Version(String),
+    Profile(String),
 }
 
 /// Room for the transparent title bar's traffic lights, measured on macOS 27; GPUI 0.2.2 does not
@@ -224,7 +230,7 @@ impl AppState {
             log_paused: false,
             log_scroll: UniformListScrollHandle::new(),
             focus: cx.focus_handle(),
-            version_menu: None,
+            context_menu: None,
             #[cfg(test)]
             palette: None,
         }
@@ -262,6 +268,17 @@ impl AppState {
     ) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
         let handle = self.handle.clone();
         move |_, _, _| handle.send(make())
+    }
+
+    /// Right-click opens the delete menu for `target` at the pointer.
+    fn open_menu(
+        target: Deletable,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(&gpui::MouseDownEvent, &mut Window, &mut App) + 'static {
+        cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+            this.context_menu = Some((target.clone(), event.position));
+            cx.notify();
+        })
     }
 
     /// One small line next to the area it is about: red for errors, dim otherwise.
@@ -348,14 +365,18 @@ impl AppState {
             } else {
                 name.clone()
             };
-            profiles = profiles.child(button(
-                id,
-                label,
-                p,
-                selected,
-                profile.problem.is_none(),
-                self.cmd(move || Cmd::Activate(name.clone())),
-            ));
+            let target = Deletable::Profile(name.clone());
+            profiles = profiles.child(
+                button(
+                    id,
+                    label,
+                    p,
+                    selected,
+                    profile.problem.is_none(),
+                    self.cmd(move || Cmd::Activate(name.clone())),
+                )
+                .on_mouse_down(MouseButton::Right, Self::open_menu(target, cx)),
+            );
         }
         if s.profiles.is_empty() {
             profiles = profiles.child(
@@ -390,19 +411,20 @@ impl AppState {
             );
         }
 
+        // Shown while stopped too: a choice is remembered and applied at the next start.
+        let mut modes = div().flex().gap_1();
+        for mode in ["rule", "global", "direct"] {
+            modes = modes.child(button(
+                mode,
+                mode,
+                p,
+                s.mode == mode,
+                s.phase != Phase::Stopping,
+                self.cmd(move || Cmd::SetMode(mode.to_owned())),
+            ));
+        }
+        column = column.child(section("MODE", p)).child(modes);
         if running {
-            let mut modes = div().flex().gap_1();
-            for mode in ["rule", "global", "direct"] {
-                modes = modes.child(button(
-                    mode,
-                    mode,
-                    p,
-                    s.mode == mode,
-                    true,
-                    self.cmd(move || Cmd::SetMode(mode.to_owned())),
-                ));
-            }
-            column = column.child(section("MODE", p)).child(modes);
             column = column.child(section("GROUPS", p));
             for group in s
                 .groups
@@ -439,7 +461,12 @@ impl AppState {
                 column = column.child(header);
                 if expanded {
                     let mut options = div().flex().flex_wrap().gap_1().px_2().pb_2();
-                    for proxy in &group.all {
+                    // Display only: REJECT as the whole machine's route is never wanted.
+                    for proxy in group
+                        .all
+                        .iter()
+                        .filter(|proxy| !(name == "GLOBAL" && *proxy == "REJECT"))
+                    {
                         let (g, pick) = (name.clone(), proxy.clone());
                         let id = SharedString::from(format!("pick-{name}-{proxy}"));
                         options = options.child(button(
@@ -785,7 +812,7 @@ impl AppState {
         let busy = s.update_busy.is_some();
         let mut versions = div().flex().flex_wrap().gap_1();
         for version in &s.installed {
-            let (pick, menu) = (version.clone(), version.clone());
+            let pick = version.clone();
             versions = versions.child(
                 button(
                     format!("core-{version}"),
@@ -797,10 +824,7 @@ impl AppState {
                 )
                 .on_mouse_down(
                     MouseButton::Right,
-                    cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                        this.version_menu = Some((menu.clone(), event.position));
-                        cx.notify();
-                    }),
+                    Self::open_menu(Deletable::Version(version.clone()), cx),
                 ),
             );
         }
@@ -873,17 +897,29 @@ impl Render for AppState {
         {
             self.palette = Some(p);
         }
-        let menu = self.version_menu.clone().map(|(version, position)| {
-            let in_use = self.snap.core_version.as_deref() == Some(&version);
+        let menu = self.context_menu.clone().map(|(target, position)| {
+            // The version in use and the active profile cannot be deleted.
+            let (selector, label, in_use) = match &target {
+                Deletable::Version(v) => (
+                    "delete-version",
+                    "Delete",
+                    self.snap.core_version.as_ref() == Some(v),
+                ),
+                Deletable::Profile(name) => (
+                    "remove-profile",
+                    "Remove",
+                    self.snap.active.as_ref() == Some(name),
+                ),
+            };
             let delete = div()
-                .id("delete-version")
-                .debug_selector(|| "delete-version".to_owned())
+                .id(selector)
+                .debug_selector(|| selector.to_owned())
                 .px_2()
                 .py_1()
                 .rounded(px(4.))
                 .text_size(px(12.))
                 .text_color(if in_use { p.dim } else { p.danger })
-                .child("Delete");
+                .child(label);
             let delete = if in_use {
                 delete
             } else {
@@ -891,8 +927,11 @@ impl Render for AppState {
                     .cursor_pointer()
                     .hover(move |st| st.bg(p.hover))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.handle.send(Cmd::DeleteVersion(version.clone()));
-                        this.version_menu = None;
+                        this.handle.send(match target.clone() {
+                            Deletable::Version(v) => Cmd::DeleteVersion(v),
+                            Deletable::Profile(name) => Cmd::RemoveProfile(name),
+                        });
+                        this.context_menu = None;
                         cx.notify();
                     }))
             };
@@ -908,11 +947,11 @@ impl Render for AppState {
                         .border_color(p.border)
                         .bg(p.panel)
                         .shadow_md()
-                        // A right-click elsewhere may be opening this menu on another version.
+                        // A right-click elsewhere may be opening this menu on another item.
                         .on_mouse_down_out(cx.listener(
                             |this, event: &gpui::MouseDownEvent, _, cx| {
                                 if event.button == MouseButton::Left {
-                                    this.version_menu = None;
+                                    this.context_menu = None;
                                     cx.notify();
                                 }
                             },
@@ -1234,6 +1273,68 @@ mod gpui_tests {
     }
 
     #[gpui::test]
+    fn mode_row_is_shown_and_usable_while_stopped(cx: &mut TestAppContext) {
+        let stopped = Snapshot {
+            phase: Phase::Stopped,
+            mode: "direct".into(),
+            groups: Vec::new(),
+            ..running()
+        };
+        let mut ui = open(cx, stopped);
+        assert!(ui.cx.debug_bounds("group-PICK").is_none(), "no groups");
+        ui.click("rule");
+        assert!(matches!(&ui.sent()[..], [Cmd::SetMode(mode)] if mode == "rule"));
+        ui.set(|s| {
+            s.snap = Arc::new(Snapshot {
+                phase: Phase::Stopping,
+                ..(*s.snap).clone()
+            })
+        });
+        ui.click("global");
+        assert!(ui.sent().is_empty(), "disabled while stopping");
+    }
+
+    #[gpui::test]
+    fn global_is_listed_first_in_global_mode_without_reject(cx: &mut TestAppContext) {
+        let global = Group {
+            name: "GLOBAL".into(),
+            kind: "Selector".into(),
+            now: "PICK".into(),
+            all: vec!["DIRECT".into(), "REJECT".into(), "PICK".into()],
+        };
+        let mut snap = running();
+        snap.mode = "global".into();
+        snap.groups.insert(0, global);
+        let mut ui = open(cx, snap);
+        let y = |ui: &mut Ui, id| ui.cx.debug_bounds(id).unwrap().origin.y;
+        assert!(y(&mut ui, "group-GLOBAL") < y(&mut ui, "group-PICK"));
+        ui.click("group-GLOBAL");
+        assert!(ui.cx.debug_bounds("pick-GLOBAL-DIRECT").is_some());
+        assert!(ui.cx.debug_bounds("pick-GLOBAL-REJECT").is_none());
+        ui.click("pick-GLOBAL-DIRECT");
+        assert!(
+            matches!(&ui.sent()[..], [Cmd::Select { group, proxy }] if group == "GLOBAL" && proxy == "DIRECT")
+        );
+    }
+
+    #[gpui::test]
+    fn global_is_hidden_outside_global_mode(cx: &mut TestAppContext) {
+        let mut snap = running();
+        snap.groups.insert(
+            0,
+            Group {
+                name: "GLOBAL".into(),
+                kind: "Selector".into(),
+                now: "DIRECT".into(),
+                all: vec!["DIRECT".into()],
+            },
+        );
+        let ui = open(cx, snap);
+        assert!(ui.cx.debug_bounds("group-GLOBAL").is_none());
+        assert!(ui.cx.debug_bounds("group-PICK").is_some());
+    }
+
+    #[gpui::test]
     fn connections_can_be_closed_one_by_one_or_all(cx: &mut TestAppContext) {
         let mut ui = open(cx, running());
         let conn = |id: &str| Connection {
@@ -1328,7 +1429,7 @@ mod gpui_tests {
         ui.right_click("core-v1.19.32");
         ui.click("delete-version");
         assert!(matches!(&ui.sent()[..], [Cmd::DeleteVersion(v)] if v == "v1.19.32"));
-        assert!(ui.read(|s| s.version_menu.is_none()));
+        assert!(ui.read(|s| s.context_menu.is_none()));
 
         ui.set(|s| {
             let mut snap = (*s.snap).clone();
@@ -1364,9 +1465,22 @@ mod gpui_tests {
         ui.keys("cmd-4");
         ui.drain();
         ui.right_click("core-v1.19.33");
-        assert!(ui.read(|s| s.version_menu.is_some()));
+        assert!(ui.read(|s| s.context_menu.is_some()));
         ui.click("delete-version");
         assert!(ui.sent().is_empty());
+    }
+
+    #[gpui::test]
+    fn profiles_are_removed_by_right_click_except_the_active_one(cx: &mut TestAppContext) {
+        let mut ui = open(cx, running());
+        ui.right_click("profile-home");
+        ui.click("remove-profile");
+        assert!(ui.sent().is_empty(), "the active profile stays");
+        // A broken link cannot be activated but can be removed.
+        ui.right_click("profile-gone");
+        ui.click("remove-profile");
+        assert!(matches!(&ui.sent()[..], [Cmd::RemoveProfile(n)] if n == "gone"));
+        assert!(ui.read(|s| s.context_menu.is_none()));
     }
 
     #[gpui::test]
