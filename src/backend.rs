@@ -423,6 +423,16 @@ impl Actor {
         if let Err(e) = profiles::ensure_default(&self.paths) {
             self.say(Area::Files, format!("{e:#}"), true);
         }
+        // A core placed in bin/ by hand is used, before the cleanup below would delete it.
+        if self.app.core_version.is_none()
+            && let Some(version) = update::newest_installed(&self.paths)
+        {
+            self.app.core_version = Some(version.clone());
+            match self.app.save(&self.paths) {
+                Ok(()) => self.log(false, &format!("Using installed core {version}")),
+                Err(e) => self.say(Area::Core, format!("{e:#}"), true),
+            }
+        }
         self.refresh_profiles();
         self.read_proxy_state();
         // Queued, so the window shows the launch state before a core starts.

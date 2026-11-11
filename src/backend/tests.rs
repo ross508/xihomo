@@ -520,6 +520,20 @@ async fn only_unused_versions_can_be_deleted() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn startup_uses_a_core_placed_by_hand_instead_of_deleting_it() {
+    let mut a = idle("adopt-core");
+    install(&a, &["v1.9.0", "v1.19.33"]);
+    a.startup().await;
+    assert_eq!(a.app.core_version.as_deref(), Some("v1.19.33"));
+    assert_eq!(saved(&a).core_version.as_deref(), Some("v1.19.33"));
+    assert!(
+        a.paths.core_exe("v1.19.33").is_file(),
+        "kept by the cleanup"
+    );
+    assert_eq!(a.snap.error(), None);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn restore_picks_the_default_profile_and_skips_without_a_core() {
     let mut a = idle("restore-default");
     a.startup().await;

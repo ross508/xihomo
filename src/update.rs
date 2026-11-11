@@ -220,6 +220,17 @@ pub fn installed(paths: &Paths) -> Vec<String> {
     out
 }
 
+/// The newest installed version, comparing its numbers so v1.19.0 beats v1.9.0.
+pub fn newest_installed(paths: &Paths) -> Option<String> {
+    let numbers = |v: &str| -> Vec<u64> {
+        v[1..]
+            .split(|c: char| !c.is_ascii_digit())
+            .filter_map(|n| n.parse().ok())
+            .collect()
+    };
+    installed(paths).into_iter().max_by_key(|v| numbers(v))
+}
+
 /// Keep only the running version and its rollback target.
 pub fn prune(paths: &Paths, keep: &[&str]) {
     for version in installed(paths) {
@@ -379,5 +390,16 @@ mod tests {
         }
         prune(&paths, &["v2.0.0", "v3.0.0"]);
         assert_eq!(installed(&paths), ["v2.0.0", "v3.0.0"]);
+    }
+
+    #[test]
+    fn newest_installed_compares_numbers_not_text() {
+        let paths = temp_paths("newest");
+        assert_eq!(newest_installed(&paths), None);
+        for v in ["v1.9.0", "v1.19.33", "v1.19.4"] {
+            fs::create_dir_all(paths.bin().join(v)).unwrap();
+            fs::write(paths.core_exe(v), "x").unwrap();
+        }
+        assert_eq!(newest_installed(&paths).as_deref(), Some("v1.19.33"));
     }
 }
