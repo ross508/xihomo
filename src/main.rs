@@ -2,6 +2,7 @@ mod api;
 mod backend;
 mod core;
 mod icons;
+mod input;
 mod profiles;
 mod proxy;
 mod settings;
@@ -132,6 +133,7 @@ fn run_app(handle: Handle, cx: &mut App) -> Result<()> {
         KeyBinding::new("cmd-3", ui::ShowLogs, None),
         KeyBinding::new("cmd-4", ui::ShowSettings, None),
     ]);
+    cx.bind_keys(input::bindings());
     cx.on_action(|_: &ui::Quit, cx| cx.quit());
 
     let state = cx.new(|cx| AppState::new(handle.clone(), cx));

@@ -1,14 +1,14 @@
 use crate::api::{Connection, LogLine};
 use crate::backend::{Area, Cmd, Handle, Phase, Snapshot};
 use crate::icons;
+use crate::input::{Changed, TextInput};
 use crate::settings::Theme;
 use crate::tray::phase_label;
 use gpui::prelude::*;
 use gpui::{
-    App, ClickEvent, Context, ElementId, FocusHandle, Hsla, KeyDownEvent, MouseButton,
-    PathPromptOptions, Pixels, Point, ScrollStrategy, SharedString, Stateful,
-    UniformListScrollHandle, Window, WindowAppearance, WindowHandle, actions, anchored, deferred,
-    div, px, rgb, uniform_list,
+    App, ClickEvent, Context, ElementId, Entity, FocusHandle, Hsla, MouseButton, PathPromptOptions,
+    Pixels, Point, ScrollStrategy, SharedString, Stateful, UniformListScrollHandle, Window,
+    WindowAppearance, WindowHandle, actions, anchored, deferred, div, px, rgb, uniform_list,
 };
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -68,6 +68,20 @@ pub fn filter_logs<'a>(
         .collect()
 }
 
+/// Case-insensitive match on what a connection row shows, plus its rule.
+fn connection_matches(conn: &Connection, needle: &str) -> bool {
+    needle.is_empty()
+        || [
+            conn.destination(),
+            conn.metadata.network.clone(),
+            conn.metadata.process.clone(),
+            conn.chains.join(" "),
+            conn.rule.clone(),
+        ]
+        .iter()
+        .any(|field| field.to_lowercase().contains(needle))
+}
+
 pub struct AppState {
     pub handle: Handle,
     pub snap: Arc<Snapshot>,
@@ -78,6 +92,10 @@ pub struct AppState {
     log_view: Vec<LogLine>,
     log_level: &'static str,
     log_filter: String,
+    log_input: Entity<TextInput>,
+    /// Lowercased, like the log filter.
+    conn_filter: String,
+    conn_input: Entity<TextInput>,
     log_paused: bool,
     log_scroll: UniformListScrollHandle,
     pub focus: FocusHandle,
@@ -205,6 +223,27 @@ fn button(
     }
 }
 
+/// A filter input framed like the other controls; accent-bordered while it filters.
+fn filter_field(
+    id: &'static str,
+    input: &Entity<TextInput>,
+    active: bool,
+    p: Palette,
+) -> gpui::Div {
+    div()
+        .debug_selector(|| id.to_owned())
+        .flex_1()
+        .min_w_0()
+        .rounded(px(5.))
+        .bg(p.panel)
+        .border_1()
+        .border_color(if active { p.accent } else { p.border })
+        .text_size(px(12.))
+        .text_color(p.text)
+        .overflow_hidden()
+        .child(input.clone())
+}
+
 fn section(title: &'static str, p: Palette) -> gpui::Div {
     div()
         .text_size(px(11.))
@@ -217,6 +256,19 @@ fn section(title: &'static str, p: Palette) -> gpui::Div {
 impl AppState {
     pub fn new(handle: Handle, cx: &mut Context<Self>) -> Self {
         let snap = handle.snapshot.borrow().clone();
+        let log_input = cx.new(|cx| TextInput::new("Filter logs", cx));
+        let conn_input = cx.new(|cx| TextInput::new("Filter connections", cx));
+        cx.subscribe(&log_input, |this, input, _: &Changed, cx| {
+            this.log_filter = input.read(cx).text().to_owned();
+            this.rebuild_logs();
+            cx.notify();
+        })
+        .detach();
+        cx.subscribe(&conn_input, |this, input, _: &Changed, cx| {
+            this.conn_filter = input.read(cx).text().to_lowercase();
+            cx.notify();
+        })
+        .detach();
         Self {
             handle,
             snap,
@@ -227,6 +279,9 @@ impl AppState {
             log_view: Vec::new(),
             log_level: "all",
             log_filter: String::new(),
+            log_input,
+            conn_filter: String::new(),
+            conn_input,
             log_paused: false,
             log_scroll: UniformListScrollHandle::new(),
             focus: cx.focus_handle(),
@@ -495,14 +550,30 @@ impl AppState {
 
     fn render_connections(&mut self, p: Palette, cx: &mut Context<Self>) -> gpui::AnyElement {
         let count = self.conns.len();
+        let shown: Arc<Vec<usize>> = Arc::new(
+            (0..count)
+                .filter(|&ix| connection_matches(&self.conns[ix], &self.conn_filter))
+                .collect(),
+        );
+        let summary = if self.conn_filter.is_empty() {
+            format!("{count} active")
+        } else {
+            format!("{} of {count} active", shown.len())
+        };
         let header = div()
             .flex()
-            .justify_between()
             .items_center()
+            .gap_2()
             .mb_2()
             .text_size(px(12.))
             .text_color(p.dim)
-            .child(format!("{count} active"))
+            .child(filter_field(
+                "conn-filter",
+                &self.conn_input,
+                !self.conn_filter.is_empty(),
+                p,
+            ))
+            .child(div().flex_none().child(summary))
             .child(button(
                 "close-all",
                 "Close All",
@@ -513,10 +584,11 @@ impl AppState {
             ));
         let list = uniform_list(
             "connections",
-            count,
+            shown.len(),
             cx.processor(move |this, range: std::ops::Range<usize>, _, _| {
                 range
-                    .map(|ix| {
+                    .map(|row| {
+                        let ix = shown[row];
                         let conn = &this.conns[ix];
                         let chain: Vec<&str> =
                             conn.chains.iter().rev().map(String::as_str).collect();
@@ -594,37 +666,13 @@ impl AppState {
                 }),
             ));
         }
-        // shortcut: typed characters only (no IME composition or selection), a full input needs GPUI's EntityInputHandler.
-        let filter_text = if self.log_filter.is_empty() {
-            "Type to filter".to_owned()
-        } else {
-            self.log_filter.clone()
-        };
         bar = bar
-            .child(
-                div()
-                    .id("log-filter")
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .px_2()
-                    .py(px(3.))
-                    .rounded(px(5.))
-                    .bg(p.panel)
-                    .border_1()
-                    .border_color(if self.log_filter.is_empty() {
-                        p.border
-                    } else {
-                        p.accent
-                    })
-                    .text_size(px(12.))
-                    .text_color(if self.log_filter.is_empty() {
-                        p.dim
-                    } else {
-                        p.text
-                    })
-                    .child(filter_text),
-            )
+            .child(filter_field(
+                "log-filter",
+                &self.log_input,
+                !self.log_filter.is_empty(),
+                p,
+            ))
             .child(button(
                 "pause",
                 if self.log_paused { "Resume" } else { "Pause" },
@@ -867,32 +915,21 @@ impl AppState {
             .child(column)
             .into_any_element()
     }
-
-    fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
-        if self.tab != Tab::Logs
-            || event.keystroke.modifiers.platform
-            || event.keystroke.modifiers.control
-        {
-            return;
-        }
-        match event.keystroke.key.as_str() {
-            "backspace" => {
-                self.log_filter.pop();
-            }
-            "escape" => self.log_filter.clear(),
-            _ => match &event.keystroke.key_char {
-                Some(text) if !text.chars().any(char::is_control) => self.log_filter.push_str(text),
-                _ => return,
-            },
-        }
-        self.rebuild_logs();
-        cx.notify();
-    }
 }
 
 impl Render for AppState {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(self.snap.theme, window.appearance());
+        // Typing filters right away on Logs and Connections; elsewhere focus returns to the root,
+        // so a hidden input never swallows the tab and window shortcuts.
+        let wanted = match self.tab {
+            Tab::Logs => self.log_input.read(cx).focus.clone(),
+            Tab::Connections => self.conn_input.read(cx).focus.clone(),
+            _ => self.focus.clone(),
+        };
+        if !wanted.contains_focused(window, cx) {
+            window.focus(&wanted);
+        }
         #[cfg(test)]
         {
             self.palette = Some(p);
@@ -985,7 +1022,6 @@ impl Render for AppState {
         div()
             .track_focus(&self.focus)
             .key_context("xihomo")
-            .on_key_down(cx.listener(|this, event, _, cx| this.on_key(event, cx)))
             .on_action(|_: &CloseWindow, window, _| window.remove_window())
             .on_action(cx.listener(|this, _: &ShowControl, _, cx| this.set_tab(Tab::Control, cx)))
             .on_action(
@@ -1021,6 +1057,33 @@ impl Render for AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_filter_matches_shown_fields_and_rule() {
+        let conn = Connection {
+            metadata: crate::api::Metadata {
+                host: "api.github.com".into(),
+                destination_port: "443".into(),
+                network: "tcp".into(),
+                process: "Safari".into(),
+                ..Default::default()
+            },
+            chains: vec!["node-a".into(), "Proxy".into()],
+            rule: "DomainSuffix".into(),
+            ..Connection::default()
+        };
+        for needle in [
+            "",
+            "github.com:443",
+            "tcp",
+            "safari",
+            "proxy",
+            "domainsuffix",
+        ] {
+            assert!(connection_matches(&conn, needle), "{needle}");
+        }
+        assert!(!connection_matches(&conn, "chrome"));
+    }
 
     #[test]
     fn log_filter_combines_level_and_case_insensitive_text() {
@@ -1120,7 +1183,8 @@ mod gpui_tests {
                 KeyBinding::new("cmd-2", ShowConnections, None),
                 KeyBinding::new("cmd-3", ShowLogs, None),
                 KeyBinding::new("cmd-4", ShowSettings, None),
-            ])
+            ]);
+            cx.bind_keys(crate::input::bindings());
         });
         let (handle, rx) = Handle::detached(snapshot);
         let (view, cx) = cx.add_window_view(|window, cx| {
@@ -1355,6 +1419,55 @@ mod gpui_tests {
         assert!(matches!(&ui.sent()[..], [Cmd::CloseConnection(id)] if id == "c2"));
         ui.click("close-all");
         assert!(matches!(ui.sent()[..], [Cmd::CloseAll]));
+    }
+
+    #[gpui::test]
+    fn connections_filter_by_typed_text_and_shortcuts_still_work(cx: &mut TestAppContext) {
+        let mut ui = open(cx, running());
+        let conn = |id: &str| Connection {
+            id: id.into(),
+            metadata: Metadata {
+                host: format!("{id}.example"),
+                destination_port: "443".into(),
+                ..Metadata::default()
+            },
+            ..Connection::default()
+        };
+        ui.set(|s| s.conns = Arc::new(vec![conn("c1"), conn("c2")]));
+        ui.keys("cmd-2");
+        ui.drain();
+        ui.cx.simulate_input("C2");
+        assert_eq!(ui.read(|s| s.conn_filter.clone()), "c2");
+        assert_eq!(
+            ui.read(|s| s.log_filter.clone()),
+            "",
+            "only the visible tab's filter"
+        );
+        // The first row is now c2: its Close button sits where c1's was.
+        ui.click("close-c1");
+        assert!(matches!(&ui.sent()[..], [Cmd::CloseConnection(id)] if id == "c2"));
+
+        // Window shortcuts pass through the focused input; other tabs take no typing.
+        ui.keys("cmd-1");
+        assert_eq!(ui.read(|s| s.tab), Tab::Control);
+        ui.cx.simulate_input("x");
+        assert_eq!(ui.read(|s| s.conn_filter.clone()), "c2");
+        ui.keys("cmd-2 escape");
+        assert_eq!(ui.read(|s| s.conn_filter.clone()), "");
+    }
+
+    #[gpui::test]
+    fn a_click_in_the_filter_padding_places_the_cursor(cx: &mut TestAppContext) {
+        let mut ui = open(cx, running());
+        ui.keys("cmd-3");
+        ui.cx.simulate_input("git");
+        let field = ui.cx.debug_bounds("log-filter").unwrap();
+        // Inside the border, left of the text: the start of the line.
+        let edge = gpui::point(field.left() + px(3.), field.center().y);
+        ui.cx.simulate_click(edge, Modifiers::default());
+        ui.frame();
+        ui.cx.simulate_input("x");
+        assert_eq!(ui.read(|s| s.log_filter.clone()), "xgit");
     }
 
     #[gpui::test]
