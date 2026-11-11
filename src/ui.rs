@@ -2,7 +2,7 @@ use crate::api::{Connection, LogLine};
 use crate::backend::{Area, Cmd, Handle, Phase, Snapshot};
 use crate::icons;
 use crate::input::{Changed, TextInput};
-use crate::settings::Theme;
+use crate::settings::{self, Theme};
 use crate::tray::phase_label;
 use gpui::prelude::*;
 use gpui::{
@@ -401,11 +401,12 @@ impl AppState {
             None if proxy_on => ("System Proxy: On", true),
             None => ("System Proxy: Off", running),
         };
+        let channel = if settings::DEV { " · dev" } else { "" };
         let (status, status_color) = match &s.phase {
-            Phase::Failed(reason) => (format!("Failed: {reason}"), p.danger),
+            Phase::Failed(reason) => (format!("Failed: {reason}{channel}"), p.danger),
             phase => (
                 format!(
-                    "{} · {} · mixed {} · controller {}",
+                    "{} · {} · mixed {} · controller {}{channel}",
                     phase_label(phase),
                     s.core_version.as_deref().unwrap_or("no core"),
                     s.mixed_port,
@@ -943,7 +944,7 @@ impl AppState {
             ));
         }
         column = column
-            .child(section("MIHOMO CORE", p))
+            .child(section("CORE", p))
             .child(versions)
             .child(actions);
         column = match &s.update_busy {

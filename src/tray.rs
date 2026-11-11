@@ -1,6 +1,6 @@
 use crate::backend::{Cmd, Phase, Snapshot};
 use crate::icons::{self, State};
-use crate::settings::{self, Theme};
+use crate::settings::Theme;
 use crate::ui::Tab;
 use anyhow::Result;
 use objc2::{AnyThread, MainThreadMarker};
@@ -39,10 +39,10 @@ pub fn phase_label(phase: &Phase) -> &'static str {
     }
 }
 
+/// The menu's own System Proxy item shows the proxy state, so this line leaves it out.
 fn status_line(s: &Snapshot) -> String {
-    let proxy = if s.proxy_on { "proxy on" } else { "proxy off" };
     let profile = s.active.as_deref().unwrap_or("no profile");
-    format!("{} · {proxy} · {profile}", phase_label(&s.phase))
+    format!("{} · {profile}", phase_label(&s.phase))
 }
 
 /// What the menu shows, as plain data: testable without AppKit, and compared to skip rebuilds.
@@ -89,7 +89,7 @@ pub fn menu_model(s: &Snapshot) -> Vec<Entry> {
         })
         .collect::<Vec<_>>();
     let mut menu = vec![
-        item(OPEN, "Open xihomo", true),
+        item(OPEN, "Open Window", true),
         item(SETTINGS, "Settings…", true),
         Entry::Separator,
         Entry::Item {
@@ -135,7 +135,7 @@ pub fn menu_model(s: &Snapshot) -> Vec<Entry> {
     menu.extend([
         item(CHECK_NOW, "Check Now", true),
         Entry::Separator,
-        item(QUIT, "Quit xihomo", true),
+        item(QUIT, "Quit", true),
     ]);
     menu
 }
@@ -242,7 +242,6 @@ impl Tray {
         }));
         let icon = TrayIconBuilder::new()
             .with_id("xihomo")
-            .with_tooltip(settings::NAME)
             .with_menu_on_left_click(false)
             .with_icon_templated(icons::tray_icon(
                 &snapshot.icon_set,
@@ -279,9 +278,12 @@ impl Tray {
                 appearance.as_deref(),
             );
             self.icon.set_menu(Some(Box::new(menu)));
-            let _ = self
-                .icon
-                .set_tooltip(Some(format!("{}: {}", settings::NAME, status_line(s))));
+            // No app name: the menu bar shows only the state, not what is running it.
+            let _ = self.icon.set_tooltip(Some(format!(
+                "{} · system proxy {}",
+                status_line(s),
+                if s.proxy_on { "on" } else { "off" }
+            )));
             self.shown_menu = Some(signature);
         }
     }
@@ -426,10 +428,10 @@ mod tests {
         assert_eq!(
             labels(&model),
             [
-                "Open xihomo",
+                "Open Window",
                 "Settings…",
                 "-",
-                "Running · proxy off · home",
+                "Running · home",
                 "Stop Core",
                 "-",
                 "Rule",
@@ -442,7 +444,7 @@ mod tests {
                 "Reload Edited Profile",
                 "Check Now",
                 "-",
-                "Quit xihomo",
+                "Quit",
             ]
         );
         let modes = |s: &Snapshot| {

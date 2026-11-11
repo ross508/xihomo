@@ -7,11 +7,8 @@ use std::path::{Path, PathBuf};
 
 /// Debug builds are the dev channel: their own directories and default ports, so development never
 /// touches the release build used day to day.
-pub const NAME: &str = if cfg!(debug_assertions) {
-    "xihomo-dev"
-} else {
-    "xihomo"
-};
+pub const DEV: bool = cfg!(debug_assertions);
+pub const NAME: &str = if DEV { "xihomo-dev" } else { "xihomo" };
 
 /// Everything xihomo reads or owns on disk: `config` is the user's, `data` is xihomo's.
 /// Tests point both at a temporary directory.
