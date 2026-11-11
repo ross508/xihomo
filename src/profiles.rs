@@ -458,7 +458,7 @@ mod tests {
         assert!(
             fs::read_to_string(paths.candidate())
                 .unwrap()
-                .contains("10999")
+                .contains(&Settings::default().mixed_port.to_string())
         );
         assert!(link(&paths, &target).is_err(), "name collision is refused");
     }

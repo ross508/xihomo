@@ -52,7 +52,7 @@ fn open_window(state: &Entity<AppState>, tab: Option<Tab>, cx: &mut App) {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             // The content draws under a transparent title bar, so it takes the theme's background.
             titlebar: Some(TitlebarOptions {
-                title: Some("xihomo".into()),
+                title: Some(settings::NAME.into()),
                 appears_transparent: true,
                 ..Default::default()
             }),

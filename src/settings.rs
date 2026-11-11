@@ -5,6 +5,14 @@ use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+/// Debug builds are the dev channel: their own directories and default ports, so development never
+/// touches the release build used day to day.
+pub const NAME: &str = if cfg!(debug_assertions) {
+    "xihomo-dev"
+} else {
+    "xihomo"
+};
+
 /// Everything xihomo reads or owns on disk: `config` is the user's, `data` is xihomo's.
 /// Tests point both at a temporary directory.
 #[derive(Clone, Debug)]
@@ -17,8 +25,8 @@ impl Paths {
     pub fn user_default() -> Result<Self> {
         let home = PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?);
         Ok(Self {
-            config: home.join(".config/xihomo"),
-            data: home.join("Library/Application Support/xihomo"),
+            config: home.join(".config").join(NAME),
+            data: home.join("Library/Application Support").join(NAME),
         })
     }
 
@@ -168,9 +176,14 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
+        let (mixed_port, controller_port) = if cfg!(debug_assertions) {
+            (20999, 21000)
+        } else {
+            (10999, 11000)
+        };
         Self {
-            mixed_port: 10999,
-            controller_port: 11000,
+            mixed_port,
+            controller_port,
             icon_set: "circle".into(),
             theme: Theme::Auto,
         }
@@ -249,6 +262,23 @@ pub fn temp_paths(name: &str) -> Paths {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn debug_builds_stay_off_the_release_directories_and_ports() {
+        let paths = Paths::user_default().unwrap();
+        assert!(paths.config.ends_with(".config/xihomo-dev"));
+        assert!(
+            paths
+                .data
+                .ends_with("Library/Application Support/xihomo-dev")
+        );
+        let settings = Settings::default();
+        assert_eq!(
+            (settings.mixed_port, settings.controller_port),
+            (20999, 21000)
+        );
+    }
 
     #[test]
     fn missing_keys_and_empty_files_take_defaults() {

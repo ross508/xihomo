@@ -1,6 +1,6 @@
 use crate::backend::{Cmd, Phase, Snapshot};
 use crate::icons::{self, State};
-use crate::settings::Theme;
+use crate::settings::{self, Theme};
 use crate::ui::Tab;
 use anyhow::Result;
 use objc2::{AnyThread, MainThreadMarker};
@@ -242,7 +242,7 @@ impl Tray {
         }));
         let icon = TrayIconBuilder::new()
             .with_id("xihomo")
-            .with_tooltip("xihomo")
+            .with_tooltip(settings::NAME)
             .with_menu_on_left_click(false)
             .with_icon_templated(icons::tray_icon(
                 &snapshot.icon_set,
@@ -281,7 +281,7 @@ impl Tray {
             self.icon.set_menu(Some(Box::new(menu)));
             let _ = self
                 .icon
-                .set_tooltip(Some(format!("xihomo: {}", status_line(s))));
+                .set_tooltip(Some(format!("{}: {}", settings::NAME, status_line(s))));
             self.shown_menu = Some(signature);
         }
     }

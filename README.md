@@ -8,10 +8,21 @@ Requires full Xcode and the project's [mise](https://mise.jdx.dev) toolchain.
 
 ```sh
 mise install
-mise exec -- cargo run            # development
+mise exec -- cargo run            # development, dev channel
 scripts/bundle.sh                 # target/release/xihomo.app, ad-hoc signed
 open target/release/xihomo.app
+scripts/bundle.sh --dev           # target/debug/xihomo-dev.app
 ```
+
+Debug builds are the **dev channel**, so development can run next to the release build you use day to day without touching it:
+
+| | Release | Dev (debug build) |
+|---|---|---|
+| Bundle identifier | `io.github.ross508.xihomo` | `io.github.ross508.xihomo.dev` |
+| Directories | `~/.config/xihomo/`, `~/Library/Application Support/xihomo/` | `~/.config/xihomo-dev/`, `~/Library/Application Support/xihomo-dev/` |
+| Default ports (mixed, controller) | 10999, 11000 | 20999, 21000 |
+
+Each channel has its own settings, profiles, cores, Mihomo homes, secret and instance lock, so both can run at once. The system proxy is shared by the whole Mac: turning it on in one channel replaces the other's. Each channel only treats a proxy at its own port as its own. To use the same profile in both, link the same file in each channel's `profiles/`. Paths below are the release channel's.
 
 xihomo starts with only its menu bar icon and no window. First run: click the icon, choose Settings…, then Check for Update → Update to the latest core. If `profiles/` is empty, xihomo creates `default.yaml` (`mode: direct`), selects it and starts the core with it; use Link YAML File… for a real profile and select it.
 
