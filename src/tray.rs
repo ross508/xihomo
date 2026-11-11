@@ -243,6 +243,7 @@ impl Tray {
         let icon = TrayIconBuilder::new()
             .with_id("xihomo")
             .with_tooltip("xihomo")
+            .with_menu_on_left_click(false)
             .with_icon_templated(icons::tray_icon(
                 &snapshot.icon_set,
                 State::of(&snapshot.phase),
@@ -262,6 +263,7 @@ impl Tray {
         if self.shown_icon.as_ref() != Some(&wanted) {
             let icon = icons::tray_icon(&wanted.0, wanted.1);
             if self.icon.set_icon_templated(Some(icon)).is_ok() {
+                self.fit_icon();
                 self.shown_icon = Some(wanted);
             }
         }
@@ -281,6 +283,22 @@ impl Tray {
                 .icon
                 .set_tooltip(Some(format!("xihomo: {}", status_line(s))));
             self.shown_menu = Some(signature);
+        }
+    }
+
+    /// tray-icon takes the bitmap's pixels as points, capped at 22pt; show the 2x bitmap at its real size.
+    fn fit_icon(&self) {
+        let (Some(mtm), Some(item)) = (MainThreadMarker::new(), self.icon.ns_status_item()) else {
+            return;
+        };
+        if let Some(button) = item.button(mtm)
+            && let Some(image) = button.image()
+        {
+            let mut size = image.size();
+            size.width = icons::POINTS;
+            size.height = icons::POINTS;
+            image.setSize(size);
+            button.setImage(Some(&image));
         }
     }
 

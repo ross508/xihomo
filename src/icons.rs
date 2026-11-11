@@ -3,7 +3,11 @@
 use crate::backend::Phase;
 
 pub const SETS: &[&str] = &["orbit", "shield", "bars"];
-const SIZE: u32 = 44;
+/// 18pt at 2x, the width of most menu bar icons; AppKit sizes the item, and its highlight, from it.
+const SIZE: u32 = 36;
+pub const POINTS: f64 = (SIZE / 2) as f64;
+/// Shapes reach 0.9 at most, so the canvas starts there instead of leaving an empty margin.
+const EXTENT: f32 = 0.9;
 const SAMPLES: u32 = 4;
 const STROKE: f32 = 0.17;
 
@@ -68,7 +72,8 @@ pub fn rgba(set: &str, state: State) -> Vec<u8> {
             for sy in 0..SAMPLES {
                 for sx in 0..SAMPLES {
                     let map = |p: u32, s: u32| {
-                        ((p as f32 + (s as f32 + 0.5) / SAMPLES as f32) / SIZE as f32) * 2.0 - 1.0
+                        (((p as f32 + (s as f32 + 0.5) / SAMPLES as f32) / SIZE as f32) * 2.0 - 1.0)
+                            * EXTENT
                     };
                     hits += covered(set, state, map(px, sx), map(py, sy)) as u32;
                 }
