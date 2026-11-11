@@ -127,11 +127,12 @@ struct Palette {
     border: Hsla,
     accent: Hsla,
     on_accent: Hsla,
+    warning: Hsla,
     danger: Hsla,
 }
 
 /// Two fixed palettes after an OS X El Capitan-inspired light theme and a Vibrant Dark-inspired
-/// dark one. `Auto` follows the window's appearance.
+/// dark one, with Aqua's Graphite appearance as the accent. `Auto` follows the window's appearance.
 fn palette(theme: Theme, appearance: WindowAppearance) -> Palette {
     let dark = match theme {
         Theme::Light => false,
@@ -150,8 +151,9 @@ fn palette(theme: Theme, appearance: WindowAppearance) -> Palette {
             text: c(0xEEEEEE),
             dim: c(0xB8B8B8),
             border: c(0x4D4D4D),
-            accent: c(0x286AC7),
+            accent: c(0x66778D),
             on_accent: c(0xFFFFFF),
+            warning: c(0xE3C37A),
             danger: c(0xF08178),
         }
     } else {
@@ -162,8 +164,9 @@ fn palette(theme: Theme, appearance: WindowAppearance) -> Palette {
             text: c(0x222222),
             dim: c(0x636363),
             border: c(0xC2C2C2),
-            accent: c(0x0067D9),
+            accent: c(0x5F6F84),
             on_accent: c(0xFFFFFF),
+            warning: c(0x795300),
             danger: c(0xB52F2B),
         }
     }
@@ -742,7 +745,7 @@ impl AppState {
                         let line = &this.log_view[ix];
                         let color = match &*line.level {
                             "error" => p.danger,
-                            "warning" => p.accent,
+                            "warning" => p.warning,
                             _ => p.text,
                         };
                         div()
@@ -1042,21 +1045,54 @@ impl Render for AppState {
             Tab::Logs => self.render_logs(p, cx),
             Tab::Settings => self.render_settings(p, cx),
         };
-        let mut tabs = div().flex().gap_1().mb_3();
-        for (tab, label, id) in [
+        // One segmented control, so switching panels does not look like the action buttons. Each
+        // segment draws its own frame, so the selected one is a solid block up to its outer edges.
+        let mut tabs = div().flex();
+        let all = [
             (Tab::Control, "Control", "tab-control"),
             (Tab::Connections, "Connections", "tab-connections"),
             (Tab::Logs, "Logs", "tab-logs"),
             (Tab::Settings, "Settings", "tab-settings"),
-        ] {
-            tabs = tabs.child(button(
-                id,
-                label,
-                p,
-                self.tab == tab,
-                true,
-                cx.listener(move |this, _, _, cx| this.set_tab(tab, cx)),
-            ));
+        ];
+        let last = all.len() - 1;
+        for (i, (tab, label, id)) in all.into_iter().enumerate() {
+            let selected = self.tab == tab;
+            if i > 0 {
+                let beside_selected = selected || self.tab == all[i - 1].0;
+                tabs = tabs.child(div().w(px(1.)).bg(if beside_selected {
+                    p.accent
+                } else {
+                    p.border
+                }));
+            }
+            let mut segment = div()
+                .id(id)
+                .debug_selector(|| id.to_owned())
+                .px_3()
+                .py(px(3.))
+                .text_size(px(12.))
+                .cursor_pointer()
+                .border_t_1()
+                .border_b_1()
+                .on_click(cx.listener(move |this, _, _, cx| this.set_tab(tab, cx)))
+                .child(label);
+            if i == 0 {
+                segment = segment.border_l_1().rounded_l(px(5.));
+            }
+            if i == last {
+                segment = segment.border_r_1().rounded_r(px(5.));
+            }
+            tabs = tabs.child(if selected {
+                segment
+                    .bg(p.accent)
+                    .border_color(p.accent)
+                    .text_color(p.on_accent)
+            } else {
+                segment
+                    .bg(p.panel)
+                    .border_color(p.border)
+                    .hover(move |s| s.bg(p.hover))
+            });
         }
         div()
             .track_focus(&self.focus)
@@ -1087,7 +1123,7 @@ impl Render for AppState {
                         }
                     }),
             )
-            .child(tabs)
+            .child(div().flex().justify_center().mb_3().child(tabs))
             .child(div().flex_1().min_h_0().child(body))
             .children(menu)
     }
