@@ -171,7 +171,7 @@ impl Default for Settings {
         Self {
             mixed_port: 10999,
             controller_port: 11000,
-            icon_set: "orbit".into(),
+            icon_set: "circle".into(),
             theme: Theme::Auto,
         }
     }

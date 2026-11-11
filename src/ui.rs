@@ -6,9 +6,10 @@ use crate::settings::Theme;
 use crate::tray::phase_label;
 use gpui::prelude::*;
 use gpui::{
-    App, ClickEvent, Context, ElementId, Entity, FocusHandle, Hsla, MouseButton, PathPromptOptions,
-    Pixels, Point, ScrollStrategy, SharedString, Stateful, UniformListScrollHandle, Window,
-    WindowAppearance, WindowHandle, actions, anchored, deferred, div, px, rgb, uniform_list,
+    App, ClickEvent, Context, ElementId, Entity, FocusHandle, Hsla, MouseButton, PathBuilder,
+    PathPromptOptions, Pixels, Point, ScrollStrategy, SharedString, Stateful,
+    UniformListScrollHandle, Window, WindowAppearance, WindowHandle, actions, anchored, canvas,
+    deferred, div, point, px, rgb, uniform_list,
 };
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -192,6 +193,17 @@ fn button(
     enabled: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> Stateful<gpui::Div> {
+    chip(id, p, selected, enabled, on_click).child(label.into())
+}
+
+/// A button's frame, states and click handling, without its content.
+fn chip(
+    id: impl Into<SharedString>,
+    p: Palette,
+    selected: bool,
+    enabled: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<gpui::Div> {
     let id: SharedString = id.into();
     let selector = id.to_string();
     let base = div()
@@ -202,8 +214,7 @@ fn button(
         .rounded(px(5.))
         .border_1()
         .text_size(px(12.))
-        .flex_none()
-        .child(label.into());
+        .flex_none();
     let styled = if selected {
         base.bg(p.accent)
             .border_color(p.accent)
@@ -221,6 +232,30 @@ fn button(
     } else {
         styled
     }
+}
+
+/// An icon set's solid shape, drawn as vector paths in `color`.
+fn glyph(set: &str, color: Hsla) -> impl IntoElement {
+    let shape = icons::outline(set);
+    canvas(
+        |_, _, _| {},
+        move |bounds, _, window, _| {
+            for polygon in &shape {
+                let at = |&(x, y): &(f32, f32)| {
+                    point(
+                        bounds.left() + bounds.size.width * x,
+                        bounds.top() + bounds.size.height * y,
+                    )
+                };
+                let mut path = PathBuilder::fill();
+                path.add_polygon(&polygon.iter().map(at).collect::<Vec<_>>(), true);
+                if let Ok(path) = path.build() {
+                    window.paint_path(path, color);
+                }
+            }
+        },
+    )
+    .size(px(14.))
 }
 
 /// A filter input framed like the other controls; accent-bordered while it filters.
@@ -742,16 +777,20 @@ impl AppState {
             .text_size(px(12.))
             .text_color(p.text);
 
-        let mut sets = div().flex().gap_1();
+        let mut sets = div().flex().flex_wrap().gap_1();
         for set in icons::SETS {
-            sets = sets.child(button(
-                *set,
-                *set,
-                p,
-                s.icon_set == *set,
-                true,
-                self.cmd(move || Cmd::SetIconSet((*set).to_owned())),
-            ));
+            let selected = s.icon_set == *set;
+            sets = sets.child(
+                chip(
+                    *set,
+                    p,
+                    selected,
+                    true,
+                    self.cmd(move || Cmd::SetIconSet((*set).to_owned())),
+                )
+                .py(px(4.))
+                .child(glyph(set, if selected { p.on_accent } else { p.text })),
+            );
         }
         column = column.child(section("MENU BAR ICON", p)).child(sets);
 

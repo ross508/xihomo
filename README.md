@@ -39,7 +39,7 @@ Files are split by who maintains them.
 ```yaml
 mixed_port: 10999
 controller_port: 11000
-icon_set: orbit
+icon_set: circle
 theme: auto        # auto | light | dark
 ```
 
