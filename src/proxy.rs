@@ -15,12 +15,16 @@ use core_foundation::boolean::CFBoolean;
 use core_foundation::dictionary::CFDictionary;
 use core_foundation::number::CFNumber;
 use core_foundation::string::CFString;
+use std::sync::Mutex;
 use std::time::Duration;
 use tokio::process::Command;
 use tokio::task::JoinSet;
 
 const TOOL: &str = "/usr/sbin/networksetup";
 const HOST: &str = "127.0.0.1";
+
+/// Every port this process pointed the proxy at, so a panic can tell a proxy of ours.
+static WRITTEN: Mutex<Vec<u16>> = Mutex::new(Vec::new());
 
 async fn run<const N: usize>(args: [&str; N]) -> Result<()> {
     // Layer 1 tests must never change this Mac's network settings.
@@ -260,6 +264,12 @@ async fn run_all<const N: usize>(commands: Vec<[String; N]>) -> Result<()> {
 }
 
 pub async fn enable(services: &[String], port: u16) -> Result<()> {
+    {
+        let mut written = WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+        if !written.contains(&port) {
+            written.push(port);
+        }
+    }
     run_all(services.iter().flat_map(|s| on_args(s, port)).collect()).await
 }
 
@@ -268,9 +278,63 @@ pub async fn disable() -> Result<()> {
     run_all(services()?.iter().flat_map(|s| off_args(s)).collect()).await
 }
 
+/// Called from the panic hook, before the process may abort: a proxy left pointing at a port
+/// nothing serves cuts the whole Mac off. Blocking, since the runtime may be gone, and limited to
+/// a proxy this process set, so another tool's proxy is never touched.
+pub fn release_after_panic() {
+    let written = WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if !should_release(&written, state) {
+        return;
+    }
+    let commands = match services() {
+        Ok(services) => services
+            .iter()
+            .flat_map(|s| off_args(s))
+            .collect::<Vec<_>>(),
+        Err(e) => return eprintln!("xihomo: cannot list network services: {e:#}"),
+    };
+    if cfg!(test) {
+        panic!("test tried to run networksetup {commands:?}");
+    }
+    // Spawned together, as the async path does; configd serializes them anyway.
+    let children: Vec<_> = commands
+        .iter()
+        .filter_map(|args| std::process::Command::new(TOOL).args(args).spawn().ok())
+        .collect();
+    for mut child in children {
+        let _ = child.wait();
+    }
+    eprintln!("xihomo: turned the system proxy off after a crash");
+}
+
+fn should_release(written: &[u16], state: impl Fn(&[u16]) -> State) -> bool {
+    !written.is_empty() && state(written).ours
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_panic_releases_only_a_proxy_this_process_set() {
+        let ours = |_: &[u16]| State {
+            on: true,
+            ours: true,
+        };
+        let theirs = |_: &[u16]| State {
+            on: true,
+            ours: false,
+        };
+        assert!(!should_release(&[], ours), "nothing written: never ours");
+        assert!(!should_release(&[10999], theirs), "another tool's proxy");
+        assert!(should_release(&[10999, 11999], ours));
+        let asked = std::cell::RefCell::new(Vec::new());
+        should_release(&[10999, 11999], |ports: &[u16]| {
+            asked.borrow_mut().extend_from_slice(ports);
+            State::default()
+        });
+        assert_eq!(*asked.borrow(), [10999, 11999], "every port written counts");
+    }
 
     #[test]
     fn writes_xihomos_http_https_and_socks_proxy() {

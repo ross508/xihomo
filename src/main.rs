@@ -266,6 +266,13 @@ fn run_app(handle: Handle, window_file: PathBuf, cx: &mut App) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    // Any panic is a bug that may already have taken the core down with it (an unwinding backend
+    // drops it; a panic in a platform callback aborts the app), so a proxy of ours goes too.
+    let report = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        report(info);
+        proxy::release_after_panic();
+    }));
     let paths = Paths::user_default()?;
     paths.ensure()?;
     // Held for the whole process: one owner of the child, the ports and the proxy journal.
