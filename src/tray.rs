@@ -1,7 +1,6 @@
 use crate::backend::{Cmd, Phase, Snapshot};
 use crate::icons::{self, State};
 use crate::settings::Theme;
-use crate::ui::Tab;
 use anyhow::Result;
 use objc2::{AnyThread, MainThreadMarker};
 use objc2_app_kit::{NSAppearance, NSAppearanceCustomization, NSApplication, NSImage, NSMenu};
@@ -16,7 +15,6 @@ pub const PROXY: &str = "proxy";
 pub const RELOAD: &str = "reload";
 pub const CHECK_NOW: &str = "check-now";
 pub const OPEN: &str = "open";
-pub const SETTINGS: &str = "settings";
 pub const QUIT: &str = "quit";
 pub const PROFILE_PREFIX: &str = "profile:";
 pub const MODE_PREFIX: &str = "mode:";
@@ -89,8 +87,7 @@ pub fn menu_model(s: &Snapshot) -> Vec<Entry> {
         })
         .collect::<Vec<_>>();
     let mut menu = vec![
-        item(OPEN, "Open Window", true),
-        item(SETTINGS, "Settings…", true),
+        item(OPEN, "Show", true),
         Entry::Separator,
         Entry::Item {
             id: None,
@@ -142,7 +139,7 @@ pub fn menu_model(s: &Snapshot) -> Vec<Entry> {
 
 pub enum MenuAction {
     Send(Cmd),
-    Open(Option<Tab>),
+    Open,
     Quit,
 }
 
@@ -157,8 +154,7 @@ pub fn menu_action(id: &str, s: &Snapshot) -> Option<MenuAction> {
         PROXY => MenuAction::Send(Cmd::SetProxy(!s.proxy_on)),
         RELOAD => MenuAction::Send(Cmd::Reload),
         CHECK_NOW => MenuAction::Send(Cmd::CheckNow),
-        OPEN => MenuAction::Open(None),
-        SETTINGS => MenuAction::Open(Some(Tab::Settings)),
+        OPEN => MenuAction::Open,
         QUIT => MenuAction::Quit,
         other => {
             if let Some(mode) = other.strip_prefix(MODE_PREFIX) {
@@ -428,8 +424,7 @@ mod tests {
         assert_eq!(
             labels(&model),
             [
-                "Open Window",
-                "Settings…",
+                "Show",
                 "-",
                 "Running · home",
                 "Stop Core",
@@ -509,14 +504,7 @@ mod tests {
             menu_action(CHECK_NOW, &on),
             Some(MenuAction::Send(Cmd::CheckNow))
         ));
-        assert!(matches!(
-            menu_action(OPEN, &on),
-            Some(MenuAction::Open(None))
-        ));
-        assert!(matches!(
-            menu_action(SETTINGS, &on),
-            Some(MenuAction::Open(Some(Tab::Settings)))
-        ));
+        assert!(matches!(menu_action(OPEN, &on), Some(MenuAction::Open)));
         assert!(matches!(menu_action(QUIT, &on), Some(MenuAction::Quit)));
         assert!(menu_action("unknown", &on).is_none());
         assert!(

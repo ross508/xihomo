@@ -55,6 +55,9 @@ impl Paths {
     pub fn app_data(&self) -> PathBuf {
         self.state().join("app.json")
     }
+    pub fn window(&self) -> PathBuf {
+        self.state().join("window.json")
+    }
     pub fn candidate(&self) -> PathBuf {
         self.runtime().join("candidate.yaml")
     }

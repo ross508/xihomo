@@ -99,6 +99,100 @@ local_test!(start_control_stop, a, _rx, {
         .unwrap();
 });
 
+/// A tunnel through the core's mixed port to a loopback listener of the test's own, returned
+/// with the listener's end so neither closes early.
+async fn tunnel(a: &Actor) -> (std::net::TcpStream, std::net::TcpStream) {
+    use std::io::{Read, Write};
+    let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = target.local_addr().unwrap().port();
+    let mut tunnel = std::net::TcpStream::connect(("127.0.0.1", a.settings.mixed_port)).unwrap();
+    tunnel
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    write!(
+        tunnel,
+        "CONNECT 127.0.0.1:{port} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
+    )
+    .unwrap();
+    let (accepted, _) = target.accept().unwrap();
+    let mut reply = [0u8; 128];
+    let n = tunnel.read(&mut reply).unwrap();
+    assert!(
+        reply[..n].starts_with(b"HTTP/1.1 200"),
+        "{:?}",
+        String::from_utf8_lossy(&reply[..n])
+    );
+    (tunnel, accepted)
+}
+
+/// The core closed its side, so the client sees the end of the tunnel.
+fn closed(mut tunnel: std::net::TcpStream) -> bool {
+    std::io::Read::read(&mut tunnel, &mut [0u8; 16]).unwrap() == 0
+}
+
+async fn open(a: &Actor) -> usize {
+    a.api.connections().await.unwrap().len()
+}
+
+local_test!(mode_changes_close_open_connections, a, _rx, {
+    a.handle(Cmd::Start).await;
+    assert_eq!(a.snap.phase, Phase::Running, "{:?}", a.snap.error());
+    let (first, _far) = tunnel(&a).await;
+    assert_eq!(open(&a).await, 1);
+
+    a.handle(Cmd::SetMode(a.snap.mode.clone())).await;
+    assert!(a.snap.error().is_none(), "{:?}", a.snap.error());
+    assert_eq!(open(&a).await, 1, "the current mode again changes nothing");
+
+    a.handle(Cmd::SetMode("global".into())).await;
+    assert!(a.snap.error().is_none(), "{:?}", a.snap.error());
+    assert_eq!(open(&a).await, 0);
+    assert!(closed(first));
+    a.handle(Cmd::Stop).await;
+});
+
+local_test!(a_reload_closes_open_connections, a, _rx, {
+    a.handle(Cmd::Start).await;
+    assert_eq!(a.snap.phase, Phase::Running, "{:?}", a.snap.error());
+    let (first, _far) = tunnel(&a).await;
+    a.handle(Cmd::Reload).await;
+    assert!(a.snap.error().is_none(), "{:?}", a.snap.error());
+    assert_eq!(open(&a).await, 0);
+    assert!(closed(first));
+    a.handle(Cmd::Stop).await;
+});
+
+local_test!(a_new_pick_closes_connections_through_the_old_one, a, _rx, {
+    a.handle(Cmd::Start).await;
+    assert_eq!(a.snap.phase, Phase::Running, "{:?}", a.snap.error());
+    let (first, _far) = tunnel(&a).await;
+    let pick = |proxy: &str| Cmd::Select {
+        group: "PICK".into(),
+        proxy: proxy.into(),
+    };
+    a.handle(pick("DIRECT")).await;
+    assert!(a.snap.error().is_none(), "{:?}", a.snap.error());
+    assert_eq!(open(&a).await, 1, "the current pick again changes nothing");
+
+    a.handle(pick("REJECT")).await;
+    assert!(a.snap.error().is_none(), "{:?}", a.snap.error());
+    assert_eq!(open(&a).await, 0);
+    assert!(closed(first));
+    a.handle(Cmd::Stop).await;
+});
+
+#[test]
+fn only_connections_through_the_group_by_another_member_are_stale() {
+    let chain = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+    let nested = chain(&["node-a", "Inner", "Outer"]);
+    assert!(routed_elsewhere(&nested, "Inner", "node-b"));
+    assert!(!routed_elsewhere(&nested, "Inner", "node-a"));
+    assert!(routed_elsewhere(&nested, "Outer", "Other"));
+    assert!(!routed_elsewhere(&nested, "Outer", "Inner"));
+    assert!(!routed_elsewhere(&nested, "Elsewhere", "node-a"));
+    assert!(!routed_elsewhere(&chain(&["Inner"]), "Inner", "node-a"));
+}
+
 local_test!(failed_activation_keeps_selection_and_core, a, _rx, {
     a.handle(Cmd::Start).await;
     assert_eq!(a.snap.phase, Phase::Running);

@@ -2,17 +2,20 @@ use crate::api::{Connection, LogLine};
 use crate::backend::{Area, Cmd, Handle, Phase, Snapshot};
 use crate::icons;
 use crate::input::{Changed, TextInput};
+use crate::placement::{self, Placement};
 use crate::settings::{self, Theme};
 use crate::tray::phase_label;
 use gpui::prelude::*;
 use gpui::{
     App, ClickEvent, Context, ElementId, Entity, FocusHandle, Hsla, MouseButton, PathBuilder,
-    PathPromptOptions, Pixels, Point, ScrollStrategy, SharedString, Stateful,
+    PathPromptOptions, Pixels, Point, ScrollStrategy, SharedString, Stateful, Task,
     UniformListScrollHandle, Window, WindowAppearance, WindowHandle, actions, anchored, canvas,
     deferred, div, point, px, rgb, uniform_list,
 };
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 actions!(
     xihomo,
@@ -27,7 +30,7 @@ actions!(
 );
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Tab {
+enum Tab {
     Control,
     Connections,
     Logs,
@@ -87,7 +90,7 @@ pub struct AppState {
     pub handle: Handle,
     pub snap: Arc<Snapshot>,
     pub conns: Arc<Vec<Connection>>,
-    pub tab: Tab,
+    tab: Tab,
     pub window: Option<WindowHandle<AppState>>,
     expanded: HashSet<String>,
     log_view: Vec<LogLine>,
@@ -102,6 +105,10 @@ pub struct AppState {
     pub focus: FocusHandle,
     /// What the open right-click menu would delete, and where it is.
     context_menu: Option<(Deletable, Point<Pixels>)>,
+    /// Where the window's placement is kept; tests leave it unset and write nothing.
+    pub placement_file: Option<PathBuf>,
+    /// The latest placement and its delayed save; replacing it cancels the earlier save.
+    placement_save: Option<(Placement, Task<()>)>,
     /// The palette of the last frame, so tests can see what was drawn.
     #[cfg(test)]
     palette: Option<Palette>,
@@ -185,6 +192,17 @@ fn human(bytes: u64) -> String {
     } else {
         format!("{value:.1} {}", UNITS[unit])
     }
+}
+
+/// Node cards are at least this wide, in points; how many fit sets the column count.
+const CARD_MIN_WIDTH: f32 = 180.;
+/// `gap_1` between cards.
+const CARD_GAP: f32 = 4.;
+
+/// As many equal columns as fit cards of the minimum width, and never fewer than two. A card is
+/// then below `(n + 1) / n` of the minimum, so at most about 1.5 times it.
+fn node_columns(width: f32) -> u16 {
+    (((width + CARD_GAP) / (CARD_MIN_WIDTH + CARD_GAP)).floor() as u16).max(2)
 }
 
 /// `selected` draws the control filled, for tabs, segments and chosen values.
@@ -324,16 +342,58 @@ impl AppState {
             log_scroll: UniformListScrollHandle::new(),
             focus: cx.focus_handle(),
             context_menu: None,
+            placement_file: None,
+            placement_save: None,
             #[cfg(test)]
             palette: None,
         }
     }
 
-    pub fn set_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
+    fn set_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
         self.tab = tab;
         self.sync_visibility();
         self.rebuild_logs();
         cx.notify();
+    }
+
+    /// Saves the window's place once it has rested for a moment, so dragging or tiling writes once.
+    pub fn remember_placement(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let Some(file) = self.placement_file.clone() else {
+            return;
+        };
+        let Some(display) = window.display(cx).and_then(|d| d.uuid().ok()) else {
+            return;
+        };
+        // Full screen reports the windowed bounds it returns to.
+        let bounds = window.window_bounds().get_bounds();
+        let placement = Placement {
+            display: display.to_string(),
+            x: bounds.origin.x.into(),
+            y: bounds.origin.y.into(),
+            width: bounds.size.width.into(),
+            height: bounds.size.height.into(),
+        };
+        if placement.width <= 0.0 || placement.height <= 0.0 {
+            return;
+        }
+        let (executor, saving) = (cx.background_executor().clone(), placement.clone());
+        let task = cx.background_spawn(async move {
+            executor.timer(Duration::from_millis(500)).await;
+            if let Err(e) = placement::save(&file, &saving) {
+                eprintln!("xihomo: {e:#}");
+            }
+        });
+        self.placement_save = Some((placement, task));
+    }
+
+    /// Writes a pending placement now, for when the window closes or the app quits.
+    pub fn flush_placement(&mut self) {
+        if let (Some(file), Some((placement, _))) =
+            (&self.placement_file, self.placement_save.take())
+            && let Err(e) = placement::save(file, &placement)
+        {
+            eprintln!("xihomo: {e:#}");
+        }
     }
 
     /// Connections are polled only while they are on screen.
@@ -386,7 +446,17 @@ impl AppState {
         )
     }
 
-    fn render_control(&mut self, p: Palette, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_control(
+        &mut self,
+        p: Palette,
+        width: Pixels,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        // Less the window's padding and the node grid's own.
+        let inner = f32::from(width) - 40.;
+        let columns = node_columns(inner);
+        // Text measured inside a grid track gets no width to truncate to, so cards carry theirs.
+        let card_width = ((inner - (columns - 1) as f32 * CARD_GAP) / columns as f32).floor();
         let s = self.snap.clone();
         let running = s.phase == Phase::Running;
         let (core_label, core_cmd): (&str, fn() -> Cmd) = match s.phase {
@@ -554,7 +624,7 @@ impl AppState {
                     .child(div().text_color(p.dim).truncate().child(group.now.clone()));
                 column = column.child(header);
                 if expanded {
-                    let mut options = div().flex().flex_wrap().gap_1().px_2().pb_2();
+                    let mut options = div().grid().grid_cols(columns).gap_1().px_2().pb_2();
                     // Display only: REJECT as the whole machine's route is never wanted.
                     for proxy in group
                         .all
@@ -563,9 +633,8 @@ impl AppState {
                     {
                         let (g, pick) = (name.clone(), proxy.clone());
                         let id = SharedString::from(format!("pick-{name}-{proxy}"));
-                        options = options.child(button(
+                        let card = chip(
                             id,
-                            proxy.clone(),
                             p,
                             *proxy == group.now,
                             group.selectable(),
@@ -573,7 +642,12 @@ impl AppState {
                                 group: g.clone(),
                                 proxy: pick.clone(),
                             }),
-                        ));
+                        );
+                        // A long name ends in an ellipsis instead of widening its column.
+                        options = options.child(
+                            card.w(px(card_width))
+                                .child(div().truncate().child(proxy.clone())),
+                        );
                     }
                     column = column.child(options);
                 }
@@ -922,7 +996,7 @@ impl AppState {
         if s.installed.is_empty() {
             versions = versions.child(div().text_color(p.dim).child("No core installed"));
         }
-        let mut actions = div().flex().flex_wrap().gap_1().mt_1();
+        let mut actions = div().flex().flex_none().gap_1();
         actions = actions.child(button(
             "check",
             "Check for Update",
@@ -943,14 +1017,39 @@ impl AppState {
                 self.cmd(|| Cmd::Download),
             ));
         }
-        column = column
-            .child(section("CORE", p))
-            .child(versions)
-            .child(actions);
-        column = match &s.update_busy {
-            Some(status) => column.child(div().mt_1().text_color(p.dim).child(status.clone())),
-            None => column.children(self.note(Area::Update, p)),
+        // Update progress and results follow the CORE heading, bottom-aligned with it, styled as a
+        // hint rather than a second heading.
+        let update_message = match &s.update_busy {
+            Some(status) => Some((status.clone(), p.accent)),
+            None => s
+                .message(Area::Update)
+                .map(|m| (m.text.clone(), if m.error { p.danger } else { p.accent })),
         };
+        column = column
+            .child(
+                div()
+                    .flex()
+                    .items_end()
+                    .gap(px(6.))
+                    .child(section("CORE", p).flex_none())
+                    .children(update_message.map(|(text, color)| {
+                        div()
+                            .mb_1()
+                            .text_size(px(10.))
+                            .italic()
+                            .text_color(color)
+                            .child(text)
+                    })),
+            )
+            // Versions on the left, the update buttons right-aligned on the same row.
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap_1()
+                    .child(versions.flex_1())
+                    .child(actions),
+            );
         div()
             .id("settings")
             .size_full()
@@ -1041,7 +1140,7 @@ impl Render for AppState {
             )
         });
         let body = match self.tab {
-            Tab::Control => self.render_control(p, cx),
+            Tab::Control => self.render_control(p, window.viewport_size().width, cx),
             Tab::Connections => self.render_connections(p, cx),
             Tab::Logs => self.render_logs(p, cx),
             Tab::Settings => self.render_settings(p, cx),
@@ -1133,6 +1232,19 @@ impl Render for AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_cards_stay_between_the_minimum_and_one_and_a_half_times_it() {
+        let two = (CARD_MIN_WIDTH * 2. + CARD_GAP) as u32;
+        for width in (two..3000).map(|w| w as f32) {
+            let n = node_columns(width) as f32;
+            let card = (width - (n - 1.) * CARD_GAP) / n;
+            assert!(card >= CARD_MIN_WIDTH, "{width}: {card}");
+            assert!(card < CARD_MIN_WIDTH * 1.5 + CARD_GAP, "{width}: {card}");
+        }
+        assert_eq!(node_columns(200.), 2);
+        assert_eq!(node_columns(600.), 3);
+    }
 
     #[test]
     fn connection_filter_matches_shown_fields_and_rule() {

@@ -27,6 +27,15 @@ const MODES: [&str; 3] = ["rule", "global", "direct"];
 /// Built-in outbounds that are never a useful default for GLOBAL.
 const BUILTIN: [&str; 5] = ["DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE"];
 
+/// Mihomo lists a connection's chain from the node outward, so the entry before a group is the
+/// member it chose.
+fn routed_elsewhere(chains: &[String], group: &str, proxy: &str) -> bool {
+    chains
+        .iter()
+        .position(|name| name == group)
+        .is_some_and(|ix| ix > 0 && chains[ix - 1] != proxy)
+}
+
 /// What GLOBAL should select instead of DIRECT: its first member that is a proxy group, else
 /// its first member that is not built in. `None` leaves it alone.
 pub fn global_default(groups: &[Group]) -> Option<String> {
@@ -893,7 +902,9 @@ impl Actor {
                 });
             }
             self.commit(name, candidate)?;
-            return self.refresh_with_global_default().await;
+            self.refresh_with_global_default().await?;
+            // Open connections keep the old profile's rules and nodes until closed.
+            return self.api.close_all().await;
         }
         // A different home is a process argument, so this needs a managed restart.
         self.read_proxy_state();
@@ -949,8 +960,8 @@ impl Actor {
         Ok(())
     }
 
-    /// Always remembered; applied now if the core runs, otherwise at the next start.
-    /// Existing connections are left open.
+    /// Always remembered; applied now if the core runs, otherwise at the next start. A change
+    /// closes open connections: Mihomo routes by mode only when a connection opens.
     async fn set_mode(&mut self, mode: &str) -> Result<()> {
         if !MODES.contains(&mode) {
             bail!("unknown mode {mode}");
@@ -960,13 +971,26 @@ impl Actor {
         if self.core.is_none() {
             return Ok(());
         }
+        // Asked of the core, not the snapshot, so a stale view cannot skip a real change.
+        if self.api.runtime().await?.0 == mode {
+            return self.refresh_runtime().await;
+        }
         self.api.set_mode(mode).await?;
-        self.refresh_with_global_default().await
+        // After GLOBAL moves off DIRECT, so reconnecting apps cannot land on DIRECT meanwhile.
+        self.refresh_with_global_default().await?;
+        self.api.close_all().await
     }
 
+    /// Closes the connections that went through `group` by another member, which keep that
+    /// route until closed. Picking the current member closes nothing.
     async fn select(&mut self, group: &str, proxy: &str) -> Result<()> {
         self.running_or_err()?;
         self.api.select(group, proxy).await?;
+        for conn in self.api.connections().await? {
+            if routed_elsewhere(&conn.chains, group, proxy) {
+                self.api.close_connection(&conn.id).await?;
+            }
+        }
         self.refresh_runtime().await
     }
 
