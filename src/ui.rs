@@ -496,8 +496,12 @@ fn icon_button(
         (false, true) => p.text,
         (false, false) => p.dim.opacity(0.6),
     };
-    let tip: SharedString = tip.into();
-    chip(id, p, selected, enabled, on_click)
+    let (id, tip): (SharedString, SharedString) = (id.into(), tip.into());
+    // A tooltip already waiting to show keeps the text it was built with, so a button that
+    // changes what it does gets a new element for each state; the selector stays the same.
+    let selector = id.to_string();
+    chip(format!("{id}:{tip}"), p, selected, enabled, on_click)
+        .debug_selector(|| selector)
         .w(px(28.))
         .h(px(24.))
         .px_0()
@@ -581,6 +585,9 @@ fn hint(text: String, p: Palette) -> gpui::Div {
 /// Width of the label column, so every row's controls start at the same edge.
 const LABEL_WIDTH: Pixels = px(104.);
 
+/// The height of a button or field, the line every part of a Settings row is centred on.
+const CONTROL_HEIGHT: Pixels = px(27.);
+
 /// A Settings row in three parts: the label, the controls (wrapping inside their own area), and
 /// the row's icon buttons pinned to the right of the first line.
 fn field(
@@ -596,10 +603,12 @@ fn field(
         .py(px(3.))
         .child(
             div()
+                .debug_selector(move || format!("label-{text}"))
                 .w(LABEL_WIDTH)
+                .h(CONTROL_HEIGHT)
                 .flex_none()
-                // Centred on a control's height.
-                .pt(px(4.))
+                .flex()
+                .items_center()
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(p.dim)
                 .child(text),
@@ -608,13 +617,23 @@ fn field(
             div()
                 .flex_1()
                 .min_w_0()
+                // Text alone, without a control, still lines up with the label.
+                .min_h(CONTROL_HEIGHT)
                 .flex()
                 .flex_wrap()
                 .items_center()
                 .gap_1()
                 .child(controls),
         )
-        .children(action)
+        // Icon buttons are shorter than the other controls; they stay on the first line.
+        .children(action.map(|action| {
+            div()
+                .h(CONTROL_HEIGHT)
+                .flex_none()
+                .flex()
+                .items_center()
+                .child(action)
+        }))
 }
 
 /// A hairline between groups of sections, fainter than control borders, across the content.
@@ -2976,7 +2995,20 @@ mod gpui_tests {
             }
         }
         let show = ui.cx.debug_bounds("secret-show").unwrap();
-        assert!(show.right() < ui.cx.debug_bounds("regenerate").unwrap().left());
+        let regenerate = ui.cx.debug_bounds("regenerate").unwrap();
+        assert!(show.right() < regenerate.left());
+        // Text, buttons and icon buttons are centred on their row's label.
+        for (label, ids) in [
+            ("label-Secret", &["secret", "secret-show", "regenerate"][..]),
+            ("label-Available To", &["lan-off"]),
+            ("label-Versions", &["check"]),
+        ] {
+            let label = ui.cx.debug_bounds(label).unwrap();
+            for id in ids {
+                let offset = (ui.cx.debug_bounds(id).unwrap().center().y - label.center().y).abs();
+                assert!(offset < px(1.), "{id} is off its label by {offset:?}");
+            }
+        }
     }
 
     #[gpui::test]

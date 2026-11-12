@@ -328,14 +328,7 @@ impl TextInput {
 
     /// The platform speaks UTF-16 offsets; `content` is indexed in UTF-8 bytes.
     fn offset_from_utf16(&self, offset: usize) -> usize {
-        let mut utf16 = 0;
-        for (utf8, ch) in self.content.char_indices() {
-            if utf16 >= offset {
-                return utf8;
-            }
-            utf16 += ch.len_utf16();
-        }
-        self.content.len()
+        utf8_offset(&self.content, offset)
     }
 
     fn offset_to_utf16(&self, offset: usize) -> usize {
@@ -381,6 +374,18 @@ impl TextInput {
         self.show_cursor();
         cx.notify();
     }
+}
+
+/// The UTF-8 offset of a UTF-16 offset in `text`, clamped to its end.
+fn utf8_offset(text: &str, utf16_offset: usize) -> usize {
+    let mut utf16 = 0;
+    for (utf8, ch) in text.char_indices() {
+        if utf16 >= utf16_offset {
+            return utf8;
+        }
+        utf16 += ch.len_utf16();
+    }
+    text.len()
 }
 
 impl EntityInputHandler for TextInput {
@@ -455,16 +460,20 @@ impl EntityInputHandler for TextInput {
             .map(|r| self.range_from_utf16(r))
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
-        let new_text = &*self.accept(&range, new_text);
+        let sent = new_text;
+        let new_text = &*self.accept(&range, sent);
         let marked = (!new_text.is_empty()).then(|| range.start..range.start + new_text.len());
         self.replace(range.clone(), new_text, marked, cx);
-        // The new selection is relative to the inserted text.
+        // The new selection is relative to the text the input method sent, so it no longer
+        // applies once a digits field has dropped some of it.
+        let end = range.start + new_text.len();
         self.selected_range = new_selected_range_utf16
+            .filter(|_| new_text == sent)
             .map(|r| {
-                let r = self.range_from_utf16(&r);
-                range.start + r.start..range.start + r.end
+                range.start + utf8_offset(new_text, r.start)
+                    ..range.start + utf8_offset(new_text, r.end)
             })
-            .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
+            .unwrap_or(end..end);
     }
 
     fn bounds_for_range(
@@ -775,9 +784,14 @@ mod tests {
             assert_eq!(input.text(), "xc");
 
             // IME: marked text replaces itself until committed.
-            input.replace_and_mark_text_in_range(None, "n", None, window, cx);
-            input.replace_and_mark_text_in_range(None, "ni", None, window, cx);
+            input.replace_and_mark_text_in_range(None, "n", Some(1..1), window, cx);
+            input.replace_and_mark_text_in_range(None, "ni", Some(2..2), window, cx);
             assert_eq!(input.content, "xnic", "shown while composing");
+            assert_eq!(
+                input.selected_range,
+                3..3,
+                "the cursor follows the composition"
+            );
             input.replace_text_in_range(None, "你", window, cx);
             assert_eq!(input.text(), "x你c");
             assert_eq!(input.marked_range, None);
@@ -802,6 +816,17 @@ mod tests {
             assert_eq!(input.text(), "99345");
             input.replace_and_mark_text_in_range(None, "ni", None, window, cx);
             assert_eq!(input.content, "99345", "no composing letters");
+            // An input method places the cursor inside the letters it sent; with the letters
+            // dropped, the cursor stays inside the text it asks about next.
+            input.selected_range = 5..5;
+            input.replace_and_mark_text_in_range(None, "a", Some(1..1), window, cx);
+            assert_eq!(input.selected_range, 5..5);
+            input.selected_text_range(false, window, cx);
+            input.replace_and_mark_text_in_range(None, "ab", Some(2..2), window, cx);
+            assert_eq!(
+                input.selected_text_range(false, window, cx).unwrap().range,
+                5..5
+            );
             input.set_text("7", cx);
             assert_eq!(
                 (input.text(), input.selected_range.clone()),
