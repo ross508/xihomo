@@ -1,9 +1,11 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use yaml_serde::{Mapping, Value};
 
 /// Debug builds are the dev channel: their own directories and default ports, so development never
 /// touches the release build used day to day.
@@ -61,6 +63,10 @@ impl Paths {
     pub fn candidate(&self) -> PathBuf {
         self.runtime().join("candidate.yaml")
     }
+    /// The file a launched core reads with `-f`, and again on a dashboard's Restart or Reload.
+    pub fn config(&self) -> PathBuf {
+        self.runtime().join("config.yaml")
+    }
     pub fn last_good(&self) -> PathBuf {
         self.runtime().join("last-good.yaml")
     }
@@ -89,20 +95,55 @@ impl Paths {
         Ok(())
     }
 
-    /// Stable per-install controller secret, so last-good snapshots stay usable across launches.
-    pub fn secret(&self) -> Result<String> {
-        let path = self.state().join("secret");
-        if let Ok(secret) = fs::read_to_string(&path)
-            && secret.len() == 64
-        {
-            return Ok(secret);
-        }
-        let mut bytes = [0u8; 32];
-        std::io::Read::read_exact(&mut fs::File::open("/dev/urandom")?, &mut bytes)?;
-        let secret: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-        write_private(&path, secret.as_bytes())?;
-        Ok(secret)
+    fn secret_file(&self) -> PathBuf {
+        self.state().join("secret")
     }
+
+    /// Stable per-install controller secret, so last-good snapshots stay usable across launches.
+    /// `true` when it was missing or invalid and a new one was written.
+    pub fn secret(&self) -> Result<(String, bool)> {
+        if let Ok(secret) = fs::read_to_string(self.secret_file())
+            && valid_secret(&secret)
+        {
+            return Ok((secret, false));
+        }
+        let secret = new_secret()?;
+        self.save_secret(&secret)?;
+        Ok((secret, true))
+    }
+
+    pub fn save_secret(&self, secret: &str) -> Result<()> {
+        write_private(&self.secret_file(), secret.as_bytes())
+    }
+}
+
+/// Letters and digits without look-alikes (0 O o, 1 I l), plus the URL-safe marks, so a secret
+/// can be read off the screen and pasted into a dashboard's address or a header unescaped.
+const SECRET_CHARS: &[u8] = b"abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789-_.~";
+/// 20 of 60 characters: about 118 bits.
+const SECRET_LEN: usize = 20;
+
+/// Anything URL-safe and long enough, so a secret from an earlier version (64 hex digits) stays.
+fn valid_secret(secret: &str) -> bool {
+    (16..=128).contains(&secret.len())
+        && secret
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.~".contains(&b))
+}
+
+/// A new secret from the system's random source, without modulo bias.
+pub fn new_secret() -> Result<String> {
+    let mut random = fs::File::open("/dev/urandom")?;
+    let limit = (256 / SECRET_CHARS.len() * SECRET_CHARS.len()) as u8;
+    let mut secret = String::with_capacity(SECRET_LEN);
+    let mut byte = [0u8; 1];
+    while secret.len() < SECRET_LEN {
+        std::io::Read::read_exact(&mut random, &mut byte)?;
+        if byte[0] < limit {
+            secret.push(SECRET_CHARS[byte[0] as usize % SECRET_CHARS.len()] as char);
+        }
+    }
+    Ok(secret)
 }
 
 /// Atomic and private. `rename` replaces a symlink at `path` rather than writing through it.
@@ -163,13 +204,13 @@ pub enum Theme {
     Dark,
 }
 
-/// `settings.yaml`: only what the user edits. xihomo rewrites it only when a preference changes
-/// in the GUI.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
+/// `settings.yaml`: only what the user edits. xihomo changes only the key edited in the GUI.
+#[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct Settings {
     pub mixed_port: u16,
     pub controller_port: u16,
+    /// Other devices may use the proxy.
+    pub allow_lan: bool,
     pub icon_set: String,
     pub theme: Theme,
 }
@@ -184,23 +225,105 @@ impl Default for Settings {
         Self {
             mixed_port,
             controller_port,
+            allow_lan: false,
             icon_set: "circle".into(),
             theme: Theme::Auto,
         }
     }
 }
 
+/// Ports below 1024 need root; xihomo's are always unprivileged.
+pub fn valid_port(port: u16) -> bool {
+    port >= 1024
+}
+
+/// One key's value, or its default when it is absent; an invalid one is named in `invalid`.
+fn field<T: DeserializeOwned>(
+    map: &Mapping,
+    key: &str,
+    default: T,
+    invalid: &mut Vec<String>,
+) -> T {
+    match map.get(key) {
+        None => default,
+        Some(value) => yaml_serde::from_value(value.clone()).unwrap_or_else(|_| {
+            invalid.push(key.to_owned());
+            default
+        }),
+    }
+}
+
+/// Where a write to `path` lands: through a symlink to its target, so dotfile links survive.
+fn write_target(path: &Path) -> PathBuf {
+    fs::canonicalize(path)
+        .or_else(|_| fs::read_link(path).map(|t| path.parent().unwrap_or(Path::new("")).join(t)))
+        .unwrap_or_else(|_| path.to_owned())
+}
+
 impl Settings {
+    /// Field by field: an invalid value takes its default and is reported, the others are kept.
+    /// Only a file that is not YAML, or not a mapping, is set aside.
     pub fn load(paths: &Paths) -> Result<(Self, Option<String>)> {
-        load_or_set_aside(&paths.settings(), |bytes| {
+        let mut invalid = Vec::new();
+        let (settings, notice) = load_or_set_aside(&paths.settings(), |bytes| {
             // An empty or comment-only file is a valid "all defaults".
-            Ok(match yaml_serde::from_slice::<yaml_serde::Value>(bytes)? {
-                yaml_serde::Value::Null => Self::default(),
-                value => yaml_serde::from_value(value)?,
-            })
-        })
+            let map = match yaml_serde::from_slice::<Value>(bytes)? {
+                Value::Null => Mapping::new(),
+                Value::Mapping(map) => map,
+                _ => bail!("not a YAML mapping"),
+            };
+            let d = Self::default();
+            let mut s = Self {
+                mixed_port: field(&map, "mixed_port", d.mixed_port, &mut invalid),
+                controller_port: field(&map, "controller_port", d.controller_port, &mut invalid),
+                allow_lan: field(&map, "allow_lan", d.allow_lan, &mut invalid),
+                icon_set: field(&map, "icon_set", d.icon_set, &mut invalid),
+                theme: field(&map, "theme", d.theme, &mut invalid),
+            };
+            for (key, port, default) in [
+                ("mixed_port", &mut s.mixed_port, d.mixed_port),
+                ("controller_port", &mut s.controller_port, d.controller_port),
+            ] {
+                if !valid_port(*port) {
+                    invalid.push(key.to_owned());
+                    *port = default;
+                }
+            }
+            if s.mixed_port == s.controller_port {
+                invalid.push("controller_port (same as mixed_port)".to_owned());
+                (s.mixed_port, s.controller_port) = (d.mixed_port, d.controller_port);
+            }
+            Ok(s)
+        })?;
+        let invalid = (!invalid.is_empty()).then(|| {
+            format!(
+                "settings.yaml: invalid {}; using the default",
+                invalid.join(", ")
+            )
+        });
+        Ok((settings, notice.or(invalid)))
     }
 
+    /// Re-reads the file and changes only `key`, so edits made since launch are kept.
+    pub fn write_key(paths: &Paths, key: &str, value: impl Serialize) -> Result<()> {
+        let path = paths.settings();
+        let mut map = match fs::read(&path) {
+            Ok(bytes) => match yaml_serde::from_slice::<Value>(&bytes) {
+                Ok(Value::Mapping(map)) => map,
+                Ok(Value::Null) => Mapping::new(),
+                _ => bail!("settings.yaml cannot be parsed; fix it before changing settings here"),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Mapping::new(),
+            Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+        };
+        map.insert(key.into(), yaml_serde::to_value(value)?);
+        write_private(
+            &write_target(&path),
+            yaml_serde::to_string(&map)?.as_bytes(),
+        )
+    }
+
+    #[cfg(test)]
     pub fn save(&self, paths: &Paths) -> Result<()> {
         write_private(&paths.settings(), yaml_serde::to_string(self)?.as_bytes())
     }
@@ -310,8 +433,8 @@ mod tests {
     fn invalid_files_are_set_aside_not_overwritten() {
         let paths = temp_paths("settings-invalid");
         for (path, bad) in [
-            (paths.settings(), "theme: purple\n"),
             (paths.settings(), "a: ["),
+            (paths.settings(), "- a\n"),
             (paths.app_data(), "{nope"),
         ] {
             fs::write(&path, bad).unwrap();
@@ -329,6 +452,88 @@ mod tests {
             aside.push(".invalid");
             assert_eq!(fs::read_to_string(aside).unwrap(), bad);
         }
+    }
+
+    #[test]
+    fn an_invalid_value_takes_its_default_and_keeps_the_others() {
+        let paths = temp_paths("settings-fields");
+        let d = Settings::default();
+        let text = "theme: purple\nicon_set: bars\nmixed_port: 80\ncontroller_port: 7001\nallow_lan: yes please\n";
+        fs::write(paths.settings(), text).unwrap();
+        let (settings, notice) = Settings::load(&paths).unwrap();
+        assert_eq!(
+            settings,
+            Settings {
+                icon_set: "bars".into(),
+                controller_port: 7001,
+                ..d.clone()
+            }
+        );
+        let notice = notice.unwrap();
+        for key in ["theme", "mixed_port", "allow_lan"] {
+            assert!(notice.contains(key), "{notice}");
+        }
+        assert!(!notice.contains("icon_set"), "{notice}");
+        assert_eq!(fs::read_to_string(paths.settings()).unwrap(), text, "kept");
+
+        fs::write(
+            paths.settings(),
+            "mixed_port: 7000\ncontroller_port: 7000\n",
+        )
+        .unwrap();
+        let (settings, notice) = Settings::load(&paths).unwrap();
+        assert_eq!(
+            (settings.mixed_port, settings.controller_port),
+            (d.mixed_port, d.controller_port)
+        );
+        assert!(notice.unwrap().contains("same as"));
+    }
+
+    #[test]
+    fn a_gui_write_changes_one_key_and_follows_a_symlink() {
+        let paths = temp_paths("settings-write");
+        Settings::write_key(&paths, "theme", Theme::Dark).unwrap();
+        assert_eq!(Settings::load(&paths).unwrap().0.theme, Theme::Dark);
+
+        // Edited by hand since launch: the other keys, even unknown ones, survive.
+        let dotfiles = paths.data.join("dotfiles");
+        fs::create_dir_all(&dotfiles).unwrap();
+        let target = dotfiles.join("settings.yaml");
+        fs::write(&target, "mixed_port: 7000\nunknown: 1\n").unwrap();
+        fs::remove_file(paths.settings()).unwrap();
+        std::os::unix::fs::symlink(&target, paths.settings()).unwrap();
+        Settings::write_key(&paths, "allow_lan", true).unwrap();
+        assert!(fs::symlink_metadata(paths.settings()).unwrap().is_symlink());
+        let (settings, notice) = Settings::load(&paths).unwrap();
+        assert_eq!(
+            (settings.mixed_port, settings.allow_lan, notice),
+            (7000, true, None)
+        );
+        assert!(fs::read_to_string(&target).unwrap().contains("unknown: 1"));
+
+        // A file broken since launch is not replaced.
+        fs::write(&target, "a: [").unwrap();
+        assert!(Settings::write_key(&paths, "theme", Theme::Light).is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "a: [");
+    }
+
+    #[test]
+    fn a_missing_or_invalid_secret_is_regenerated_and_reported() {
+        let paths = temp_paths("secret");
+        let (first, created) = paths.secret().unwrap();
+        assert!(created && first.len() == SECRET_LEN);
+        assert!(first.bytes().all(|b| SECRET_CHARS.contains(&b)));
+        assert_eq!(paths.secret().unwrap(), (first.clone(), false));
+        for bad in ["short", "has a space in it!!", "quote\"and#hash&amp;sign"] {
+            fs::write(paths.state().join("secret"), bad).unwrap();
+            let (next, created) = paths.secret().unwrap();
+            assert!(created && valid_secret(&next), "{bad}");
+        }
+        // A secret from an earlier version is kept.
+        let old = "0123456789abcdef".repeat(4);
+        fs::write(paths.state().join("secret"), &old).unwrap();
+        assert_eq!(paths.secret().unwrap(), (old, false));
+        assert_ne!(new_secret().unwrap(), new_secret().unwrap());
     }
 
     #[test]

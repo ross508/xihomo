@@ -7,12 +7,22 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// A large rule list over a slow link can take this long to fetch.
+const PROVIDER_TIMEOUT: Duration = Duration::from_secs(60);
+
 #[derive(Clone)]
 pub struct Api {
     client: Client,
     streaming: Client,
     base: Url,
     secret: Arc<str>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CoreConfig {
+    pub mode: String,
+    pub mixed_port: u16,
+    pub allow_lan: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -126,7 +136,21 @@ impl Api {
     }
 
     async fn send(&self, method: Method, url: Url, body: Option<Value>) -> Result<Response> {
+        self.send_within(method, url, body, None).await
+    }
+
+    /// `timeout` replaces the client's for a request that makes the core download something.
+    async fn send_within(
+        &self,
+        method: Method,
+        url: Url,
+        body: Option<Value>,
+        timeout: Option<Duration>,
+    ) -> Result<Response> {
         let mut req = self.client.request(method, url).bearer_auth(&*self.secret);
+        if let Some(timeout) = timeout {
+            req = req.timeout(timeout);
+        }
         if let Some(body) = body {
             req = req.json(&body);
         }
@@ -158,17 +182,26 @@ impl Api {
             .context("no version in reply")
     }
 
-    /// Mode and the mixed port that actually took effect.
-    pub async fn runtime(&self) -> Result<(String, u16)> {
+    /// What actually took effect in the running core.
+    pub async fn runtime(&self) -> Result<CoreConfig> {
         let body: Value = self
             .send(Method::GET, self.url(&["configs"]), None)
             .await?
             .json()
             .await?;
-        Ok((
-            body["mode"].as_str().unwrap_or_default().to_owned(),
-            body["mixed-port"].as_u64().unwrap_or_default() as u16,
-        ))
+        Ok(CoreConfig {
+            mode: body["mode"].as_str().unwrap_or_default().to_owned(),
+            mixed_port: body["mixed-port"].as_u64().unwrap_or_default() as u16,
+            allow_lan: body["allow-lan"].as_bool().unwrap_or_default(),
+        })
+    }
+
+    /// What a dashboard does to change the running core.
+    #[cfg(test)]
+    pub async fn patch(&self, body: Value) -> Result<()> {
+        self.send(Method::PATCH, self.url(&["configs"]), Some(body))
+            .await?;
+        Ok(())
     }
 
     pub async fn set_mode(&self, mode: &str) -> Result<()> {
@@ -232,6 +265,46 @@ impl Api {
         self.send(Method::DELETE, self.url(&["connections"]), None)
             .await?;
         Ok(())
+    }
+
+    /// Asks the core to refresh every proxy and rule provider (download a remote one, re-read a
+    /// file one). Returns how many were updated and the failures, by name.
+    /// All at once, since each waits for its own download.
+    pub async fn update_providers(&self) -> Result<(usize, Vec<String>)> {
+        let mut updates = tokio::task::JoinSet::new();
+        for kind in ["proxies", "rules"] {
+            let body: Value = self
+                .send(Method::GET, self.url(&["providers", kind]), None)
+                .await?
+                .json()
+                .await?;
+            // Groups' inline proxies are listed as "Compatible" providers; nothing to fetch.
+            let names: Vec<String> = body["providers"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .filter(|(_, p)| p["vehicleType"] != "Compatible")
+                .map(|(name, _)| name.clone())
+                .collect();
+            for name in names {
+                let (api, url) = (self.clone(), self.url(&["providers", kind, &name]));
+                updates.spawn_local(async move {
+                    let result = api
+                        .send_within(Method::PUT, url, None, Some(PROVIDER_TIMEOUT))
+                        .await;
+                    result.map_err(|e| format!("{name} ({e:#})"))
+                });
+            }
+        }
+        let (mut updated, mut failed) = (0, Vec::new());
+        while let Some(done) = updates.join_next().await {
+            match done.map_err(|e| e.to_string()).and_then(|r| r) {
+                Ok(_) => updated += 1,
+                Err(e) => failed.push(e),
+            }
+        }
+        failed.sort();
+        Ok((updated, failed))
     }
 
     /// Mihomo streams one JSON object per line over plain HTTP; no WebSocket is needed.

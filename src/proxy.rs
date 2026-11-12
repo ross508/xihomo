@@ -63,6 +63,13 @@ mod sc {
         pub fn SCNetworkServiceGetName(service: CFTypeRef) -> CFStringRef;
         pub fn SCNetworkServiceGetServiceID(service: CFTypeRef) -> CFStringRef;
         pub fn SCDynamicStoreCopyProxies(store: CFTypeRef) -> CFDictionaryRef;
+        pub fn SCDynamicStoreCreate(
+            allocator: CFAllocatorRef,
+            name: CFStringRef,
+            callout: *const std::ffi::c_void,
+            context: *mut std::ffi::c_void,
+        ) -> CFTypeRef;
+        pub fn SCDynamicStoreCopyValue(store: CFTypeRef, key: CFStringRef) -> CFTypeRef;
     }
 }
 
@@ -140,11 +147,11 @@ pub fn services() -> Result<Vec<String>> {
 pub struct State {
     /// HTTP, HTTPS or SOCKS is enabled, whoever set it.
     pub on: bool,
-    /// One of them points at xihomo's mixed port.
+    /// One of them points at one of xihomo's mixed ports.
     pub ours: bool,
 }
 
-fn parse(d: &Dict, port: u16) -> State {
+fn parse(d: &Dict, ports: &[u16]) -> State {
     let mut state = State::default();
     for (enable, host, port_key) in [
         ("HTTPEnable", "HTTPProxy", "HTTPPort"),
@@ -163,20 +170,58 @@ fn parse(d: &Dict, port: u16) -> State {
             .find(CFString::new(port_key))
             .and_then(|v| v.downcast::<CFNumber>())
             .and_then(|n| n.to_i64())
-            == Some(port.into());
+            .is_some_and(|p| ports.iter().any(|&port| p == i64::from(port)));
         state.ours |= host && same_port;
     }
     state
 }
 
-/// Read-only and in-process; an unreadable store counts as no proxy.
-pub fn state(port: u16) -> State {
+/// Read-only and in-process; an unreadable store counts as no proxy. More than one port counts
+/// as ours while the proxy moves from one to another.
+pub fn state(ports: &[u16]) -> State {
     unsafe {
         let dict = sc::SCDynamicStoreCopyProxies(std::ptr::null());
         if dict.is_null() {
             return State::default();
         }
-        parse(&Dict::wrap_under_create_rule(dict), port)
+        parse(&Dict::wrap_under_create_rule(dict), ports)
+    }
+}
+
+/// The primary interface's first IPv4 address: how other devices on the network reach this Mac.
+pub fn lan_ip() -> Option<std::net::Ipv4Addr> {
+    unsafe {
+        let name = CFString::new("xihomo");
+        let store = owned(sc::SCDynamicStoreCreate(
+            kCFAllocatorDefault,
+            name.as_concrete_TypeRef(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        ))?;
+        let value = |key: &str, field: &str| {
+            let key = CFString::new(key);
+            let value = owned(sc::SCDynamicStoreCopyValue(
+                store.as_CFTypeRef(),
+                key.as_concrete_TypeRef(),
+            ))?;
+            if !value.instance_of::<CFDictionary>() {
+                return None;
+            }
+            Dict::wrap_under_get_rule(value.as_CFTypeRef().cast())
+                .find(CFString::new(field))
+                .map(|v| v.clone())
+        };
+        let interface =
+            value("State:/Network/Global/IPv4", "PrimaryInterface")?.downcast::<CFString>()?;
+        let addresses = value(
+            &format!("State:/Network/Interface/{interface}/IPv4"),
+            "Addresses",
+        )?
+        .downcast::<CFArray>()?;
+        CFArray::<CFType>::wrap_under_get_rule(addresses.as_concrete_TypeRef())
+            .iter()
+            .filter_map(|a| a.downcast::<CFString>()?.to_string().parse().ok())
+            .next()
     }
 }
 
@@ -258,14 +303,14 @@ mod tests {
         };
         let num = |n: i64| CFNumber::from(n).as_CFType();
         let text = |s: &str| CFString::new(s).as_CFType();
-        assert_eq!(parse(&dict(&[]), 10999), State::default());
+        assert_eq!(parse(&dict(&[]), &[10999]), State::default());
         let other = dict(&[
             ("HTTPEnable", num(1)),
             ("HTTPProxy", text("127.0.0.1")),
             ("HTTPPort", num(7890)),
         ]);
         assert_eq!(
-            parse(&other, 10999),
+            parse(&other, &[10999]),
             State {
                 on: true,
                 ours: false
@@ -280,7 +325,7 @@ mod tests {
             ("SOCKSPort", num(10999)),
         ]);
         assert_eq!(
-            parse(&ours, 10999),
+            parse(&ours, &[10999]),
             State {
                 on: true,
                 ours: true
@@ -291,7 +336,21 @@ mod tests {
             ("HTTPProxy", text("127.0.0.1")),
             ("HTTPPort", num(10999)),
         ]);
-        assert_eq!(parse(&disabled_ours, 10999), State::default());
+        assert_eq!(parse(&disabled_ours, &[10999]), State::default());
+        // Moving from 7890 to 10999: either counts as ours.
+        assert!(parse(&other, &[10999, 7890]).ours);
+    }
+
+    /// Read-only cross-check on this Mac: the address is one `ifconfig` lists, never loopback.
+    #[test]
+    fn lan_address_is_an_address_of_this_mac() {
+        let Some(ip) = lan_ip() else { return };
+        assert!(!ip.is_loopback() && !ip.is_unspecified());
+        let output = std::process::Command::new("/sbin/ifconfig")
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(text.contains(&format!("inet {ip} ")), "{ip}");
     }
 
     /// Read-only cross-check on this Mac: the in-process list matches networksetup's.

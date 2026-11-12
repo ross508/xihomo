@@ -22,8 +22,9 @@ fn actor(name: &str) -> Option<(Actor, mpsc::UnboundedReceiver<Cmd>)> {
     std::os::unix::fs::symlink(core, paths.core_exe(VERSION)).unwrap();
     fs::write(paths.profiles().join("good.yaml"), GOOD).unwrap();
     // Distinct, per-process ports so parallel tests and any real instance cannot collide.
+    // Four per test: mixed, controller and two spares from `spare`.
     let base =
-        21000 + (std::process::id() % 500) as u16 * 40 + NEXT_PORT.fetch_add(2, Ordering::SeqCst);
+        21000 + (std::process::id() % 500) as u16 * 80 + NEXT_PORT.fetch_add(4, Ordering::SeqCst);
     Settings {
         mixed_port: base,
         controller_port: base + 1,
@@ -57,6 +58,22 @@ macro_rules! local_test {
                 .await;
         }
     };
+}
+
+/// A free port next to the actor's own two.
+fn spare(a: &Actor, n: u16) -> u16 {
+    a.settings.mixed_port + 1 + n
+}
+
+fn saved_settings(a: &Actor) -> Settings {
+    Settings::load(&a.paths).unwrap().0
+}
+
+fn message(a: &Actor, area: Area) -> String {
+    a.snap
+        .message(area)
+        .map(|m| m.text.clone())
+        .unwrap_or_default()
 }
 
 fn saved(actor: &Actor) -> AppData {
@@ -285,11 +302,323 @@ local_test!(occupied_port_refuses_start, a, _rx, {
     a.handle(Cmd::Start).await;
     assert!(a.core.is_none());
     match &a.snap.phase {
-        Phase::Failed(message) => assert!(message.contains("in use"), "{message}"),
+        Phase::Failed(message) => assert!(message.contains("Settings → API"), "{message}"),
         other => panic!("{other:?}"),
     }
+    let port = a.settings.controller_port;
+    assert_eq!(
+        message(&a, Area::Api),
+        format!("Port {port} is in use; change it here")
+    );
     assert!(squatter.local_addr().is_ok());
+    drop(squatter);
+    a.handle(Cmd::Start).await;
+    assert_eq!(a.snap.phase, Phase::Running);
+    assert_eq!(a.snap.message(Area::Api), None, "resolved");
+    a.handle(Cmd::Stop).await;
 });
+
+local_test!(a_proxy_port_change_applies_by_reload, a, _rx, {
+    a.handle(Cmd::Start).await;
+    assert_eq!(a.snap.phase, Phase::Running, "{:?}", a.snap.error());
+    let pid = a.core.as_ref().unwrap().pid();
+    let (first, _far) = tunnel(&a).await;
+    let (old, new) = (a.settings.mixed_port, spare(&a, 1));
+
+    // Refused before anything changes: privileged, the API's own, or in use.
+    let squatter = std::net::TcpListener::bind(("127.0.0.1", spare(&a, 2))).unwrap();
+    for (port, why) in [
+        (80, "1024 to 65535".to_owned()),
+        (70000, "1024 to 65535".to_owned()),
+        (u32::from(a.settings.controller_port), "API port".to_owned()),
+        (u32::from(spare(&a, 2)), "in use".to_owned()),
+    ] {
+        a.handle(Cmd::SetProxyPort(port)).await;
+        assert!(message(&a, Area::Listen).contains(&why), "{port}");
+        assert_eq!(a.settings.mixed_port, old);
+    }
+    drop(squatter);
+
+    a.handle(Cmd::SetProxyPort(u32::from(new))).await;
+    assert_eq!(message(&a, Area::Listen), "Applied");
+    assert_eq!(a.snap.applying, None);
+    assert_eq!(a.core.as_ref().unwrap().pid(), pid, "no restart");
+    assert_eq!(a.api.runtime().await.unwrap().mixed_port, new);
+    assert_eq!(saved_settings(&a).mixed_port, new);
+    for file in [a.paths.last_good(), a.paths.config()] {
+        assert!(
+            fs::read_to_string(file)
+                .unwrap()
+                .contains(&format!("mixed-port: {new}"))
+        );
+    }
+    assert!(closed(first), "like Reload");
+    let (_second, _far) = tunnel(&a).await;
+    core::ensure_ports_free(&[old]).await.unwrap();
+    a.handle(Cmd::Stop).await;
+});
+
+local_test!(
+    sharing_with_the_network_applies_without_closing_connections,
+    a,
+    _rx,
+    {
+        a.handle(Cmd::Start).await;
+        let (_open, _far) = tunnel(&a).await;
+        a.handle(Cmd::SetAllowLan(true)).await;
+        assert!(a.snap.error().is_none(), "{:?}", a.snap.error());
+        assert!(a.api.runtime().await.unwrap().allow_lan);
+        assert!(saved_settings(&a).allow_lan);
+        assert_eq!(open(&a).await, 1, "connections stay");
+        a.handle(Cmd::SetAllowLan(false)).await;
+        assert!(!a.api.runtime().await.unwrap().allow_lan);
+        assert_eq!(
+            message(&a, Area::Listen),
+            "Only this device can use the proxy"
+        );
+        a.handle(Cmd::Stop).await;
+    }
+);
+
+local_test!(api_changes_restart_the_core_with_the_new_values, a, _rx, {
+    a.handle(Cmd::Start).await;
+    let pid = a.core.as_ref().unwrap().pid();
+    let (old_port, new_port) = (a.settings.controller_port, spare(&a, 1));
+    a.handle(Cmd::SetApiPort(u32::from(a.settings.mixed_port)))
+        .await;
+    assert!(message(&a, Area::Api).contains("proxy port"));
+
+    a.handle(Cmd::SetApiPort(u32::from(new_port))).await;
+    assert_eq!(message(&a, Area::Api), "Applied", "{:?}", a.snap.error());
+    assert_eq!(a.snap.phase, Phase::Running);
+    assert_ne!(a.core.as_ref().unwrap().pid(), pid, "a new process");
+    assert_eq!(saved_settings(&a).controller_port, new_port);
+    assert!(
+        Api::new(old_port, &a.secret)
+            .unwrap()
+            .version()
+            .await
+            .is_err()
+    );
+    assert_eq!(a.api.version().await.unwrap(), VERSION);
+
+    let old_secret = a.secret.clone();
+    a.handle(Cmd::RegenerateSecret).await;
+    assert!(message(&a, Area::Api).starts_with("Regenerated"));
+    assert_ne!(a.secret, old_secret);
+    assert_eq!(a.paths.secret().unwrap(), (a.secret.clone(), false));
+    assert!(
+        Api::new(new_port, &old_secret)
+            .unwrap()
+            .version()
+            .await
+            .is_err()
+    );
+    assert!(a.api.version().await.is_ok());
+
+    // The log task follows the new client: a reload's lines still arrive.
+    a.logs.lock().unwrap().clear();
+    a.handle(Cmd::Reload).await;
+    let mut seen = false;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        seen = a
+            .logs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| !l.text.starts_with("xihomo"));
+        if seen {
+            break;
+        }
+    }
+    assert!(seen, "no core log lines after the restart");
+    a.handle(Cmd::Stop).await;
+});
+
+local_test!(
+    changes_while_stopped_are_saved_for_the_next_start,
+    a,
+    _rx,
+    {
+        let (proxy, api) = (spare(&a, 1), spare(&a, 2));
+        a.handle(Cmd::SetProxyPort(u32::from(proxy))).await;
+        assert_eq!(message(&a, Area::Listen), "Saved; applies at next start");
+        a.handle(Cmd::SetApiPort(u32::from(api))).await;
+        assert_eq!(message(&a, Area::Api), "Saved; applies at next start");
+        a.handle(Cmd::RegenerateSecret).await;
+        let s = saved_settings(&a);
+        assert_eq!((s.mixed_port, s.controller_port), (proxy, api));
+        a.handle(Cmd::Start).await;
+        assert_eq!(a.snap.phase, Phase::Running, "{:?}", a.snap.error());
+        assert_eq!(a.api.runtime().await.unwrap().mixed_port, proxy);
+        a.handle(Cmd::Stop).await;
+    }
+);
+
+local_test!(
+    last_good_recovery_uses_the_current_ports_and_secret,
+    a,
+    _rx,
+    {
+        a.handle(Cmd::Start).await;
+        a.handle(Cmd::Stop).await;
+        let (proxy, api) = (spare(&a, 1), spare(&a, 2));
+        a.handle(Cmd::SetProxyPort(u32::from(proxy))).await;
+        a.handle(Cmd::SetApiPort(u32::from(api))).await;
+        a.handle(Cmd::RegenerateSecret).await;
+        fs::remove_file(a.paths.profiles().join("good.yaml")).unwrap();
+        a.handle(Cmd::Start).await;
+        assert_eq!(a.snap.phase, Phase::Running, "{:?}", a.snap.phase);
+        assert!(message(&a, Area::Core).contains("last-good"));
+        assert_eq!(a.api.runtime().await.unwrap().mixed_port, proxy);
+        a.handle(Cmd::Stop).await;
+    }
+);
+
+local_test!(
+    a_rejected_candidate_never_replaces_the_running_file,
+    a,
+    _rx,
+    {
+        a.handle(Cmd::Start).await;
+        let running = fs::read(a.paths.config()).unwrap();
+        fs::write(
+            a.paths.profiles().join("good.yaml"),
+            "proxy-groups:\n  - {name: X, type: nonsense}\n",
+        )
+        .unwrap();
+        a.handle(Cmd::Reload).await;
+        assert!(a.snap.error().unwrap().contains("rejected"));
+        assert_eq!(fs::read(a.paths.config()).unwrap(), running);
+        assert_ne!(fs::read(a.paths.candidate()).unwrap(), running);
+        a.handle(Cmd::Stop).await;
+    }
+);
+
+local_test!(
+    changes_made_by_another_tool_are_followed_or_reported,
+    a,
+    _rx,
+    {
+        a.handle(Cmd::Start).await;
+        let dashboard = Api::new(a.settings.controller_port, &a.secret).unwrap();
+        let (kept, moved) = (a.settings.mixed_port, spare(&a, 1));
+
+        dashboard
+            .patch(serde_json::json!({"mode": "global"}))
+            .await
+            .unwrap();
+        a.handle(Cmd::Refresh).await;
+        assert_eq!(
+            (a.snap.mode.as_str(), saved(&a).mode.as_deref()),
+            ("global", Some("global"))
+        );
+
+        // A port that serves nothing is only reported, and Reload restores the saved one.
+        dashboard
+            .patch(serde_json::json!({"mixed-port": 0}))
+            .await
+            .unwrap();
+        a.periodic().await;
+        assert_eq!(
+            message(&a, Area::Listen),
+            format!("Another tool set port 0; Reload restores {kept}")
+        );
+        assert_eq!(saved_settings(&a).mixed_port, kept);
+        a.handle(Cmd::Reload).await;
+        assert_eq!(a.api.runtime().await.unwrap().mixed_port, kept);
+        a.periodic().await;
+        assert_eq!(a.snap.message(Area::Listen), None, "resolved");
+
+        dashboard
+            .patch(serde_json::json!({"mixed-port": moved, "allow-lan": true}))
+            .await
+            .unwrap();
+        a.periodic().await;
+        let s = saved_settings(&a);
+        assert_eq!(
+            (a.settings.mixed_port, s.mixed_port, s.allow_lan),
+            (moved, moved, true)
+        );
+        assert_eq!(
+            message(&a, Area::Listen),
+            "LAN access turned on by another tool"
+        );
+        a.publish();
+        assert!(a.snap.allow_lan);
+        a.handle(Cmd::Reload).await;
+        assert_eq!(
+            a.snap.error(),
+            None,
+            "the followed port confirms after a reload"
+        );
+
+        a.app.core_version = Some("v0.0.1".into());
+        a.periodic().await;
+        assert_eq!(
+            message(&a, Area::Update),
+            "The core was replaced by another tool"
+        );
+        a.app.core_version = Some(VERSION.into());
+        a.handle(Cmd::Stop).await;
+    }
+);
+
+local_test!(update_refreshes_the_running_profiles_providers, a, rx, {
+    a.handle(Cmd::UpdateProviders).await;
+    assert!(a.snap.error().unwrap().contains("not running"));
+    a.handle(Cmd::Start).await;
+    a.handle(Cmd::UpdateProviders).await;
+    assert!(a.snap.providers_busy);
+    let done = rx.recv().await.unwrap();
+    a.handle(done).await;
+    assert_eq!(message(&a, Area::Profiles), "This profile has no providers");
+
+    // File providers are re-read from the profile's home, all of them at once.
+    fs::write(
+        a.paths.home("good").join("nodes.yaml"),
+        "proxies:\n  - {name: n1, type: http, server: 127.0.0.1, port: 1}\n",
+    )
+    .unwrap();
+    fs::write(
+        a.paths.home("good").join("local.yaml"),
+        "payload:\n  - example.com\n",
+    )
+    .unwrap();
+    fs::write(
+        a.paths.profiles().join("good.yaml"),
+        GOOD.replace(
+            "proxy-groups:",
+            "proxy-providers:\n  nodes: {type: file, path: ./nodes.yaml}\nrule-providers:\n  local: {type: file, behavior: domain, path: ./local.yaml}\nproxy-groups:",
+        ),
+    )
+    .unwrap();
+    a.handle(Cmd::Reload).await;
+    assert_eq!(a.snap.error(), None);
+    a.handle(Cmd::UpdateProviders).await;
+    let done = rx.recv().await.unwrap();
+    a.handle(done).await;
+    assert!(!a.snap.providers_busy);
+    assert_eq!(message(&a, Area::Profiles), "Updated 2 providers");
+    a.handle(Cmd::Stop).await;
+});
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_lost_secret_is_reported_except_on_a_first_run() {
+    let paths = temp_paths("secret-report");
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let a = Actor::new(paths.clone(), tx.clone(), Arc::new(AtomicBool::new(false)))
+        .unwrap()
+        .0;
+    assert_eq!(a.snap.message(Area::Api), None, "first run");
+    AppData::default().save(&paths).unwrap();
+    fs::write(paths.state().join("secret"), "short").unwrap();
+    let a = Actor::new(paths, tx, Arc::new(AtomicBool::new(false)))
+        .unwrap()
+        .0;
+    assert!(message(&a, Area::Api).contains("update your dashboards"));
+}
 
 local_test!(unexpected_exit_fails_without_restart, a, rx, {
     a.handle(Cmd::Start).await;
@@ -418,17 +747,13 @@ async fn dev_profiles_validate_after_overrides() {
             continue;
         }
         let paths = temp_paths("devprofile");
-        let (yaml, _) = profiles::compose(
+        let yaml = profiles::compose(
             &fs::read(&path).unwrap(),
             b"",
-            &profiles::Runtime {
-                mixed_port: 10999,
-                controller_port: 11000,
-                secret: "x",
-                mode: None,
-            },
+            &profiles::Runtime::new(&Settings::default(), "x", None),
         )
-        .unwrap_or_else(|_| panic!("composition failed"));
+        .unwrap_or_else(|_| panic!("composition failed"))
+        .yaml;
         write_private(&paths.candidate(), yaml.as_bytes()).unwrap();
         let home = paths.data.join("home");
         fs::create_dir_all(&home).unwrap();
@@ -565,8 +890,12 @@ async fn default_profile_passes_the_real_core() {
     let Some(exe) = real_core() else { return };
     let paths = temp_paths("default-validates");
     profiles::ensure_default(&paths).unwrap();
-    let candidate =
-        profiles::write_candidate(&paths, &Settings::default(), "default", "x", None).unwrap();
+    let candidate = profiles::write_candidate(
+        &paths,
+        "default",
+        &profiles::Runtime::new(&Settings::default(), "x", None),
+    )
+    .unwrap();
     core::validate(&exe, &paths, &candidate.home, &paths.candidate(), "x")
         .await
         .unwrap();
@@ -784,11 +1113,11 @@ local_test!(remembered_mode_beats_an_older_last_good, a, _rx, {
 
 /// The system proxy state lags behind networksetup; these readers stand in for configd.
 static LAGGING_READS: AtomicU16 = AtomicU16::new(0);
-fn lagging_off(_: u16) -> proxy::State {
+fn lagging_off(_: &[u16]) -> proxy::State {
     let on = LAGGING_READS.fetch_add(1, Ordering::SeqCst) < 3;
     proxy::State { on, ours: on }
 }
-fn stuck_on(_: u16) -> proxy::State {
+fn stuck_on(_: &[u16]) -> proxy::State {
     proxy::State {
         on: true,
         ours: true,

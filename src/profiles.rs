@@ -9,10 +9,23 @@ use yaml_serde::{Mapping, Value};
 
 const MAX_YAML: u64 = 32 * 1024 * 1024;
 
-/// Keys xihomo must own; an override naming one is a mistake worth reporting, not ignoring.
-const RESERVED: &[&str] = &[
+/// Keys xihomo writes for every profile.
+const WRITTEN: &[&str] = &[
     "mixed-port",
+    "allow-lan",
+    "skip-auth-prefixes",
     "external-controller",
+    "secret",
+    "tun",
+];
+
+/// Keys xihomo removes: other listeners, controllers and UIs it does not manage.
+const REMOVED: &[&str] = &[
+    "port",
+    "socks-port",
+    "redir-port",
+    "tproxy-port",
+    "bind-address",
     "external-controller-tls",
     "external-controller-unix",
     "external-controller-pipe",
@@ -21,9 +34,15 @@ const RESERVED: &[&str] = &[
     "external-ui-url",
     "external-ui-name",
     "external-doh-server",
-    "secret",
-    "tun",
+    "tuic-server",
+    "ss-config",
+    "vmess-config",
 ];
+
+fn owned(key: &Value) -> Option<&str> {
+    key.as_str()
+        .filter(|k| WRITTEN.contains(k) || REMOVED.contains(k))
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Profile {
@@ -78,9 +97,9 @@ pub fn profile_path(paths: &Paths, name: &str) -> Result<PathBuf> {
         .with_context(|| format!("profile {name} not found"))
 }
 
-/// Add an independently maintained YAML file as a profile without importing its contents.
-pub fn link(paths: &Paths, target: &Path) -> Result<String> {
-    let name = target
+/// The profile a file would become: its stem, and where it goes in `profiles/`.
+fn new_profile(paths: &Paths, file: &Path) -> Result<(String, PathBuf)> {
+    let name = file
         .file_stem()
         .and_then(|n| n.to_str())
         .filter(|n| usable_name(n))
@@ -90,8 +109,37 @@ pub fn link(paths: &Paths, target: &Path) -> Result<String> {
     if fs::symlink_metadata(&dest).is_ok() {
         bail!("a profile named {name} already exists");
     }
+    Ok((name, dest))
+}
+
+/// Add an independently maintained YAML file as a profile without importing its contents.
+pub fn link(paths: &Paths, target: &Path) -> Result<String> {
+    let (name, dest) = new_profile(paths, target)?;
     let target = std::path::absolute(target).context("resolve the linked file")?;
     std::os::unix::fs::symlink(target, &dest).context("create profile link")?;
+    Ok(name)
+}
+
+/// Copies a YAML mapping into `profiles/` as a new regular-file profile. The copy is checked
+/// like any profile when it is selected.
+pub fn import(paths: &Paths, source: &Path) -> Result<String> {
+    let (name, dest) = new_profile(paths, source)?;
+    let bytes = read_bounded(source)?;
+    mapping(&bytes, &format!("{name}.yaml"))?;
+    let mut file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&dest)
+    {
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+            bail!("a profile named {name} already exists")
+        }
+        other => other.with_context(|| format!("create {}", dest.display()))?,
+    };
+    if let Err(e) = std::io::Write::write_all(&mut file, &bytes) {
+        let _ = fs::remove_file(&dest);
+        return Err(e).with_context(|| format!("write {}", dest.display()));
+    }
     Ok(name)
 }
 
@@ -212,39 +260,85 @@ fn mapping(bytes: &[u8], what: &str) -> Result<Mapping> {
 pub struct Runtime<'a> {
     pub mixed_port: u16,
     pub controller_port: u16,
+    pub allow_lan: bool,
     pub secret: &'a str,
     /// The user's remembered mode, which beats the profile's and the overrides'.
     pub mode: Option<&'a str>,
 }
 
-/// source → overrides.yaml → xihomo-owned fields. Each step replaces whole top-level values:
-/// mappings are never merged and lists never concatenated. Returns the YAML and any notices.
-pub fn compose(source: &[u8], overrides: &[u8], rt: &Runtime) -> Result<(String, Vec<String>)> {
-    let mut map = mapping(source, "profile")?;
-    let overrides = mapping(overrides, "overrides.yaml")?;
-    for (key, value) in overrides {
-        if let Some(name) = key.as_str()
-            && RESERVED.contains(&name)
-        {
-            bail!(
-                "overrides.yaml may not set {name}: xihomo owns it (ports live in settings.yaml)"
-            );
+impl<'a> Runtime<'a> {
+    pub fn new(settings: &Settings, secret: &'a str, mode: Option<&'a str>) -> Self {
+        Self {
+            mixed_port: settings.mixed_port,
+            controller_port: settings.controller_port,
+            allow_lan: settings.allow_lan,
+            secret,
+            mode,
         }
-        map.insert(key, value);
     }
+}
 
-    let mut notices = Vec::new();
-    for key in RESERVED {
+/// `host:port` with the host replaced by 127.0.0.1; text without a port is left alone.
+fn loopback(addr: &str) -> String {
+    addr.rsplit_once(':')
+        .map_or_else(|| addr.to_owned(), |(_, port)| format!("127.0.0.1:{port}"))
+}
+
+fn loopback_value(addr: &mut Value) {
+    if let Some(text) = addr.as_str() {
+        *addr = loopback(text).into();
+    }
+}
+
+/// Writes xihomo's fields over `map` and returns the owned keys it already had. Also used on
+/// `last-good.yaml`, so a recovery launch uses the current ports and secret.
+pub fn own(map: &mut Mapping, rt: &Runtime) -> Vec<String> {
+    let overridden = map.keys().filter_map(owned).map(str::to_owned).collect();
+    for key in WRITTEN.iter().chain(REMOVED) {
         map.remove(*key);
     }
     if let Some(Value::Sequence(listeners)) = map.get_mut("listeners") {
-        let before = listeners.len();
         listeners.retain(|l| l.get("type").and_then(Value::as_str) != Some("tun"));
-        if listeners.len() != before {
-            notices.push("TUN listeners were removed: xihomo V1 uses the system proxy".to_owned());
+        // Mihomo binds these to 0.0.0.0 by default, whatever allow-lan says.
+        if !rt.allow_lan {
+            for listener in listeners.iter_mut().filter_map(Value::as_mapping_mut) {
+                listener.insert("listen".into(), "127.0.0.1".into());
+            }
+        }
+    }
+    if !rt.allow_lan {
+        if let Some(Value::Sequence(tunnels)) = map.get_mut("tunnels") {
+            for tunnel in tunnels {
+                match tunnel {
+                    // network,address,target[,proxy]
+                    Value::String(text) => {
+                        let mut parts: Vec<String> =
+                            text.split(',').map(|p| p.trim().to_owned()).collect();
+                        if let Some(address) = parts.get_mut(1) {
+                            *address = loopback(address);
+                        }
+                        *text = parts.join(",");
+                    }
+                    Value::Mapping(tunnel) => {
+                        if let Some(address) = tunnel.get_mut("address") {
+                            loopback_value(address);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(listen) = map.get_mut("dns").and_then(|d| d.get_mut("listen")) {
+            loopback_value(listen);
         }
     }
     map.insert("mixed-port".into(), Value::from(rt.mixed_port));
+    map.insert("allow-lan".into(), rt.allow_lan.into());
+    // Apps on this Mac reach the proxy through the system proxy, which cannot authenticate.
+    map.insert(
+        "skip-auth-prefixes".into(),
+        Value::Sequence(vec!["127.0.0.1/8".into(), "::1/128".into()]),
+    );
     map.insert(
         "external-controller".into(),
         format!("127.0.0.1:{}", rt.controller_port).into(),
@@ -256,40 +350,76 @@ pub fn compose(source: &[u8], overrides: &[u8], rt: &Runtime) -> Result<(String,
     if let Some(mode) = rt.mode {
         map.insert("mode".into(), mode.into());
     }
-    Ok((yaml_serde::to_string(&map)?, notices))
+    overridden
+}
+
+pub struct Composed {
+    pub yaml: String,
+    /// Shown at Settings → PROFILES.
+    pub notices: Vec<String>,
+    /// Owned keys the profile set, which xihomo replaced; written to Logs.
+    pub ignored: Vec<String>,
+}
+
+/// source → overrides.yaml → xihomo-owned fields. Each step replaces whole top-level values:
+/// mappings are never merged and lists never concatenated. An owned key in overrides.yaml is
+/// ignored with a notice.
+pub fn compose(source: &[u8], overrides: &[u8], rt: &Runtime) -> Result<Composed> {
+    let mut map = mapping(source, "profile")?;
+    let overrides = mapping(overrides, "overrides.yaml")?;
+    let mut refused = Vec::new();
+    for (key, value) in overrides {
+        match owned(&key) {
+            Some(name) => refused.push(name.to_owned()),
+            None => {
+                map.insert(key, value);
+            }
+        }
+    }
+    let mut notices = Vec::new();
+    if !refused.is_empty() {
+        notices.push(format!(
+            "overrides.yaml: {} ignored (set by xihomo)",
+            refused.join(", ")
+        ));
+    }
+    let had_tun = matches!(map.get("listeners"), Some(Value::Sequence(l))
+        if l.iter().any(|l| l.get("type").and_then(Value::as_str) == Some("tun")));
+    let ignored = own(&mut map, rt);
+    if had_tun {
+        notices.push("TUN listeners were removed: xihomo V1 uses the system proxy".to_owned());
+    }
+    Ok(Composed {
+        yaml: yaml_serde::to_string(&map)?,
+        notices,
+        ignored,
+    })
+}
+
+/// Writes the owned fields into `last-good.yaml` again, with the current settings.
+pub fn reown(path: &Path, rt: &Runtime) -> Result<()> {
+    let mut map = mapping(&read_bounded(path)?, "last-good.yaml")?;
+    own(&mut map, rt);
+    crate::settings::write_private(path, yaml_serde::to_string(&map)?.as_bytes())
 }
 
 pub struct Candidate {
     pub home: PathBuf,
     pub fingerprint: String,
     pub notices: Vec<String>,
+    pub ignored: Vec<String>,
 }
 
-/// Resolve the profile now, then write a private effective snapshot. Links are only ever read.
-pub fn write_candidate(
-    paths: &Paths,
-    settings: &Settings,
-    name: &str,
-    secret: &str,
-    mode: Option<&str>,
-) -> Result<Candidate> {
+/// Resolve the profile now, then write a private effective snapshot to `candidate.yaml`, which
+/// only validation and reloads read. Links are only ever read.
+pub fn write_candidate(paths: &Paths, name: &str, rt: &Runtime) -> Result<Candidate> {
     let path = profile_path(paths, name)?;
     let target =
         fs::canonicalize(&path).with_context(|| format!("profile {name} cannot be resolved"))?;
     let source = read_bounded(&target)?;
     let overrides = read_overrides(paths)?;
-    let (yaml, notices) = compose(
-        &source,
-        &overrides,
-        &Runtime {
-            mixed_port: settings.mixed_port,
-            controller_port: settings.controller_port,
-            secret,
-            mode,
-        },
-    )
-    .with_context(|| format!("profile {name}"))?;
-    crate::settings::write_private(&paths.candidate(), yaml.as_bytes())?;
+    let composed = compose(&source, &overrides, rt).with_context(|| format!("profile {name}"))?;
+    crate::settings::write_private(&paths.candidate(), composed.yaml.as_bytes())?;
     // Created on first activation, so a never-used profile has no home.
     let home = paths.home(name);
     fs::DirBuilder::new()
@@ -300,7 +430,8 @@ pub fn write_candidate(
     Ok(Candidate {
         home,
         fingerprint: fingerprint(&source, &overrides),
-        notices,
+        notices: composed.notices,
+        ignored: composed.ignored,
     })
 }
 
@@ -326,9 +457,17 @@ mod tests {
     const RT: Runtime = Runtime {
         mixed_port: 10999,
         controller_port: 11000,
+        allow_lan: false,
         secret: "s3",
         mode: None,
     };
+
+    fn rt_default() -> Runtime<'static> {
+        Runtime {
+            mixed_port: Settings::default().mixed_port,
+            ..RT
+        }
+    }
 
     fn parsed(yaml: &str) -> Value {
         yaml_serde::from_str(yaml).unwrap()
@@ -337,9 +476,8 @@ mod tests {
     #[test]
     fn runtime_fields_beat_source_and_overrides_replace_whole_values() {
         let source = b"mixed-port: 7890\nexternal-controller: 0.0.0.0:9090\nsecret: old\nlog-level: debug\ndns: {enable: true, ipv6: true}\nrules: [\"MATCH,DIRECT\"]\n";
-        let (yaml, notices) =
-            compose(source, b"dns: {enable: false}\nlog-level: info\n", &RT).unwrap();
-        let v = parsed(&yaml);
+        let c = compose(source, b"dns: {enable: false}\nlog-level: info\n", &RT).unwrap();
+        let v = parsed(&c.yaml);
         assert_eq!(v["mixed-port"], Value::from(10999));
         assert_eq!(v["external-controller"].as_str(), Some("127.0.0.1:11000"));
         assert_eq!(v["secret"].as_str(), Some("s3"));
@@ -349,14 +487,15 @@ mod tests {
             "mappings replace, never merge"
         );
         assert_eq!(v["rules"][0].as_str(), Some("MATCH,DIRECT"));
-        assert!(notices.is_empty());
+        assert!(c.notices.is_empty());
+        assert_eq!(c.ignored, ["mixed-port", "external-controller", "secret"]);
     }
 
     #[test]
     fn remembered_mode_beats_profile_and_overrides() {
         let mode = |source: &str, overrides: &str, rt: &Runtime| {
-            let (yaml, _) = compose(source.as_bytes(), overrides.as_bytes(), rt).unwrap();
-            parsed(&yaml)["mode"].as_str().map(str::to_owned)
+            let c = compose(source.as_bytes(), overrides.as_bytes(), rt).unwrap();
+            parsed(&c.yaml)["mode"].as_str().map(str::to_owned)
         };
         let global = Runtime {
             mode: Some("global"),
@@ -376,42 +515,107 @@ mod tests {
     }
 
     #[test]
-    fn reserved_overrides_are_rejected() {
-        for bad in [
-            "mixed-port: 1",
-            "secret: x",
-            "tun: {enable: true}",
-            "external-controller-unix: /tmp/x",
-        ] {
-            let err = compose(b"a: 1", bad.as_bytes(), &RT)
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("may not set"), "{err}");
-        }
+    fn owned_overrides_are_ignored_with_a_notice() {
+        let c = compose(
+            b"a: 1\nmixed-port: 1\n",
+            b"mixed-port: 1\nsecret: x\nport: 2\nlog-level: debug\n",
+            &RT,
+        )
+        .unwrap();
+        let v = parsed(&c.yaml);
+        assert_eq!(v["mixed-port"], Value::from(10999));
+        assert_eq!(v["secret"].as_str(), Some("s3"));
+        assert!(v.get("port").is_none());
+        assert_eq!(
+            v["log-level"].as_str(),
+            Some("debug"),
+            "other keys still apply"
+        );
+        assert_eq!(
+            c.notices,
+            ["overrides.yaml: mixed-port, secret, port ignored (set by xihomo)"]
+        );
+        assert_eq!(c.ignored, ["mixed-port"], "only the profile's own keys");
     }
 
     #[test]
-    fn extra_controllers_and_tun_are_disabled() {
-        let source = b"tun: {enable: true, stack: system}\nexternal-controller-tls: 0.0.0.0:9\nexternal-controller-unix: /tmp/x\nexternal-ui: ui\nexternal-doh-server: /dns\nlisteners:\n  - {name: t, type: tun}\n  - {name: m, type: mixed, port: 1}\n";
-        let (yaml, notices) = compose(source, b"", &RT).unwrap();
-        let v = parsed(&yaml);
+    fn extra_controllers_listeners_and_tun_are_disabled() {
+        let source = b"tun: {enable: true, stack: system}\nport: 1\nsocks-port: 2\nredir-port: 3\ntproxy-port: 4\nbind-address: '*'\nexternal-controller-tls: 0.0.0.0:9\nexternal-controller-unix: /tmp/x\nexternal-controller-pipe: x\nexternal-controller-cors: {}\nexternal-ui: ui\nexternal-ui-url: u\nexternal-ui-name: n\nexternal-doh-server: /dns\ntuic-server: {enable: true}\nss-config: x\nvmess-config: x\nauthentication: [\"u:p\"]\nlisteners:\n  - {name: t, type: tun}\n  - {name: m, type: mixed, port: 1}\n";
+        let c = compose(source, b"", &RT).unwrap();
+        let v = parsed(&c.yaml);
         assert_eq!(v["tun"]["enable"], Value::from(false));
-        for key in [
-            "external-controller-tls",
-            "external-controller-unix",
-            "external-ui",
-            "external-doh-server",
-        ] {
+        for key in REMOVED {
             assert!(v.get(key).is_none(), "{key}");
         }
+        assert_eq!(v["allow-lan"], Value::from(false));
+        assert_eq!(v["skip-auth-prefixes"][0].as_str(), Some("127.0.0.1/8"));
+        assert_eq!(v["skip-auth-prefixes"][1].as_str(), Some("::1/128"));
+        assert_eq!(
+            v["authentication"][0].as_str(),
+            Some("u:p"),
+            "left to the profile"
+        );
         assert_eq!(v["listeners"].as_sequence().unwrap().len(), 1);
-        assert_eq!(notices.len(), 1);
+        assert_eq!(c.notices.len(), 1);
+        assert_eq!(c.ignored.len(), 17);
+    }
+
+    #[test]
+    fn self_addressed_listeners_stay_on_this_mac_unless_shared() {
+        let source = b"listeners:\n  - {name: m, type: mixed, port: 1}\n  - {name: s, type: socks, port: 2, listen: 0.0.0.0}\ntunnels:\n  - tcp/udp,0.0.0.0:6553,114.114.114.114:53,proxy\n  - {network: [tcp], address: '[::]:7777', target: 'a:1'}\ndns: {enable: true, listen: ':53'}\n";
+        let v = parsed(&compose(source, b"", &RT).unwrap().yaml);
+        for i in 0..2 {
+            assert_eq!(v["listeners"][i]["listen"].as_str(), Some("127.0.0.1"));
+        }
+        assert_eq!(
+            v["tunnels"][0].as_str(),
+            Some("tcp/udp,127.0.0.1:6553,114.114.114.114:53,proxy")
+        );
+        assert_eq!(v["tunnels"][1]["address"].as_str(), Some("127.0.0.1:7777"));
+        assert_eq!(v["tunnels"][1]["target"].as_str(), Some("a:1"));
+        assert_eq!(v["dns"]["listen"].as_str(), Some("127.0.0.1:53"));
+
+        let shared = Runtime {
+            allow_lan: true,
+            ..RT
+        };
+        let v = parsed(&compose(source, b"", &shared).unwrap().yaml);
+        assert_eq!(v["allow-lan"], Value::from(true));
+        assert!(v["listeners"][0].get("listen").is_none(), "as written");
+        assert_eq!(v["listeners"][1]["listen"].as_str(), Some("0.0.0.0"));
+        assert_eq!(
+            v["tunnels"][0].as_str(),
+            Some("tcp/udp,0.0.0.0:6553,114.114.114.114:53,proxy")
+        );
+        assert_eq!(v["dns"]["listen"].as_str(), Some(":53"));
+    }
+
+    #[test]
+    fn last_good_gets_the_current_owned_fields_and_keeps_the_rest() {
+        let paths = temp_paths("reown");
+        let old = compose(b"log-level: debug\nmode: rule\n", b"", &RT).unwrap();
+        fs::write(paths.last_good(), old.yaml).unwrap();
+        let now = Runtime {
+            mixed_port: 7000,
+            controller_port: 7001,
+            allow_lan: true,
+            secret: "new",
+            mode: Some("global"),
+        };
+        reown(&paths.last_good(), &now).unwrap();
+        let v = parsed(&fs::read_to_string(paths.last_good()).unwrap());
+        assert_eq!(v["mixed-port"], Value::from(7000));
+        assert_eq!(v["external-controller"].as_str(), Some("127.0.0.1:7001"));
+        assert_eq!(v["secret"].as_str(), Some("new"));
+        assert_eq!(v["allow-lan"], Value::from(true));
+        assert_eq!(v["mode"].as_str(), Some("global"));
+        assert_eq!(v["log-level"].as_str(), Some("debug"));
     }
 
     #[test]
     fn anchors_and_merge_keys_survive_composition() {
         let source = b"base: &b {interval: 300, url: http://t}\nproxy-groups:\n  - &g {name: A, <<: *b}\n  - *g\n";
-        let (yaml, _) = compose(source, b"", &RT).unwrap();
+        let yaml = compose(source, b"", &RT).unwrap().yaml;
         let v = parsed(&yaml);
         assert_eq!(v["proxy-groups"][1]["name"].as_str(), Some("A"));
         assert!(yaml.contains("<<"), "merge key is left for Mihomo to apply");
@@ -446,7 +650,7 @@ mod tests {
             !paths.home("home").exists(),
             "no home before first activation"
         );
-        let candidate = write_candidate(&paths, &Settings::default(), "home", "x", None).unwrap();
+        let candidate = write_candidate(&paths, "home", &rt_default()).unwrap();
         assert_eq!(candidate.home, paths.home("home"));
         assert!(candidate.home.is_dir());
         assert_eq!(fs::read_to_string(&target).unwrap(), "mixed-port: 1\n");
@@ -461,6 +665,44 @@ mod tests {
                 .contains(&Settings::default().mixed_port.to_string())
         );
         assert!(link(&paths, &target).is_err(), "name collision is refused");
+    }
+
+    #[test]
+    fn import_copies_a_mapping_and_refuses_what_it_cannot_add() {
+        let paths = temp_paths("import");
+        let ext = paths.data.join("elsewhere");
+        fs::create_dir_all(&ext).unwrap();
+        let source = ext.join("work.yaml");
+        fs::write(&source, "mode: rule\n").unwrap();
+        assert_eq!(import(&paths, &source).unwrap(), "work");
+        let copy = paths.profiles().join("work.yaml");
+        assert!(!fs::symlink_metadata(&copy).unwrap().is_symlink());
+        assert_eq!(fs::read_to_string(&copy).unwrap(), "mode: rule\n");
+
+        fs::write(&source, "mode: global\n").unwrap();
+        let again = import(&paths, &source).unwrap_err().to_string();
+        assert!(again.contains("already exists"), "{again}");
+        assert_eq!(fs::read_to_string(&copy).unwrap(), "mode: rule\n");
+
+        let linked = ext.join("home.yaml");
+        fs::write(&linked, "mode: rule\n").unwrap();
+        link(&paths, &linked).unwrap();
+        assert!(import(&paths, &linked).is_err(), "a linked name is taken");
+        assert_eq!(
+            fs::read_link(paths.profiles().join("home.yaml")).unwrap(),
+            linked
+        );
+
+        for (file, text) in [
+            ("list.yaml", "- a\n"),
+            ("broken.yaml", "a: [\n"),
+            ("empty.yaml", ""),
+        ] {
+            let bad = ext.join(file);
+            fs::write(&bad, text).unwrap();
+            assert!(import(&paths, &bad).is_err(), "{file}");
+            assert!(!paths.profiles().join(file).exists(), "{file}");
+        }
     }
 
     #[test]
@@ -479,7 +721,9 @@ mod tests {
         let paths = temp_paths("default");
         ensure_default(&paths).unwrap();
         let default = paths.profiles().join("default.yaml");
-        let (yaml, _) = compose(&fs::read(&default).unwrap(), b"", &RT).unwrap();
+        let yaml = compose(&fs::read(&default).unwrap(), b"", &RT)
+            .unwrap()
+            .yaml;
         assert_eq!(parsed(&yaml)["mode"].as_str(), Some("direct"));
 
         fs::write(&default, "a: [").unwrap();
@@ -505,7 +749,7 @@ mod tests {
         link(&paths, &target).unwrap();
         fs::write(paths.profiles().join("own.yaml"), "a: 1\n").unwrap();
         for name in ["linked", "own"] {
-            write_candidate(&paths, &Settings::default(), name, "x", None).unwrap();
+            write_candidate(&paths, name, &rt_default()).unwrap();
             fs::write(paths.home(name).join("cache.db"), "x").unwrap();
         }
 
@@ -580,7 +824,7 @@ mod tests {
         fs::remove_file(&target).unwrap();
         let listed = list(&paths).unwrap();
         assert!(listed[0].is_link && listed[0].problem.is_some());
-        assert!(write_candidate(&paths, &Settings::default(), "t", "x", None).is_err());
+        assert!(write_candidate(&paths, "t", &rt_default()).is_err());
         assert!(
             !paths.candidate().exists(),
             "no snapshot from a broken link"

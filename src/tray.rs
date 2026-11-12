@@ -38,9 +38,15 @@ pub fn phase_label(phase: &Phase) -> &'static str {
 }
 
 /// The menu's own System Proxy item shows the proxy state, so this line leaves it out.
+/// `· LAN` while other devices can use the proxy, so sharing shows without opening the window.
 fn status_line(s: &Snapshot) -> String {
     let profile = s.active.as_deref().unwrap_or("no profile");
-    format!("{} · {profile}", phase_label(&s.phase))
+    let lan = if s.allow_lan && s.phase == Phase::Running {
+        " · LAN"
+    } else {
+        ""
+    };
+    format!("{} · {profile}{lan}", phase_label(&s.phase))
 }
 
 /// What the menu shows, as plain data: testable without AppKit, and compared to skip rebuilds.
@@ -345,6 +351,24 @@ mod tests {
             }) => (label.clone(), *enabled, *checked),
             other => panic!("{id}: {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_status_line_says_when_the_proxy_is_shared() {
+        let mut s = Snapshot {
+            phase: Phase::Running,
+            active: Some("home".into()),
+            ..Snapshot::default()
+        };
+        assert_eq!(status_line(&s), "Running · home");
+        s.allow_lan = true;
+        assert_eq!(status_line(&s), "Running · home · LAN");
+        s.phase = Phase::Stopped;
+        assert_eq!(
+            status_line(&s),
+            "Stopped · home",
+            "nothing is shared while stopped"
+        );
     }
 
     #[test]

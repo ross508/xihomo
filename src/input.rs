@@ -26,7 +26,8 @@ actions!(
         Paste,
         Cut,
         Copy,
-        Clear
+        Clear,
+        Submit
     ]
 );
 
@@ -51,11 +52,16 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-x", Cut, Some(CONTEXT)),
         KeyBinding::new("cmd-c", Copy, Some(CONTEXT)),
         KeyBinding::new("escape", Clear, Some(CONTEXT)),
+        KeyBinding::new("enter", Submit, Some(CONTEXT)),
     ]
 }
 
 /// Emitted whenever the text changes, not on cursor moves.
 pub struct Changed;
+/// Return was pressed.
+pub struct Submitted;
+/// Esc was pressed in a digits field, which keeps its text for the owner to restore.
+pub struct Cancelled;
 
 pub struct TextInput {
     pub focus: FocusHandle,
@@ -73,12 +79,28 @@ pub struct TextInput {
     blinking: bool,
     /// Painted focused since the last blink; otherwise the loop ends, so a hidden input costs nothing.
     painted_focused: bool,
+    /// Accepts only ASCII digits, at most this many.
+    max_digits: Option<usize>,
 }
 
 impl EventEmitter<Changed> for TextInput {}
+impl EventEmitter<Submitted> for TextInput {}
+impl EventEmitter<Cancelled> for TextInput {}
 
 impl TextInput {
-    pub fn new(placeholder: &'static str, cx: &mut Context<Self>) -> Self {
+    /// A port or similar number: digits only, Esc reports `Cancelled` instead of clearing.
+    pub fn digits(
+        placeholder: impl Into<SharedString>,
+        max: usize,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self {
+            max_digits: Some(max),
+            ..Self::new(placeholder, cx)
+        }
+    }
+
+    pub fn new(placeholder: impl Into<SharedString>, cx: &mut Context<Self>) -> Self {
         Self {
             focus: cx.focus_handle(),
             content: String::new(),
@@ -93,7 +115,30 @@ impl TextInput {
             blink_epoch: 0,
             blinking: false,
             painted_focused: false,
+            max_digits: None,
         }
+    }
+
+    /// Set by the owner, not typed: no `Changed`.
+    pub fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.content = text.to_owned();
+        self.marked_range = None;
+        self.selected_range = text.len()..text.len();
+        self.selection_reversed = false;
+        cx.notify();
+    }
+
+    /// What of `text` may replace `range`: everything, or in a digits field only digits that fit.
+    fn accept<'a>(&self, range: &Range<usize>, text: &'a str) -> std::borrow::Cow<'a, str> {
+        let Some(max) = self.max_digits else {
+            return text.into();
+        };
+        let room = max.saturating_sub(self.content.len() - range.len());
+        text.chars()
+            .filter(char::is_ascii_digit)
+            .take(room)
+            .collect::<String>()
+            .into()
     }
 
     /// Solid while typing or moving; blinking resumes at the next paint.
@@ -188,7 +233,15 @@ impl TextInput {
         self.replace_text_in_range(None, "", window, cx)
     }
 
+    fn submit(&mut self, _: &Submit, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(Submitted);
+    }
+
     fn clear(&mut self, _: &Clear, window: &mut Window, cx: &mut Context<Self>) {
+        if self.max_digits.is_some() {
+            cx.emit(Cancelled);
+            return;
+        }
         self.selected_range = 0..self.content.len();
         self.replace_text_in_range(None, "", window, cx)
     }
@@ -381,6 +434,7 @@ impl EntityInputHandler for TextInput {
             .map(|r| self.range_from_utf16(r))
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
+        let new_text = &*self.accept(&range, new_text);
         let cursor = range.start + new_text.len();
         self.selected_range = cursor..cursor;
         self.selection_reversed = false;
@@ -401,6 +455,7 @@ impl EntityInputHandler for TextInput {
             .map(|r| self.range_from_utf16(r))
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
+        let new_text = &*self.accept(&range, new_text);
         let marked = (!new_text.is_empty()).then(|| range.start..range.start + new_text.len());
         self.replace(range.clone(), new_text, marked, cx);
         // The new selection is relative to the inserted text.
@@ -634,6 +689,7 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::clear))
+            .on_action(cx.listener(Self::submit))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -728,6 +784,29 @@ mod tests {
 
             input.clear(&Clear, window, cx);
             assert_eq!(input.text(), "");
+        });
+    }
+
+    #[gpui::test]
+    fn a_digits_field_takes_only_digits_that_fit(cx: &mut TestAppContext) {
+        let input = cx.new(|cx| TextInput::digits("10999", 5, cx));
+        let cx = cx.add_empty_window();
+        input.update_in(cx, |input, window, cx| {
+            input.replace_text_in_range(None, "1a2-3", window, cx);
+            assert_eq!(input.text(), "123");
+            input.replace_text_in_range(None, "456789", window, cx);
+            assert_eq!(input.text(), "12345", "at most five");
+            // Over a selection, the selected digits make room.
+            input.selected_range = 0..2;
+            input.replace_text_in_range(None, "99x9", window, cx);
+            assert_eq!(input.text(), "99345");
+            input.replace_and_mark_text_in_range(None, "ni", None, window, cx);
+            assert_eq!(input.content, "99345", "no composing letters");
+            input.set_text("7", cx);
+            assert_eq!(
+                (input.text(), input.selected_range.clone()),
+                ("7".into(), 1..1)
+            );
         });
     }
 

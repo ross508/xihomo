@@ -248,11 +248,7 @@ fn run_app(handle: Handle, window_file: PathBuf, cx: &mut App) -> Result<()> {
         let state = state.clone();
         cx.on_window_closed(move |cx| {
             if cx.windows().is_empty() {
-                state.update(cx, |this, _| {
-                    this.flush_placement();
-                    this.window = None;
-                    this.sync_visibility();
-                });
+                state.update(cx, |this, _| this.closed());
             }
         })
         .detach();
