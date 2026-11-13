@@ -30,7 +30,7 @@ actions!(
 );
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Tab {
+pub enum Tab {
     Control,
     Connections,
     Logs,
@@ -1048,7 +1048,7 @@ impl AppState {
         self.sync_visibility();
     }
 
-    fn set_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
+    pub fn set_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
         self.tab = tab;
         self.secret_shown = false;
         self.sync_visibility();
@@ -1584,9 +1584,24 @@ impl AppState {
                 self.cmd(move || Cmd::SetTheme(theme)),
             ));
         }
+        let mut dock = div().flex().gap_1();
+        for (keep, id, label) in [
+            (true, "dock-always", "Always"),
+            (false, "dock-open", "While Open"),
+        ] {
+            dock = dock.child(button(
+                id,
+                label,
+                p,
+                s.keep_dock_icon == keep,
+                s.keep_dock_icon != keep,
+                self.cmd(move || Cmd::SetKeepDockIcon(keep)),
+            ));
+        }
         column = column
             .child(self.titled("Appearance", Area::Files, None, p, cx))
-            .child(field("Menu Bar Icon", sets, None, p))
+            .child(field("Icon", sets, None, p))
+            .child(field("Dock Icon", dock, None, p))
             .child(field("Theme", themes, None, p))
             .child(separator(p));
 
@@ -3001,6 +3016,41 @@ mod gpui_tests {
                 "{theme:?}"
             );
         }
+    }
+
+    #[gpui::test]
+    fn dock_icon_choice_follows_the_snapshot_on_the_label_column(cx: &mut TestAppContext) {
+        let mut ui = open(cx, running());
+        ui.keys("cmd-4");
+        ui.drain();
+        ui.click("dock-open");
+        assert!(ui.sent().is_empty(), "already While Open");
+        ui.click("dock-always");
+        assert!(matches!(ui.sent()[..], [Cmd::SetKeepDockIcon(true)]));
+        ui.set(|s| {
+            s.snap = Arc::new(Snapshot {
+                keep_dock_icon: true,
+                ..(*s.snap).clone()
+            })
+        });
+        ui.click("dock-always");
+        assert!(ui.sent().is_empty(), "already Always");
+        ui.click("dock-open");
+        assert!(matches!(ui.sent()[..], [Cmd::SetKeepDockIcon(false)]));
+
+        let bounds = |ui: &mut Ui, id| ui.cx.debug_bounds(id).unwrap();
+        assert_eq!(
+            bounds(&mut ui, "dock-always").left(),
+            bounds(&mut ui, "theme-auto").left()
+        );
+        let (label, open) = (
+            bounds(&mut ui, "label-Dock Icon"),
+            bounds(&mut ui, "dock-open"),
+        );
+        assert!((open.center().y - label.center().y).abs() < px(1.));
+        assert_eq!(open.size.height, CONTROL_HEIGHT);
+        assert!(bounds(&mut ui, "label-Icon").top() < label.top());
+        assert!(label.top() < bounds(&mut ui, "label-Theme").top());
     }
 
     const SECRET: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab3f9a";

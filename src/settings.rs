@@ -213,6 +213,8 @@ pub struct Settings {
     pub allow_lan: bool,
     pub icon_set: String,
     pub theme: Theme,
+    /// The Dock icon stays while no window is open.
+    pub keep_dock_icon: bool,
 }
 
 impl Default for Settings {
@@ -228,6 +230,7 @@ impl Default for Settings {
             allow_lan: false,
             icon_set: "circle".into(),
             theme: Theme::Auto,
+            keep_dock_icon: true,
         }
     }
 }
@@ -279,6 +282,7 @@ impl Settings {
                 allow_lan: field(&map, "allow_lan", d.allow_lan, &mut invalid),
                 icon_set: field(&map, "icon_set", d.icon_set, &mut invalid),
                 theme: field(&map, "theme", d.theme, &mut invalid),
+                keep_dock_icon: field(&map, "keep_dock_icon", d.keep_dock_icon, &mut invalid),
             };
             for (key, port, default) in [
                 ("mixed_port", &mut s.mixed_port, d.mixed_port),
@@ -414,7 +418,7 @@ mod tests {
         assert_eq!(Settings::load(&paths).unwrap().0, Settings::default());
         fs::write(
             paths.settings(),
-            "theme: dark\nmixed_port: 7000\nunknown: 1\n",
+            "theme: dark\nmixed_port: 7000\nkeep_dock_icon: false\nunknown: 1\n",
         )
         .unwrap();
         let (settings, notice) = Settings::load(&paths).unwrap();
@@ -424,6 +428,7 @@ mod tests {
             Settings {
                 theme: Theme::Dark,
                 mixed_port: 7000,
+                keep_dock_icon: false,
                 ..Settings::default()
             }
         );
@@ -461,7 +466,7 @@ mod tests {
     fn an_invalid_value_takes_its_default_and_keeps_the_others() {
         let paths = temp_paths("settings-fields");
         let d = Settings::default();
-        let text = "theme: purple\nicon_set: bars\nmixed_port: 80\ncontroller_port: 7001\nallow_lan: yes please\n";
+        let text = "theme: purple\nicon_set: bars\nmixed_port: 80\ncontroller_port: 7001\nallow_lan: yes please\nkeep_dock_icon: 3\n";
         fs::write(paths.settings(), text).unwrap();
         let (settings, notice) = Settings::load(&paths).unwrap();
         assert_eq!(
@@ -473,7 +478,7 @@ mod tests {
             }
         );
         let notice = notice.unwrap();
-        for key in ["theme", "mixed_port", "allow_lan"] {
+        for key in ["theme", "mixed_port", "allow_lan", "keep_dock_icon"] {
             assert!(notice.contains(key), "{notice}");
         }
         assert!(!notice.contains("icon_set"), "{notice}");

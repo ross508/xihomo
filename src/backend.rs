@@ -108,6 +108,7 @@ pub struct Snapshot {
     pub messages: BTreeMap<Area, Message>,
     pub icon_set: String,
     pub theme: Theme,
+    pub keep_dock_icon: bool,
     pub mixed_port: u16,
     pub controller_port: u16,
     pub allow_lan: bool,
@@ -158,6 +159,7 @@ pub enum Cmd {
     DeleteVersion(String),
     SetIconSet(String),
     SetTheme(Theme),
+    SetKeepDockIcon(bool),
     /// Ports arrive as typed, up to five digits; the backend validates them.
     SetProxyPort(u32),
     SetAllowLan(bool),
@@ -200,7 +202,7 @@ impl Cmd {
             | Cmd::DeleteVersion(_)
             | Cmd::Checked(_)
             | Cmd::Staged(_) => Area::Update,
-            Cmd::SetIconSet(_) | Cmd::SetTheme(_) => Area::Files,
+            Cmd::SetIconSet(_) | Cmd::SetTheme(_) | Cmd::SetKeepDockIcon(_) => Area::Files,
             Cmd::SetProxyPort(_) | Cmd::SetAllowLan(_) => Area::Listen,
             Cmd::SetApiPort(_) | Cmd::RegenerateSecret => Area::Api,
             _ => Area::Core,
@@ -364,6 +366,10 @@ impl Actor {
             installed: update::installed(&paths),
             profiles: listed,
             config_dir: paths.config.clone(),
+            // Read at launch, before the first publish: the theme, menu bar icon and Dock.
+            icon_set: settings.icon_set.clone(),
+            theme: settings.theme,
+            keep_dock_icon: settings.keep_dock_icon,
             ..Snapshot::default()
         };
         let (snap_tx, snap_rx) = watch::channel(Arc::new(snap.clone()));
@@ -448,6 +454,7 @@ impl Actor {
         self.snap.active = self.app.active_profile.clone();
         self.snap.icon_set = self.settings.icon_set.clone();
         self.snap.theme = self.settings.theme;
+        self.snap.keep_dock_icon = self.settings.keep_dock_icon;
         self.snap.mixed_port = self.settings.mixed_port;
         self.snap.controller_port = self.settings.controller_port;
         self.snap.allow_lan = self.settings.allow_lan;
@@ -589,6 +596,8 @@ impl Actor {
                 .map(|()| self.settings.icon_set = set),
             Cmd::SetTheme(theme) => Settings::write_key(&self.paths, "theme", theme)
                 .map(|()| self.settings.theme = theme),
+            Cmd::SetKeepDockIcon(on) => Settings::write_key(&self.paths, "keep_dock_icon", on)
+                .map(|()| self.settings.keep_dock_icon = on),
             Cmd::SetProxyPort(port) => self.set_proxy_port(port).await,
             Cmd::SetAllowLan(on) => self.set_allow_lan(on).await,
             Cmd::SetApiPort(port) => self.set_api_port(port).await,

@@ -824,13 +824,17 @@ async fn startup_creates_the_default_profile_once() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn theme_choice_is_stored_in_settings_yaml() {
+async fn theme_and_dock_choices_are_stored_in_settings_yaml() {
     let mut a = idle("theme");
     a.handle(Cmd::SetTheme(Theme::Dark)).await;
+    a.handle(Cmd::SetKeepDockIcon(true)).await;
     a.publish();
-    assert_eq!(a.snap.theme, Theme::Dark);
+    assert_eq!((a.snap.theme, a.snap.keep_dock_icon), (Theme::Dark, true));
     let (settings, _) = Settings::load(&a.paths).unwrap();
-    assert_eq!(settings.theme, Theme::Dark);
+    assert_eq!(
+        (settings.theme, settings.keep_dock_icon),
+        (Theme::Dark, true)
+    );
     assert!(
         !a.paths.app_data().exists(),
         "preferences never go to app.json"

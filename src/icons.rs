@@ -1,5 +1,6 @@
 //! Bundled menu bar icons, drawn in code as template images (black plus alpha). State is carried by
-//! shape, not color: stopped is hollow, running is solid, error is hollow with a slash.
+//! shape, not color: stopped is hollow, running is solid, error is hollow with a slash. Each set also
+//! has an app icon for the Dock, and the bundle has a fixed "X".
 use crate::backend::Phase;
 use std::f32::consts::{FRAC_1_SQRT_2, FRAC_PI_2, TAU};
 
@@ -15,6 +16,11 @@ pub const SETS: &[&str] = &[
     "drop",
     "snowflake",
 ];
+/// Every app icon's glyph, the sets' and the bundle's "X", on white.
+const INK: u32 = 0x212529;
+const DEV_BAND: u32 = 0xFFD43B;
+/// The "X" icon's rim, so its white body shows on white, as in Finder.
+const RIM: u32 = 0xD0D4D9;
 /// 16pt at 2x; AppKit sizes the status item, and its highlight, from the image.
 const SIZE: u32 = 32;
 pub const POINTS: f64 = (SIZE / 2) as f64;
@@ -218,6 +224,93 @@ pub fn tray_icon(set: &str, state: State) -> tray_icon::Icon {
         .expect("icon dimensions match the buffer")
 }
 
+/// The letter "X": two bars cut level at the top and bottom, a little taller than wide.
+fn x_distance(x: f32, y: f32) -> f32 {
+    let angle = 63f32.to_radians();
+    let bars = [angle, -angle].map(|a| distance(&bar(a, 1.2, 0.1), x, y));
+    bars[0].min(bars[1]).max(y.abs() - 0.8)
+}
+
+/// An app icon on Apple's macOS grid, RGBA with straight alpha: in a 1024 canvas an 824 rounded
+/// square with a transparent 100 margin, so macOS shows it as drawn: a graphite glyph on white. `None` is the "X" bundle icon;
+/// `dev` adds a band across the lower-right corner.
+pub fn app_icon(set: Option<&str>, dev: bool, size: u32) -> Vec<u8> {
+    let glyph = set.map(shape);
+    let rgb = |c: u32| [(c >> 16) as f32, (c >> 8 & 0xFF) as f32, (c & 0xFF) as f32];
+    let (ink_color, band, rim) = (rgb(INK), rgb(DEV_BAND), rgb(RIM));
+    // Canvas units per pixel, and shape units per canvas unit: the glyph is about 44% of the body.
+    let pixel = 1024.0 / size as f32;
+    let scale = 0.44 * 824.0 / (2.0 * EXTENT);
+    let coverage = |d: f32| (0.5 - d / pixel).clamp(0.0, 1.0);
+    let mut out = Vec::with_capacity((size * size * 4) as usize);
+    for py in 0..size {
+        for px in 0..size {
+            let (u, v) = ((px as f32 + 0.5) * pixel, (py as f32 + 0.5) * pixel);
+            // Signed distance to the rounded square: half side 412, corner radius 185.
+            let (qx, qy) = ((u - 512.0).abs() - 227.0, (v - 512.0).abs() - 227.0);
+            let edge = qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - 185.0;
+            let mut c = [255.0; 3];
+            if dev {
+                // Between two lines across the corner, at 45 degrees.
+                let d = (1450.0 - (u + v)).max(u + v - 1590.0) / std::f32::consts::SQRT_2;
+                let a = coverage(d);
+                c = [0, 1, 2].map(|i| c[i] + (band[i] - c[i]) * a);
+            }
+            if set.is_none() {
+                // A band 12 canvas units wide inside the body's edge.
+                let a = coverage(edge) - coverage(edge + 12.0);
+                c = [0, 1, 2].map(|i| c[i] + (rim[i] - c[i]) * a);
+            }
+            let (x, y) = ((u - 512.0) / scale, (v - 512.0) / scale);
+            // Outside the glyph's frame nothing is near enough to cover a pixel.
+            let ink = if x.abs() < 1.0 && y.abs() < 1.0 {
+                let d = match &glyph {
+                    Some(polygons) => polygons
+                        .iter()
+                        .map(|p| distance(p, x, y))
+                        .fold(f32::MAX, f32::min),
+                    None => x_distance(x, y),
+                };
+                coverage(d * scale)
+            } else {
+                0.0
+            };
+            c = [0, 1, 2].map(|i| c[i] + (ink_color[i] - c[i]) * ink);
+            out.extend(c.map(|c| c.round() as u8));
+            out.push((coverage(edge) * 255.0).round() as u8);
+        }
+    }
+    out
+}
+
+/// A square RGBA image as PNG.
+pub fn png(rgba: &[u8], size: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut encoder = png::Encoder::new(&mut out, size, size);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().expect("writing to memory");
+    writer
+        .write_image_data(rgba)
+        .expect("the buffer matches the size");
+    writer.finish().expect("writing to memory");
+    out
+}
+
+/// The "X" bundle icon for this build's channel, as the files `iconutil -c icns` expects, each drawn
+/// at its own pixel size.
+pub fn write_iconset(dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    for points in [16, 32, 128, 256, 512] {
+        for (scale, suffix) in [(1, ""), (2, "@2x")] {
+            let size = points * scale;
+            let png = png(&app_icon(None, cfg!(debug_assertions), size), size);
+            std::fs::write(dir.join(format!("icon_{points}x{points}{suffix}.png")), png)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,6 +335,78 @@ mod tests {
                 "{set}: running is solid, stopped is hollow"
             );
         }
+    }
+
+    #[test]
+    fn app_icons_are_distinct_shaped_and_white_in_the_middle() {
+        const N: u32 = 64;
+        let mut icons = vec![app_icon(None, false, N)];
+        for set in SETS {
+            icons.push(app_icon(Some(set), false, N));
+        }
+        icons.push(app_icon(None, true, N));
+        icons.push(app_icon(Some("circle"), true, N));
+        for (i, a) in icons.iter().enumerate() {
+            assert!(icons[i + 1..].iter().all(|b| a != b), "icon {i} repeats");
+            assert_eq!(a.len(), (N * N * 4) as usize);
+            let at = |x: u32, y: u32| &a[((y * N + x) * 4) as usize..][..4];
+            // Corners and the margin are transparent, the body white to its edge, the glyph dark.
+            for (x, y) in [
+                (0, 0),
+                (N - 1, N - 1),
+                (N - 4, 4),
+                (2, N / 2),
+                (N / 2, N - 3),
+            ] {
+                assert_eq!(at(x, y)[3], 0, "icon {i} at {x},{y}");
+            }
+            assert_eq!(at(N / 10 + 2, N / 2), [255, 255, 255, 255], "icon {i}");
+            let center = at(N / 2, N / 2);
+            assert!(
+                center[3] == 255 && center[..3] != [255, 255, 255],
+                "icon {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn png_round_trips() {
+        let rgba = app_icon(Some("drop"), true, 48);
+        let png = png(&rgba, 48);
+        let mut reader = png::Decoder::new(std::io::Cursor::new(png))
+            .read_info()
+            .unwrap();
+        let mut decoded = vec![0; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut decoded).unwrap();
+        assert_eq!((info.width, info.height), (48, 48));
+        assert_eq!(decoded, rgba);
+    }
+
+    #[test]
+    fn the_iconset_has_every_size_iconutil_expects() {
+        let dir = std::env::temp_dir().join(format!("xihomo-test-{}-iconset", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_iconset(&dir).unwrap();
+        let mut names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names.len(), 10, "{names:?}");
+        for name in names {
+            let (points, scale) = name
+                .strip_prefix("icon_")
+                .and_then(|n| n.split_once('x'))
+                .map(|(p, rest)| (p.parse::<u32>().unwrap(), 1 + rest.contains("@2x") as u32))
+                .unwrap();
+            let file = std::fs::File::open(dir.join(&name)).unwrap();
+            let info = png::Decoder::new(std::io::BufReader::new(file))
+                .read_info()
+                .unwrap();
+            let size = (info.info().width, info.info().height);
+            assert_eq!(size, (points * scale, points * scale), "{name}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

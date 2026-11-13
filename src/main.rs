@@ -1,6 +1,7 @@
 mod api;
 mod backend;
 mod core;
+mod dock;
 mod icons;
 mod input;
 mod placement;
@@ -18,10 +19,7 @@ use gpui::{
     px, size,
 };
 use objc2::MainThreadMarker;
-use objc2_app_kit::{
-    NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication,
-    NSApplicationActivationPolicy,
-};
+use objc2_app_kit::{NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication};
 use settings::{Paths, Theme};
 use std::cell::RefCell;
 use std::fs::File;
@@ -37,6 +35,8 @@ const WINDOW_SIZE: (f32, f32) = (640., 680.);
 const WINDOW_MIN_SIZE: (f32, f32) = (480., 420.);
 
 fn open_window(state: &Entity<AppState>, cx: &mut App) {
+    // An accessory app does not come to the front, so it turns regular first.
+    dock::apply(true);
     cx.activate(true);
     let existing = state.read(cx).window;
     if let Some(window) = existing
@@ -143,13 +143,22 @@ fn on_menu(id: &str, state: &Entity<AppState>, cx: &mut App) {
     }
 }
 
+fn show_tab(tab: ui::Tab, cx: &mut App) {
+    let state = cx.global::<StateGlobal>().0.clone();
+    open_window(&state, cx);
+    state.update(cx, |this, cx| this.set_tab(tab, cx));
+}
+
 fn run_app(handle: Handle, window_file: PathBuf, cx: &mut App) -> Result<()> {
-    // GPUI sets the regular policy during launch; a menu bar app has no Dock icon.
-    let mtm = MainThreadMarker::new().context("not on the main thread")?;
-    NSApplication::sharedApplication(mtm)
-        .setActivationPolicy(NSApplicationActivationPolicy::Accessory);
-    let mut theme = handle.snapshot.borrow().theme;
+    // GPUI sets the regular policy during launch; without a window the Dock icon is optional.
+    let (mut theme, mut keep, mut icon_set) = {
+        let snap = handle.snapshot.borrow();
+        (snap.theme, snap.keep_dock_icon, snap.icon_set.clone())
+    };
+    dock::apply(dock::dock_shown(keep, false));
+    dock::set_icon(&icon_set);
     apply_theme(theme);
+    cx.set_menus(dock::app_menus());
 
     cx.bind_keys([
         KeyBinding::new("cmd-w", ui::CloseWindow, None),
@@ -158,9 +167,21 @@ fn run_app(handle: Handle, window_file: PathBuf, cx: &mut App) -> Result<()> {
         KeyBinding::new("cmd-2", ui::ShowConnections, None),
         KeyBinding::new("cmd-3", ui::ShowLogs, None),
         KeyBinding::new("cmd-4", ui::ShowSettings, None),
+        KeyBinding::new("cmd-,", ui::ShowSettings, None),
+        KeyBinding::new("cmd-h", dock::Hide, None),
+        KeyBinding::new("alt-cmd-h", dock::HideOthers, None),
     ]);
     cx.bind_keys(input::bindings());
     cx.on_action(|_: &ui::Quit, cx| cx.quit());
+    cx.on_action(|_: &dock::About, _| dock::about());
+    cx.on_action(|_: &dock::Hide, cx| cx.hide());
+    cx.on_action(|_: &dock::HideOthers, cx| cx.hide_other_apps());
+    cx.on_action(|_: &dock::ShowAll, cx| cx.unhide_other_apps());
+    // With the Dock icon kept and no window, the menus open one on their tab.
+    cx.on_action(|_: &ui::ShowControl, cx| show_tab(ui::Tab::Control, cx));
+    cx.on_action(|_: &ui::ShowConnections, cx| show_tab(ui::Tab::Connections, cx));
+    cx.on_action(|_: &ui::ShowLogs, cx| show_tab(ui::Tab::Logs, cx));
+    cx.on_action(|_: &ui::ShowSettings, cx| show_tab(ui::Tab::Settings, cx));
 
     let state = cx.new(|cx| {
         let mut state = AppState::new(handle.clone(), cx);
@@ -195,6 +216,15 @@ fn run_app(handle: Handle, window_file: PathBuf, cx: &mut App) -> Result<()> {
                 if snap.theme != theme {
                     theme = snap.theme;
                     apply_theme(theme);
+                }
+                if snap.icon_set != icon_set {
+                    icon_set.clone_from(&snap.icon_set);
+                    dock::set_icon(&icon_set);
+                }
+                if snap.keep_dock_icon != keep {
+                    keep = snap.keep_dock_icon;
+                    let _ = cx
+                        .update(|cx| dock::apply(dock::dock_shown(keep, !cx.windows().is_empty())));
                 }
                 tray.borrow_mut().update(&snap);
                 let _ = state.update(cx, |this, cx| {
@@ -248,6 +278,7 @@ fn run_app(handle: Handle, window_file: PathBuf, cx: &mut App) -> Result<()> {
         let state = state.clone();
         cx.on_window_closed(move |cx| {
             if cx.windows().is_empty() {
+                dock::apply(dock::dock_shown(state.read(cx).snap.keep_dock_icon, false));
                 state.update(cx, |this, _| this.closed());
             }
         })
@@ -266,6 +297,12 @@ fn run_app(handle: Handle, window_file: PathBuf, cx: &mut App) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    // Used by the bundle script; it must not touch the data directories or the instance lock.
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some("--write-iconset") {
+        let dir = args.next().context("--write-iconset needs a directory")?;
+        return icons::write_iconset(dir.as_ref()).context("write iconset");
+    }
     // Any panic is a bug that may already have taken the core down with it (an unwinding backend
     // drops it; a panic in a platform callback aborts the app), so a proxy of ours goes too.
     let report = std::panic::take_hook();
