@@ -70,6 +70,8 @@ pub enum Area {
     /// The system proxy, in Control.
     Proxy,
     Profiles,
+    /// Control → Groups: picking a member.
+    Groups,
     /// Settings → PROXY: the port and who may use it.
     Listen,
     /// Settings → API: the controller port and the secret.
@@ -182,6 +184,7 @@ impl Cmd {
     fn area(&self) -> Area {
         match self {
             Cmd::SetProxy(_) | Cmd::GuardProxy => Area::Proxy,
+            Cmd::Select { .. } => Area::Groups,
             Cmd::Activate(_)
             | Cmd::Reload
             | Cmd::Refresh
@@ -539,6 +542,11 @@ impl Actor {
                 Err(e) => Err(e),
             },
             Cmd::Activate(name) => self.activate(&name).await,
+            // A download in flight would report on providers the reload removed, and its result
+            // would replace a reload error before it was read. The buttons wait the same way.
+            Cmd::Reload if self.snap.providers_busy => {
+                Err(anyhow!("Reload waits for the providers update to finish"))
+            }
             Cmd::Reload => match self.app.active_profile.clone() {
                 Some(name) => self.activate(&name).await,
                 None => Err(anyhow!("Choose a profile first")),
@@ -835,10 +843,11 @@ impl Actor {
             })?;
         self.fingerprint = None;
         self.snap.edited = true;
+        // An error, so it stays: the profile you picked is not the one running.
         self.say(
             Area::Core,
             format!("Running the last-good configuration because: {error:#}"),
-            false,
+            true,
         );
         Ok(())
     }

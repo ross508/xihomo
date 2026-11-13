@@ -37,6 +37,23 @@ enum Tab {
     Settings,
 }
 
+impl Tab {
+    /// Where the tab shows messages; Profiles is in both Control and Settings.
+    fn areas(self) -> &'static [Area] {
+        match self {
+            Self::Control => &[Area::Core, Area::Proxy, Area::Profiles, Area::Groups],
+            Self::Settings => &[
+                Area::Files,
+                Area::Profiles,
+                Area::Listen,
+                Area::Api,
+                Area::Update,
+            ],
+            Self::Connections | Self::Logs => &[],
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum LogLevel {
     All,
@@ -118,7 +135,7 @@ pub struct AppState {
     /// "Copied" next to a section title.
     copied: Option<(Area, u64)>,
     timers: u64,
-    /// Messages that have been on screen, by id; `true` once they timed out.
+    /// Messages that have been on screen, by id; `true` once one that is not an error timed out.
     shown: HashMap<u64, bool>,
     /// The palette of the last frame, so tests can see what was drawn.
     #[cfg(test)]
@@ -229,24 +246,29 @@ fn human(bytes: u64) -> String {
 
 /// Node cards are at least this wide, in points; how many fit sets the column count.
 const CARD_MIN_WIDTH: f32 = 180.;
+/// Control's profile buttons: laid out like node cards, but sized on their own.
+const PROFILE_MIN_WIDTH: f32 = 180.;
 /// `gap_1` between cards.
 const CARD_GAP: f32 = 4.;
 
-/// As many equal columns as fit cards of the minimum width, and never fewer than two. A card is
-/// then below `(n + 1) / n` of the minimum, so at most about 1.5 times it.
-fn node_columns(width: f32) -> u16 {
-    (((width + CARD_GAP) / (CARD_MIN_WIDTH + CARD_GAP)).floor() as u16).max(2)
+/// As many equal columns as fit cards `min` wide in `width`, never fewer than two, and the cards'
+/// width. A card is then below `(n + 1) / n` of the minimum, so at most about 1.5 times it.
+/// Text measured inside a grid track gets no width to truncate to, so cards carry theirs.
+fn card_grid(width: f32, min: f32) -> (u16, f32) {
+    let columns = (((width + CARD_GAP) / (min + CARD_GAP)).floor() as u16).max(2);
+    let card = ((width - (columns - 1) as f32 * CARD_GAP) / columns as f32).floor();
+    (columns, card)
 }
 
-/// Control's first line: phase, core, ports and whether the proxy is shared.
+/// Beside Control's phase: core, ports and whether the proxy is shared.
 fn status_text(s: &Snapshot) -> String {
     let channel = if settings::DEV { " · dev" } else { "" };
     let lan = if s.allow_lan { " · LAN" } else { "" };
     match &s.phase {
-        Phase::Failed(reason) => format!("Failed: {reason}{channel}"),
-        phase => format!(
-            "{} · {} · proxy {}{lan} · API {}{channel}",
-            phase_label(phase),
+        // The reason takes the room, as the heading's message.
+        Phase::Failed(_) => channel.trim_start_matches(" · ").to_owned(),
+        _ => format!(
+            "{} · proxy {}{lan} · API {}{channel}",
             s.core_version.as_deref().unwrap_or("no core"),
             s.mixed_port,
             s.controller_port,
@@ -284,6 +306,10 @@ fn chip(
         .rounded(px(5.))
         .border_1()
         .text_size(px(12.))
+        // GPUI rounds a text input's line to whole points but not a label's. This one is rounded
+        // too, so a button is as tall as a field, CONTROL_HEIGHT, and Apply appearing beside a
+        // port field leaves the rows below where they are.
+        .line_height(CONTROL_HEIGHT - px(8.))
         .flex_none();
     let styled = if selected {
         base.bg(p.accent)
@@ -307,9 +333,11 @@ fn chip(
 /// Symbols for the icon buttons at the right of a row, drawn on a 14-point grid.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Icon {
-    /// Two half-circle arrows: fetch again, a profile's providers or a newer core.
-    Update,
-    /// A circular arrow: make a new one.
+    /// Two half-circle arrows: read the profile from disk again and apply it.
+    Reload,
+    /// An arrow into a tray: fetch from the internet, a profile's providers or a newer core.
+    Download,
+    /// A die: make a new random one.
     Regenerate,
     Delete,
     /// Look for something new.
@@ -376,13 +404,55 @@ fn symbol(icon: Icon, color: Hsla) -> impl IntoElement {
                 );
                 fills.push(head);
             };
+            // A filled circle, for the pupil and the pips.
+            let disc = |x: f32, y: f32, r: f32| {
+                let radii = point(unit * r, unit * r);
+                let mut disc = PathBuilder::fill();
+                disc.move_to(at(x - r, y));
+                disc.arc_to(radii, px(0.), false, true, at(x + r, y));
+                disc.arc_to(radii, px(0.), false, true, at(x - r, y));
+                disc
+            };
             match icon {
-                Icon::Update => {
+                Icon::Reload => {
                     arrow_arc(-165., -25., 4.6);
                     arrow_arc(15., 155., 4.6);
                 }
-                // Most of a circle, clockwise, ending in an arrowhead near the top.
-                Icon::Regenerate => arrow_arc(-30., 250., 4.6),
+                // A shaft and a head like the round arrows', into a tray as wide as the round icons.
+                Icon::Download => {
+                    strokes.push(line(&[(7., 1.6), (7., 6.8)]));
+                    let mut head = PathBuilder::fill();
+                    head.add_polygon(&[at(7., 9.4), at(4.2, 6.2), at(9.8, 6.2)], true);
+                    fills.push(head);
+                    strokes.push(line(&[(2.2, 8.6), (2.2, 12.), (11.8, 12.), (11.8, 8.6)]));
+                }
+                // Five pips in a rounded square no wider, outside, than the round icons.
+                Icon::Regenerate => {
+                    let (lo, hi, r) = (2., 12., 2.2);
+                    let radii = point(unit * r, unit * r);
+                    let mut face = PathBuilder::stroke(unit * 1.4);
+                    face.move_to(at(lo + r, lo));
+                    for (to, corner) in [
+                        ((hi - r, lo), (hi, lo + r)),
+                        ((hi, hi - r), (hi - r, hi)),
+                        ((lo + r, hi), (lo, hi - r)),
+                        ((lo, lo + r), (lo + r, lo)),
+                    ] {
+                        face.line_to(at(to.0, to.1));
+                        face.arc_to(radii, px(0.), false, true, at(corner.0, corner.1));
+                    }
+                    face.close();
+                    strokes.push(face);
+                    for (x, y) in [
+                        (4.75, 4.75),
+                        (9.25, 4.75),
+                        (7., 7.),
+                        (4.75, 9.25),
+                        (9.25, 9.25),
+                    ] {
+                        fills.push(disc(x, y, 0.9));
+                    }
+                }
                 // As wide as the round icons and a little shorter, so it does not look narrower
                 // than them in a button of the same size.
                 Icon::Delete => {
@@ -410,12 +480,7 @@ fn symbol(icon: Icon, color: Hsla) -> impl IntoElement {
                     lid.arc_to(point(r, r), px(0.), false, true, at(12.8, 7.));
                     lid.arc_to(point(r, r), px(0.), false, true, at(1.2, 7.));
                     strokes.push(lid);
-                    let r = unit * 2.1;
-                    let mut pupil = PathBuilder::fill();
-                    pupil.move_to(at(4.9, 7.));
-                    pupil.arc_to(point(r, r), px(0.), false, true, at(9.1, 7.));
-                    pupil.arc_to(point(r, r), px(0.), false, true, at(4.9, 7.));
-                    fills.push(pupil);
+                    fills.push(disc(7., 7., 2.1));
                     if icon == Icon::Hide {
                         strokes.push(line(&[(2.4, 1.6), (11.6, 12.4)]));
                     }
@@ -636,17 +701,37 @@ fn field(
         }))
 }
 
+/// A message on its title's line, so it never adds one: cut short, and shown whole on hover.
+fn beside_title(selector: String, text: String, color: Hsla, p: Palette) -> Stateful<gpui::Div> {
+    let tip = SharedString::from(text.clone());
+    // A new element for each text, so a tooltip already waiting never shows the previous one.
+    div()
+        .id(ElementId::Name(format!("{selector}:{text}").into()))
+        .debug_selector(|| selector)
+        .mb(px(2.))
+        .min_w_0()
+        .truncate()
+        .text_size(px(10.))
+        .italic()
+        .text_color(color)
+        .tooltip(move |_, cx| {
+            let text = tip.clone();
+            cx.new(|_| Tip { text, p }).into()
+        })
+        .child(text)
+}
+
 /// A hairline between groups of sections, fainter than control borders, across the content.
 fn separator(p: Palette) -> gpui::Div {
     div().my(px(8.)).h(px(1.)).bg(p.border.opacity(0.55))
 }
 
-fn section(title: &'static str, p: Palette) -> gpui::Div {
+/// A group's title: Settings puts its message beside it, Control's Groups list goes under it.
+fn heading(title: &'static str) -> gpui::Div {
     div()
-        .text_size(px(11.))
-        .text_color(p.dim)
-        .mt_3()
-        .mb_1()
+        .flex_none()
+        .text_size(px(14.))
+        .font_weight(FontWeight::SEMIBOLD)
         .child(title)
 }
 
@@ -871,10 +956,12 @@ impl AppState {
     /// The area's message, unless it is a success or information message that has had its time.
     fn current(&mut self, area: Area, cx: &mut Context<Self>) -> Option<Message> {
         let message = self.snap.message(area)?.clone();
+        let id = message.id;
         if message.error {
+            // Seen, which clears its dot on the other tabs; it never times out.
+            self.shown.entry(id).or_insert(false);
             return Some(message);
         }
-        let id = message.id;
         if !self.shown.contains_key(&id) {
             self.timer(MESSAGE_SHOWN, cx, move |this, _| {
                 this.shown.insert(id, true);
@@ -883,7 +970,51 @@ impl AppState {
         (!*self.shown.entry(id).or_insert(false)).then_some(message)
     }
 
-    /// A Settings group's title with its message to the right.
+    /// Reload, in Control and on the active profile in Settings. Always there, so an edit on disk
+    /// only fills it in, like Check for Update; usable while the core runs, since it also
+    /// restores a port another tool changed. It waits while providers update, as the backend does.
+    fn reload_button(&self, id: impl Into<SharedString>, p: Palette) -> Stateful<gpui::Div> {
+        let s = &self.snap;
+        let usable = s.phase == Phase::Running && !self.busy() && !s.providers_busy;
+        let edited = s.edited;
+        icon_button(
+            id,
+            Icon::Reload,
+            if edited {
+                "Reload: the profile or overrides changed on disk"
+            } else {
+                "Reload profile"
+            },
+            p,
+            edited,
+            usable,
+            self.cmd(|| Cmd::Reload),
+        )
+    }
+
+    /// An error `tab` would show that has not been on screen yet: a dot on its segment.
+    fn unseen_error(&self, tab: Tab) -> bool {
+        tab.areas()
+            .iter()
+            .filter_map(|&area| self.snap.message(area))
+            .any(|m| m.error && !self.shown.contains_key(&m.id))
+    }
+
+    /// Beside Control's phase, Core and the system proxy share one message: the newest that is
+    /// still current, or else a failure's reason. `true` marks an error.
+    fn status_message(&mut self, cx: &mut Context<Self>) -> Option<(String, bool)> {
+        [Area::Core, Area::Proxy]
+            .into_iter()
+            .filter_map(|area| self.current(area, cx))
+            .max_by_key(|m| m.id)
+            .map(|m| (m.text, m.error))
+            .or_else(|| match &self.snap.phase {
+                Phase::Failed(reason) => Some((reason.clone(), true)),
+                _ => None,
+            })
+    }
+
+    /// A group's title with its message to the right.
     fn titled(
         &mut self,
         title: &'static str,
@@ -905,24 +1036,8 @@ impl AppState {
             .flex()
             .items_end()
             .gap(px(6.))
-            .child(
-                div()
-                    .flex_none()
-                    .text_size(px(14.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(title),
-            )
-            .children(message.map(|(text, color)| {
-                div()
-                    .debug_selector(|| selector)
-                    .mb(px(2.))
-                    .min_w_0()
-                    .truncate()
-                    .text_size(px(10.))
-                    .italic()
-                    .text_color(color)
-                    .child(text)
-            }))
+            .child(heading(title))
+            .children(message.map(|(text, color)| beside_title(selector, text, color, p)))
     }
 
     /// The window closed: what it showed is reset for the next time.
@@ -1019,29 +1134,16 @@ impl AppState {
         })
     }
 
-    /// One small line next to the area it is about: red for errors, dim otherwise.
-    fn note(&self, area: Area, p: Palette) -> Option<gpui::Div> {
-        let message = self.snap.message(area)?;
-        Some(
-            div()
-                .mt_1()
-                .text_size(px(12.))
-                .text_color(if message.error { p.danger } else { p.dim })
-                .child(message.text.clone()),
-        )
-    }
-
     fn render_control(
         &mut self,
         p: Palette,
         width: Pixels,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        // Less the window's padding and the node grid's own.
-        let inner = f32::from(width) - 40.;
-        let columns = node_columns(inner);
-        // Text measured inside a grid track gets no width to truncate to, so cards carry theirs.
-        let card_width = ((inner - (columns - 1) as f32 * CARD_GAP) / columns as f32).floor();
+        // Less the window's padding; the node grid also has its own.
+        let content = f32::from(width) - 24.;
+        let (columns, card_width) = card_grid(content - 16., CARD_MIN_WIDTH);
+        let (profile_columns, profile_width) = card_grid(content, PROFILE_MIN_WIDTH);
         let s = self.snap.clone();
         let running = s.phase == Phase::Running;
         let (core_label, core_cmd): (&str, fn() -> Cmd) = match s.phase {
@@ -1056,48 +1158,95 @@ impl AppState {
             None if proxy_on => ("System Proxy: On", true),
             None => ("System Proxy: Off", running),
         };
-        let status = status_text(&s);
-        let status_color = if matches!(s.phase, Phase::Failed(_)) {
-            p.danger
-        } else {
-            p.text
-        };
-
-        let mut column = div().flex().flex_col();
-        column = column
+        // The phase is the heading.
+        let failed = matches!(s.phase, Phase::Failed(_));
+        let message = self.status_message(cx);
+        let details = status_text(&s);
+        let status = div()
+            .flex()
+            .items_end()
+            .gap(px(6.))
             .child(
-                div()
+                heading(phase_label(&s.phase))
                     .debug_selector(|| "status".to_owned())
-                    .text_size(px(13.))
-                    .text_color(status_color)
-                    .child(status),
+                    .text_color(if failed { p.danger } else { p.text }),
             )
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .mt_2()
-                    .child(button(
-                        "core",
-                        core_label,
-                        p,
-                        false,
-                        s.phase != Phase::Stopping,
-                        self.cmd(core_cmd),
-                    ))
-                    .child(button(
-                        "proxy",
-                        proxy_label,
-                        p,
-                        proxy_on,
-                        proxy_enabled,
-                        self.cmd(move || Cmd::SetProxy(!proxy_on)),
-                    )),
-            )
-            .children(self.note(Area::Core, p))
-            .children(self.note(Area::Proxy, p));
+            .when(!details.is_empty(), |row| {
+                row.child(
+                    div()
+                        .flex_none()
+                        .mb(px(1.))
+                        .text_color(p.dim)
+                        .child(details),
+                )
+            })
+            .children(message.map(|(text, error)| {
+                let color = if error { p.danger } else { p.accent };
+                beside_title("status-message".to_owned(), text, color, p)
+            }));
 
-        let mut profiles = div().flex().flex_wrap().gap_1();
+        // A list gets a heading, a setting a label beside it, as in Settings. Messages go beside
+        // the headings, so none of them adds a line.
+        let mut column = div().flex().flex_col().text_size(px(12.));
+        column = column.child(status).child(field(
+            "Core",
+            div()
+                .flex()
+                .gap_2()
+                .child(button(
+                    "core",
+                    core_label,
+                    p,
+                    false,
+                    s.phase != Phase::Stopping,
+                    self.cmd(core_cmd),
+                ))
+                .child(button(
+                    "proxy",
+                    proxy_label,
+                    p,
+                    proxy_on,
+                    proxy_enabled,
+                    self.cmd(move || Cmd::SetProxy(!proxy_on)),
+                )),
+            None,
+            p,
+        ));
+
+        // Shown while stopped too: a choice is remembered and applied at the next start.
+        let mut modes = div().flex().gap_1();
+        for (mode, label) in [("rule", "Rule"), ("global", "Global"), ("direct", "Direct")] {
+            modes = modes.child(button(
+                mode,
+                label,
+                p,
+                s.mode == mode,
+                s.phase != Phase::Stopping,
+                self.cmd(move || Cmd::SetMode(mode.to_owned())),
+            ));
+        }
+        column = column
+            .child(field("Mode", modes, None, p))
+            .child(separator(p));
+
+        let reload = self.reload_button("reload", p);
+        let busy = s.providers_busy.then(|| "Updating providers…".to_owned());
+        column = column.child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    self.titled("Profiles", Area::Profiles, busy, p, cx)
+                        .debug_selector(|| "profiles".to_owned())
+                        .flex_1()
+                        .min_w_0(),
+                )
+                .child(reload),
+        );
+
+        // Equal columns across the content, like the node cards.
+        let mut profiles = div().grid().grid_cols(profile_columns).gap_1().py(px(3.));
         for profile in s.profiles.iter() {
             let name = profile.name.clone();
             let id = SharedString::from(format!("profile-{name}"));
@@ -1108,71 +1257,42 @@ impl AppState {
                 name.clone()
             };
             let target = Deletable::Profile(name.clone());
+            // Its own frame, not a node card's: the two may change apart.
             profiles = profiles.child(
-                button(
+                chip(
                     id,
-                    label,
                     p,
                     selected,
                     profile.problem.is_none(),
                     self.cmd(move || Cmd::Activate(name.clone())),
                 )
-                .on_mouse_down(MouseButton::Right, Self::open_menu(target, cx)),
+                .w(px(profile_width))
+                .on_mouse_down(MouseButton::Right, Self::open_menu(target, cx))
+                .child(div().truncate().child(label)),
             );
         }
         if s.profiles.is_empty() {
-            profiles = profiles.child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(p.dim)
-                    .child("No profiles. Import or link one in Settings."),
-            );
+            profiles = div()
+                .py(px(6.))
+                .text_color(p.dim)
+                .child("No profiles. Import or link one in Settings.");
         }
-        column = column
-            .child(section("PROFILE", p))
-            .child(profiles)
-            .children(self.note(Area::Profiles, p));
-        if s.edited {
-            column = column.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .mt_1()
-                    .text_size(px(12.))
-                    .text_color(p.dim)
-                    .child("The profile or overrides changed on disk.")
-                    .child(button(
-                        "reload",
-                        "Reload",
-                        p,
-                        false,
-                        true,
-                        self.cmd(|| Cmd::Reload),
-                    )),
-            );
-        }
+        column = column.child(profiles);
 
-        // Shown while stopped too: a choice is remembered and applied at the next start.
-        let mut modes = div().flex().gap_1();
-        for mode in ["rule", "global", "direct"] {
-            modes = modes.child(button(
-                mode,
-                mode,
-                p,
-                s.mode == mode,
-                s.phase != Phase::Stopping,
-                self.cmd(move || Cmd::SetMode(mode.to_owned())),
-            ));
-        }
-        column = column.child(section("MODE", p)).child(modes);
-        if running {
-            column = column.child(section("GROUPS", p));
-            for group in s
-                .groups
-                .iter()
-                .filter(|g| g.name != "GLOBAL" || s.mode == "global")
-            {
+        let groups: Vec<_> = s
+            .groups
+            .iter()
+            .filter(|g| running && (g.name != "GLOBAL" || s.mode == "global"))
+            .collect();
+        // A profile without groups, like the default direct one, gets no empty heading.
+        if !groups.is_empty() {
+            column = column.child(separator(p)).child(
+                self.titled("Groups", Area::Groups, None, p, cx)
+                    .debug_selector(|| "groups".to_owned())
+                    // The first name sits as far below as a Settings row's label does.
+                    .mb(px(3.)),
+            );
+            for group in groups {
                 let name = group.name.clone();
                 let expanded = self.expanded.contains(&name);
                 let toggle = name.clone();
@@ -1501,7 +1621,7 @@ impl AppState {
         let action = match &s.latest {
             Some(latest) if s.core_version.as_deref() != Some(&latest.version) => icon_button(
                 "update",
-                Icon::Update,
+                Icon::Download,
                 format!("Update to {}", latest.version),
                 p,
                 true,
@@ -1555,17 +1675,24 @@ impl AppState {
                 name.push_str(&format!(" — {problem}"));
             }
             let active = s.active.as_deref() == Some(&profile.name);
-            // The active profile can only be updated, the others only deleted: one button each.
+            // The active profile can be reloaded and its providers updated; the others can only
+            // be deleted. Update and Delete share the right edge.
             let action = if active {
-                icon_button(
-                    format!("update-{}", profile.name),
-                    Icon::Update,
-                    "Update providers",
-                    p,
-                    false,
-                    s.phase == Phase::Running && !s.providers_busy,
-                    self.cmd(|| Cmd::UpdateProviders),
-                )
+                div()
+                    .flex()
+                    .flex_none()
+                    .gap_1()
+                    .child(self.reload_button(format!("reload-{}", profile.name), p))
+                    .child(icon_button(
+                        format!("update-{}", profile.name),
+                        Icon::Download,
+                        "Update providers: download node lists and rule sets",
+                        p,
+                        false,
+                        s.phase == Phase::Running && !s.providers_busy,
+                        self.cmd(|| Cmd::UpdateProviders),
+                    ))
+                    .into_any_element()
             } else {
                 let target = profile.name.clone();
                 self.confirmable(
@@ -1576,6 +1703,7 @@ impl AppState {
                     p,
                     cx,
                 )
+                .into_any_element()
             };
             // A double-click on the name selects the profile, as a click in Control does.
             let pick = (!active && profile.problem.is_none()).then(|| profile.name.clone());
@@ -1918,7 +2046,7 @@ impl Render for AppState {
                 ),
                 Deletable::Profile(name) => (
                     "remove-profile",
-                    "Remove",
+                    "Delete",
                     self.snap.active.as_ref() == Some(name),
                 ),
             };
@@ -1997,9 +2125,12 @@ impl Render for AppState {
                     p.border
                 }));
             }
+            // The body above has been drawn, so what it showed already counts as seen.
+            let dot = !selected && self.unseen_error(tab);
             let mut segment = div()
                 .id(id)
                 .debug_selector(|| id.to_owned())
+                .relative()
                 .px_3()
                 .py(px(3.))
                 .text_size(px(12.))
@@ -2007,7 +2138,20 @@ impl Render for AppState {
                 .border_t_1()
                 .border_b_1()
                 .on_click(cx.listener(move |this, _, _, cx| this.set_tab(tab, cx)))
-                .child(label);
+                .child(label)
+                // In the corner of the padding, so it changes no width.
+                .when(dot, |segment| {
+                    segment.child(
+                        div()
+                            .debug_selector(move || format!("{id}-dot"))
+                            .absolute()
+                            .top(px(3.))
+                            .right(px(3.))
+                            .size(px(6.))
+                            .rounded_full()
+                            .bg(p.danger),
+                    )
+                });
             if i == 0 {
                 segment = segment.border_l_1().rounded_l(px(5.));
             }
@@ -2066,16 +2210,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn node_cards_stay_between_the_minimum_and_one_and_a_half_times_it() {
+    fn cards_stay_between_the_minimum_and_one_and_a_half_times_it_and_fit() {
         let two = (CARD_MIN_WIDTH * 2. + CARD_GAP) as u32;
         for width in (two..3000).map(|w| w as f32) {
-            let n = node_columns(width) as f32;
-            let card = (width - (n - 1.) * CARD_GAP) / n;
+            let (n, card) = card_grid(width, CARD_MIN_WIDTH);
             assert!(card >= CARD_MIN_WIDTH, "{width}: {card}");
             assert!(card < CARD_MIN_WIDTH * 1.5 + CARD_GAP, "{width}: {card}");
+            assert!(
+                card * n as f32 + (n - 1) as f32 * CARD_GAP <= width,
+                "{width}"
+            );
         }
-        assert_eq!(node_columns(200.), 2);
-        assert_eq!(node_columns(600.), 3);
+        assert_eq!(card_grid(200., CARD_MIN_WIDTH).0, 2);
+        assert_eq!(card_grid(600., CARD_MIN_WIDTH).0, 3);
     }
 
     #[test]
@@ -2420,6 +2567,195 @@ mod gpui_tests {
     }
 
     #[gpui::test]
+    fn groups_heading_is_shown_only_above_groups(cx: &mut TestAppContext) {
+        {
+            let ui = open(cx, running());
+            assert!(ui.cx.debug_bounds("groups").is_some());
+        }
+        // The default profile runs direct and lists nothing but GLOBAL, which is hidden then.
+        let only_global = Snapshot {
+            mode: "direct".into(),
+            groups: vec![Group {
+                name: "GLOBAL".into(),
+                kind: "Selector".into(),
+                now: "DIRECT".into(),
+                all: vec!["DIRECT".into()],
+            }],
+            ..running()
+        };
+        let ui = open(cx, only_global);
+        assert!(ui.cx.debug_bounds("groups").is_none());
+    }
+
+    #[gpui::test]
+    fn control_rows_share_the_settings_label_column(cx: &mut TestAppContext) {
+        let mut ui = open(cx, running());
+        let bounds = |ui: &mut Ui, id| ui.cx.debug_bounds(id).unwrap();
+        let start = bounds(&mut ui, "core").left();
+        assert_eq!(bounds(&mut ui, "rule").left(), start);
+        for (label, id) in [
+            ("label-Core", "core"),
+            ("label-Core", "proxy"),
+            ("label-Mode", "rule"),
+        ] {
+            let offset = (bounds(&mut ui, id).center().y - bounds(&mut ui, label).center().y).abs();
+            assert!(offset < px(1.), "{id} is off its label by {offset:?}");
+        }
+        ui.click("tab-settings");
+        assert_eq!(bounds(&mut ui, "theme-auto").left(), start);
+    }
+
+    #[gpui::test]
+    fn profile_buttons_share_a_width_and_wrap_under_the_first(cx: &mut TestAppContext) {
+        let mut ui = open(cx, running());
+        // The window's minimum width: two columns, so the third profile starts a new line.
+        ui.cx.simulate_resize(gpui::size(px(480.), px(680.)));
+        ui.frame();
+        let bounds = |ui: &mut Ui, id| ui.cx.debug_bounds(id).unwrap();
+        let [home, work, gone] =
+            ["profile-home", "profile-work", "profile-gone"].map(|id| bounds(&mut ui, id));
+        assert_eq!(home.size.width, work.size.width);
+        assert_eq!(home.size.width, gone.size.width);
+        assert_eq!(home.top(), work.top());
+        assert!(gone.top() > home.bottom(), "a new line");
+        assert_eq!(gone.left(), home.left(), "under the first button");
+        // A list under its heading spans the content: from the headings' edge out to the
+        // window's 12-point padding, where Reload sits.
+        assert_eq!(home.left(), bounds(&mut ui, "profiles").left());
+        assert_eq!(work.right(), px(480. - 12.));
+        assert_eq!(bounds(&mut ui, "reload").right(), work.right());
+    }
+
+    #[gpui::test]
+    fn control_messages_sit_beside_headings_and_add_no_line(cx: &mut TestAppContext) {
+        let ids = ["rule", "profile-home", "group-PICK"];
+        let tops = |ui: &mut Ui| ids.map(|id| ui.cx.debug_bounds(id).unwrap().top());
+        let quiet = {
+            let mut ui = open(cx, running());
+            for id in ["status-message", "profiles-message", "groups-message"] {
+                assert!(ui.cx.debug_bounds(id).is_none(), "{id}");
+            }
+            tops(&mut ui)
+        };
+        let message = |text: &str, error, id| Message {
+            text: text.into(),
+            error,
+            id,
+        };
+        let mut busy = running();
+        busy.edited = true;
+        busy.messages.extend([
+            (
+                Area::Core,
+                message("Running the last-good configuration", true, 1),
+            ),
+            (Area::Proxy, message("networksetup failed", true, 2)),
+            (Area::Profiles, message("Updated 3 providers", false, 3)),
+            (Area::Groups, message("PICK has no member B", true, 4)),
+        ]);
+        let mut ui = open(cx, busy);
+        for id in ["status-message", "profiles-message", "groups-message"] {
+            assert!(ui.cx.debug_bounds(id).is_some(), "{id}");
+        }
+        assert_eq!(tops(&mut ui), quiet);
+    }
+
+    #[gpui::test]
+    fn the_status_line_shows_the_newest_message_then_an_older_error(cx: &mut TestAppContext) {
+        let mut ui = open(cx, running());
+        let shown = |ui: &mut Ui| ui.view.update(ui.cx, |this, cx| this.status_message(cx));
+        let message = |text: &str, error, id| Message {
+            text: text.into(),
+            error,
+            id,
+        };
+        ui.snap(|s| {
+            s.messages
+                .insert(Area::Core, message("Mode failed", true, 1));
+            s.messages
+                .insert(Area::Proxy, message("Proxy note", false, 2));
+        });
+        assert_eq!(shown(&mut ui), Some(("Proxy note".into(), false)));
+        ui.wait(MESSAGE_SHOWN + Duration::from_millis(10));
+        assert_eq!(
+            shown(&mut ui),
+            Some(("Mode failed".into(), true)),
+            "errors stay"
+        );
+        // A failed start says why on the heading's line, without a message of its own.
+        ui.snap(|s| {
+            s.messages.clear();
+            s.phase = Phase::Failed("port 20999 is in use".into());
+        });
+        assert_eq!(shown(&mut ui), Some(("port 20999 is in use".into(), true)));
+    }
+
+    #[gpui::test]
+    fn a_dot_marks_a_tab_with_an_error_not_seen_yet(cx: &mut TestAppContext) {
+        let mut ui = open(cx, running());
+        let message = |text: &str, error, id| Message {
+            text: text.into(),
+            error,
+            id,
+        };
+        let dots =
+            |ui: &mut Ui| ui.read(|s| [Tab::Control, Tab::Settings].map(|t| s.unseen_error(t)));
+        // An error for Settings while Control is on screen.
+        ui.snap(|s| {
+            s.messages
+                .insert(Area::Api, message("Port 21000 is in use", true, 1));
+        });
+        assert_eq!(dots(&mut ui), [false, true]);
+        assert!(ui.cx.debug_bounds("tab-settings-dot").is_some());
+        // Nothing times out before it has been seen.
+        ui.wait(MESSAGE_SHOWN * 10);
+        assert_eq!(dots(&mut ui), [false, true]);
+        ui.click("tab-settings");
+        assert_eq!(dots(&mut ui), [false, false]);
+        assert!(ui.cx.debug_bounds("api-message").is_some(), "still there");
+        // A profile error seen here is not new to Control, which shows it too.
+        ui.snap(|s| {
+            s.messages
+                .insert(Area::Profiles, message("Import failed", true, 2));
+        });
+        assert_eq!(dots(&mut ui), [false, false]);
+        // Seen on neither until one of them shows it.
+        ui.click("tab-logs");
+        ui.snap(|s| {
+            s.messages
+                .insert(Area::Profiles, message("Activation failed", true, 3));
+        });
+        assert_eq!(dots(&mut ui), [true, true]);
+        ui.click("tab-control");
+        assert_eq!(dots(&mut ui), [false, false]);
+        // Information gets no dot.
+        ui.snap(|s| {
+            s.messages
+                .insert(Area::Update, message("Up to date", false, 4));
+        });
+        assert_eq!(dots(&mut ui), [false, false]);
+    }
+
+    #[gpui::test]
+    fn reload_works_while_running_and_is_filled_after_an_edit(cx: &mut TestAppContext) {
+        let mut ui = open(cx, running());
+        ui.click("reload");
+        assert!(matches!(ui.sent()[..], [Cmd::Reload]), "no edit needed");
+        ui.snap(|s| s.edited = true);
+        ui.click("reload");
+        assert!(matches!(ui.sent()[..], [Cmd::Reload]));
+        ui.snap(|s| s.providers_busy = true);
+        ui.click("reload");
+        assert!(ui.sent().is_empty(), "waits for the providers update");
+        ui.snap(|s| {
+            s.providers_busy = false;
+            s.phase = Phase::Stopped;
+        });
+        ui.click("reload");
+        assert!(ui.sent().is_empty(), "nothing runs to reload");
+    }
+
+    #[gpui::test]
     fn connections_can_be_closed_one_by_one_or_all(cx: &mut TestAppContext) {
         let mut ui = open(cx, running());
         let conn = |id: &str| Connection {
@@ -2737,15 +3073,19 @@ mod gpui_tests {
             ..running()
         };
         let dev = if settings::DEV { " · dev" } else { "" };
+        // Beside the phase, which is the heading.
         assert_eq!(
             status_text(&s),
-            format!("Running · v1.19.33 · proxy 10999 · API 11000{dev}")
+            format!("v1.19.33 · proxy 10999 · API 11000{dev}")
         );
         s.allow_lan = true;
         assert_eq!(
             status_text(&s),
-            format!("Running · v1.19.33 · proxy 10999 · LAN · API 11000{dev}")
+            format!("v1.19.33 · proxy 10999 · LAN · API 11000{dev}")
         );
+        // A failure's reason takes the room; only the channel stays.
+        s.phase = Phase::Failed("boom".into());
+        assert_eq!(status_text(&s), dev.trim_start_matches(" · "));
         assert_eq!(
             masked(SECRET),
             format!("{}3f9a", "•".repeat(SECRET.len() - 4))
@@ -2784,6 +3124,31 @@ mod gpui_tests {
         ui.cx.simulate_input("9090");
         ui.keys("enter");
         assert!(matches!(ui.sent()[..], [Cmd::SetApiPort(9090)]));
+    }
+
+    #[gpui::test]
+    fn apply_appearing_leaves_the_rows_where_they_are(cx: &mut TestAppContext) {
+        let mut ui = settings_tab(cx);
+        let below = |ui: &mut Ui| {
+            ["lan-off", "regenerate", "check"].map(|id| ui.cx.debug_bounds(id).unwrap().top())
+        };
+        let before = below(&mut ui);
+        for input in ["proxy-port-input", "api-port-input"] {
+            ui.click(input);
+            ui.keys("cmd-a");
+            ui.cx.simulate_input("7890");
+        }
+        // Not even by the fraction of a point a taller button would add.
+        assert_eq!(below(&mut ui), before);
+        for id in [
+            "proxy-port-input",
+            "proxy-port-apply",
+            "lan-off",
+            "theme-auto",
+        ] {
+            let height = ui.cx.debug_bounds(id).unwrap().size.height;
+            assert_eq!(height, CONTROL_HEIGHT, "{id}");
+        }
     }
 
     #[gpui::test]
@@ -2899,13 +3264,18 @@ mod gpui_tests {
 
         ui.click("update-home");
         assert!(matches!(ui.sent()[..], [Cmd::UpdateProviders]));
+        // Reload sits beside it and works as Control's does.
+        ui.click("reload-home");
+        assert!(matches!(ui.sent()[..], [Cmd::Reload]));
         ui.snap(|s| s.providers_busy = true);
         ui.click("update-home");
+        ui.click("reload-home");
         ui.snap(|s| {
             s.providers_busy = false;
             s.phase = Phase::Stopped;
         });
         ui.click("update-home");
+        ui.click("reload-home");
         assert!(ui.sent().is_empty(), "not while updating or stopped");
     }
 
@@ -2983,6 +3353,7 @@ mod gpui_tests {
             "regenerate",
             "check",
             "secret-show",
+            "reload-home",
         ] {
             let bounds = ui.cx.debug_bounds(id).unwrap();
             assert_eq!(
@@ -2990,13 +3361,19 @@ mod gpui_tests {
                 (px(28.), px(24.)),
                 "{id}"
             );
-            if id != "secret-show" {
+            if !["secret-show", "reload-home"].contains(&id) {
                 assert_eq!(bounds.right(), right, "{id} shares the right edge");
             }
         }
-        let show = ui.cx.debug_bounds("secret-show").unwrap();
-        let regenerate = ui.cx.debug_bounds("regenerate").unwrap();
-        assert!(show.right() < regenerate.left());
+        // A second button sits just left of the one on the edge.
+        for (left, edge) in [
+            ("secret-show", "regenerate"),
+            ("reload-home", "update-home"),
+        ] {
+            let gap = ui.cx.debug_bounds(edge).unwrap().left()
+                - ui.cx.debug_bounds(left).unwrap().right();
+            assert_eq!(gap, px(4.), "{left}");
+        }
         // Text, buttons and icon buttons are centred on their row's label.
         for (label, ids) in [
             ("label-Secret", &["secret", "secret-show", "regenerate"][..]),

@@ -133,7 +133,8 @@ pub fn menu_model(s: &Snapshot) -> Vec<Entry> {
         },
     ]);
     if s.edited {
-        menu.push(item(RELOAD, "Reload Edited Profile", true));
+        // Waits for a providers update, as the window's Reload does.
+        menu.push(item(RELOAD, "Reload Edited Profile", !s.providers_busy));
     }
     menu.extend([
         item(CHECK_NOW, "Check Now", true),
@@ -158,6 +159,7 @@ pub fn menu_action(id: &str, s: &Snapshot) -> Option<MenuAction> {
             _ => Cmd::Start,
         }),
         PROXY => MenuAction::Send(Cmd::SetProxy(!s.proxy_on)),
+        RELOAD if s.providers_busy => return None,
         RELOAD => MenuAction::Send(Cmd::Reload),
         CHECK_NOW => MenuAction::Send(Cmd::CheckNow),
         OPEN => MenuAction::Open,
@@ -482,6 +484,11 @@ mod tests {
         assert_eq!(modes(&s), [(true, Some(false)); 3], "nothing recorded");
         s.phase = Phase::Stopping;
         assert_eq!(modes(&s), [(false, Some(false)); 3]);
+        s.providers_busy = true;
+        assert!(
+            !state(&menu_model(&s), RELOAD).1,
+            "waits for the providers update"
+        );
     }
 
     #[test]
@@ -517,6 +524,14 @@ mod tests {
             menu_action(RELOAD, &on),
             Some(MenuAction::Send(Cmd::Reload))
         ));
+        let updating = Snapshot {
+            providers_busy: true,
+            ..on.clone()
+        };
+        assert!(
+            menu_action(RELOAD, &updating).is_none(),
+            "waits for the providers update"
+        );
         assert!(
             matches!(menu_action("profile:a b/c", &on), Some(MenuAction::Send(Cmd::Activate(n))) if n == "a b/c")
         );

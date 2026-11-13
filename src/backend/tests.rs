@@ -471,6 +471,10 @@ local_test!(
         a.handle(Cmd::Start).await;
         assert_eq!(a.snap.phase, Phase::Running, "{:?}", a.snap.phase);
         assert!(message(&a, Area::Core).contains("last-good"));
+        assert!(
+            a.snap.message(Area::Core).unwrap().error,
+            "stays until resolved"
+        );
         assert_eq!(a.api.runtime().await.unwrap().mixed_port, proxy);
         a.handle(Cmd::Stop).await;
     }
@@ -571,6 +575,9 @@ local_test!(update_refreshes_the_running_profiles_providers, a, rx, {
     a.handle(Cmd::Start).await;
     a.handle(Cmd::UpdateProviders).await;
     assert!(a.snap.providers_busy);
+    // A reload in between would race the downloads.
+    a.handle(Cmd::Reload).await;
+    assert!(message(&a, Area::Profiles).starts_with("Reload waits"));
     let done = rx.recv().await.unwrap();
     a.handle(done).await;
     assert_eq!(message(&a, Area::Profiles), "This profile has no providers");
