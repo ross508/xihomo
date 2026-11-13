@@ -5,6 +5,7 @@ use crate::backend::Phase;
 use std::f32::consts::{FRAC_1_SQRT_2, FRAC_PI_2, TAU};
 
 pub const SETS: &[&str] = &[
+    "x",
     "circle",
     "square",
     "diamond",
@@ -138,6 +139,19 @@ fn shape(set: &str) -> Vec<Polygon> {
         "snowflake" => (0..3)
             .map(|i| bar(FRAC_PI_2 + i as f32 * TAU / 6.0, 0.86, 0.2))
             .collect(),
+        // The letter, also the bundle's app icon; wide enough to stay hollow at menu bar size.
+        "x" => [1.0, -1.0]
+            .map(|sign| {
+                let (h, angle, half_width) = (0.66f32, 62f32.to_radians(), 0.14);
+                let (top, w) = (h / angle.tan(), half_width / angle.sin());
+                vec![
+                    (sign * top - w, -h),
+                    (sign * top + w, -h),
+                    (-sign * top + w, h),
+                    (-sign * top - w, h),
+                ]
+            })
+            .to_vec(),
         _ => one(regular(96, 0.8)),
     }
 }
@@ -177,7 +191,8 @@ fn inside(shape: &[Polygon], x: f32, y: f32, inset: f32) -> bool {
     shape.iter().any(|polygon| distance(polygon, x, y) < -inset)
 }
 
-fn covered(shape: &[Polygon], stroke: f32, state: State, x: f32, y: f32) -> bool {
+/// `level` strikes the error through horizontally, for a shape whose own diagonals hide a slash.
+fn covered(shape: &[Polygon], stroke: f32, level: bool, state: State, x: f32, y: f32) -> bool {
     let solid = inside(shape, x, y, 0.0);
     let body = match state {
         State::Running => solid,
@@ -187,18 +202,22 @@ fn covered(shape: &[Polygon], stroke: f32, state: State, x: f32, y: f32) -> bool
         return body;
     }
     // Cut a gap around the slash so it stays legible at menu bar size.
-    let distance = (x + y).abs() / std::f32::consts::SQRT_2;
-    let on_slash = distance < 0.1 && x.abs() < 0.9 && y.abs() < 0.9;
+    let (distance, on_slash) = if level {
+        (y.abs(), y.abs() < 0.1 && x.abs() < 0.85)
+    } else {
+        let distance = (x + y).abs() / std::f32::consts::SQRT_2;
+        (distance, distance < 0.1 && x.abs() < 0.9 && y.abs() < 0.9)
+    };
     on_slash || (body && distance > 0.2)
 }
 
 pub fn rgba(set: &str, state: State) -> Vec<u8> {
     let shape = shape(set);
     // Thin parts would close up with the common stroke.
-    let stroke = if matches!(set, "bars" | "snowflake") {
-        0.1
-    } else {
-        STROKE
+    let stroke = match set {
+        "x" => 0.08,
+        "bars" | "snowflake" => 0.1,
+        _ => STROKE,
     };
     let mut out = Vec::with_capacity((SIZE * SIZE * 4) as usize);
     for py in 0..SIZE {
@@ -210,7 +229,8 @@ pub fn rgba(set: &str, state: State) -> Vec<u8> {
                         (((p as f32 + (s as f32 + 0.5) / SAMPLES as f32) / SIZE as f32) * 2.0 - 1.0)
                             * EXTENT
                     };
-                    hits += covered(&shape, stroke, state, map(px, sx), map(py, sy)) as u32;
+                    hits +=
+                        covered(&shape, stroke, set == "x", state, map(px, sx), map(py, sy)) as u32;
                 }
             }
             out.extend_from_slice(&[0, 0, 0, (hits * 255 / (SAMPLES * SAMPLES)) as u8]);
@@ -224,18 +244,12 @@ pub fn tray_icon(set: &str, state: State) -> tray_icon::Icon {
         .expect("icon dimensions match the buffer")
 }
 
-/// The letter "X": two bars cut level at the top and bottom, a little taller than wide.
-fn x_distance(x: f32, y: f32) -> f32 {
-    let angle = 63f32.to_radians();
-    let bars = [angle, -angle].map(|a| distance(&bar(a, 1.2, 0.1), x, y));
-    bars[0].min(bars[1]).max(y.abs() - 0.8)
-}
-
 /// An app icon on Apple's macOS grid, RGBA with straight alpha: in a 1024 canvas an 824 rounded
-/// square with a transparent 100 margin, so macOS shows it as drawn: a graphite glyph on white. `None` is the "X" bundle icon;
-/// `dev` adds a band across the lower-right corner.
+/// square with a transparent 100 margin, so macOS shows it as drawn: a graphite glyph on white.
+/// `None` is the "X" bundle icon, with a rim; `dev` adds a band across the lower-right corner.
 pub fn app_icon(set: Option<&str>, dev: bool, size: u32) -> Vec<u8> {
-    let glyph = set.map(shape);
+    // The bundle's icon is the "x" set's letter.
+    let glyph = shape(set.unwrap_or("x"));
     let rgb = |c: u32| [(c >> 16) as f32, (c >> 8 & 0xFF) as f32, (c & 0xFF) as f32];
     let (ink_color, band, rim) = (rgb(INK), rgb(DEV_BAND), rgb(RIM));
     // Canvas units per pixel, and shape units per canvas unit: the glyph is about 44% of the body.
@@ -264,13 +278,10 @@ pub fn app_icon(set: Option<&str>, dev: bool, size: u32) -> Vec<u8> {
             let (x, y) = ((u - 512.0) / scale, (v - 512.0) / scale);
             // Outside the glyph's frame nothing is near enough to cover a pixel.
             let ink = if x.abs() < 1.0 && y.abs() < 1.0 {
-                let d = match &glyph {
-                    Some(polygons) => polygons
-                        .iter()
-                        .map(|p| distance(p, x, y))
-                        .fold(f32::MAX, f32::min),
-                    None => x_distance(x, y),
-                };
+                let d = glyph
+                    .iter()
+                    .map(|p| distance(p, x, y))
+                    .fold(f32::MAX, f32::min);
                 coverage(d * scale)
             } else {
                 0.0
