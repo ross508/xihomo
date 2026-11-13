@@ -846,7 +846,10 @@ impl AppState {
 
     fn apply_port(&mut self, port: Port, cx: &mut Context<Self>) {
         let value = self.draft(port, cx);
-        if self.busy() || value == u32::from(self.saved_port(port)) {
+        if value == u32::from(self.saved_port(port)) {
+            return self.settle_port(port, cx);
+        }
+        if self.busy() {
             return;
         }
         // An applied empty field shows the default it stands for.
@@ -859,6 +862,38 @@ impl AppState {
             Port::Api => Cmd::SetApiPort(value),
         });
         cx.notify();
+    }
+
+    /// A field that stands for the saved port, even empty, shows it again; a message an earlier
+    /// draft left beside the section goes, as the backend clears it on a port it already has.
+    fn settle_port(&mut self, port: Port, cx: &mut Context<Self>) {
+        let saved = self.saved_port(port);
+        if self.draft(port, cx) != u32::from(saved) {
+            return;
+        }
+        let field = self.field(port);
+        field.edited = false;
+        let input = field.input.clone();
+        input.update(cx, |i, cx| i.set_text(&saved.to_string(), cx));
+        let (area, cmd) = match port {
+            Port::Proxy => (Area::Listen, Cmd::SetProxyPort(saved.into())),
+            Port::Api => (Area::Api, Cmd::SetApiPort(saved.into())),
+        };
+        if self.snap.message(area).is_some() && !self.busy() {
+            self.handle.send(cmd);
+        }
+        cx.notify();
+    }
+
+    /// Leaving a port field settles it as Return does; a new port still waits for Return or Apply.
+    pub fn watch_port_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for port in [Port::Proxy, Port::Api] {
+            let focus = self.field(port).input.read(cx).focus.clone();
+            cx.on_focus_out(&focus, window, move |this, _, _, cx| {
+                this.settle_port(port, cx)
+            })
+            .detach();
+        }
     }
 
     /// An unedited field follows the saved value; an edited one keeps the draft until it matches.
@@ -1665,6 +1700,16 @@ impl AppState {
             .id("settings")
             .size_full()
             .overflow_y_scroll()
+            // A click outside any field leaves the one being edited; a field's own click is
+            // already handled and stays in it.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, _| {
+                    if !window.default_prevented() {
+                        this.focus.focus(window);
+                    }
+                }),
+            )
             .child(column)
             .into_any_element()
     }
@@ -2371,7 +2416,8 @@ mod gpui_tests {
         });
         let (handle, rx) = Handle::detached(snapshot);
         let (view, cx) = cx.add_window_view(|window, cx| {
-            let state = AppState::new(handle, cx);
+            let mut state = AppState::new(handle, cx);
+            state.watch_port_focus(window, cx);
             state.focus.focus(window);
             state
         });
@@ -3055,11 +3101,18 @@ mod gpui_tests {
 
     const SECRET: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab3f9a";
 
-    /// Settings with the dev channel's ports, as the debug test build sees them.
+    /// This build's default ports, proxy and API, as the backend would report them.
+    fn defaults() -> (u16, u16) {
+        let d = settings::Settings::default();
+        (d.mixed_port, d.controller_port)
+    }
+
+    /// Settings with this build's default ports.
     fn settings_tab(cx: &mut TestAppContext) -> Ui<'_> {
+        let (mixed_port, controller_port) = defaults();
         let snapshot = Snapshot {
-            mixed_port: 20999,
-            controller_port: 21000,
+            mixed_port,
+            controller_port,
             secret: SECRET.into(),
             ..running()
         };
@@ -3150,7 +3203,8 @@ mod gpui_tests {
     #[gpui::test]
     fn port_fields_take_digits_apply_on_return_and_revert_on_escape(cx: &mut TestAppContext) {
         let mut ui = settings_tab(cx);
-        assert_eq!(ui.text(Port::Proxy), "20999");
+        let (proxy, _) = defaults();
+        assert_eq!(ui.text(Port::Proxy), proxy.to_string());
         ui.click("proxy-port-input");
         ui.keys("cmd-a");
         ui.cx.simulate_input("7a8-90");
@@ -3163,7 +3217,11 @@ mod gpui_tests {
         ui.cx.simulate_input("123456");
         assert_eq!(ui.text(Port::Proxy), "12345", "five digits at most");
         ui.keys("escape");
-        assert_eq!(ui.text(Port::Proxy), "20999", "back to the saved value");
+        assert_eq!(
+            ui.text(Port::Proxy),
+            proxy.to_string(),
+            "back to the saved value"
+        );
         ui.keys("enter");
         assert!(ui.sent().is_empty(), "nothing to apply");
         // Apply is gone with the change: a click where it was does nothing.
@@ -3204,17 +3262,72 @@ mod gpui_tests {
     #[gpui::test]
     fn an_empty_port_field_means_the_default(cx: &mut TestAppContext) {
         let mut ui = settings_tab(cx);
+        let (proxy, _) = defaults();
         ui.snap(|s| s.mixed_port = 7000);
         assert_eq!(ui.text(Port::Proxy), "7000");
         ui.click("proxy-port-input");
         ui.keys("cmd-a backspace");
         assert_eq!(ui.text(Port::Proxy), "", "an empty field is not refilled");
         ui.keys("enter");
-        assert!(matches!(ui.sent()[..], [Cmd::SetProxyPort(20999)]));
-        assert_eq!(ui.text(Port::Proxy), "20999");
+        assert!(matches!(ui.sent()[..], [Cmd::SetProxyPort(p)] if p == u32::from(proxy)));
+        assert_eq!(ui.text(Port::Proxy), proxy.to_string());
         // Saved as the default: no Apply, and an empty field stands for the same value.
-        ui.snap(|s| s.mixed_port = 20999);
+        ui.snap(|s| s.mixed_port = proxy);
         ui.keys("cmd-a backspace enter");
+        assert!(ui.sent().is_empty());
+        assert_eq!(
+            ui.text(Port::Proxy),
+            proxy.to_string(),
+            "refilled with the saved port"
+        );
+    }
+
+    #[gpui::test]
+    fn a_field_settled_at_the_saved_port_refills_and_clears_the_old_error(cx: &mut TestAppContext) {
+        let mut ui = settings_tab(cx);
+        let (proxy, api) = defaults();
+        // GPUI reports focus changes only in the active window, as the one being typed in is.
+        ui.cx.update(|window, _| window.activate_window());
+        let error = || Message {
+            text: "Port 80 is below 1024".into(),
+            error: true,
+            id: 1,
+        };
+        ui.click("proxy-port-input");
+        ui.keys("cmd-a");
+        ui.cx.simulate_input("80");
+        ui.keys("enter");
+        assert!(matches!(ui.sent()[..], [Cmd::SetProxyPort(80)]));
+        ui.snap(|s| {
+            s.messages.insert(Area::Listen, error());
+        });
+        // Emptied, it stands for the saved default: Return refills it and clears the message.
+        ui.keys("cmd-a backspace enter");
+        assert_eq!(ui.text(Port::Proxy), proxy.to_string());
+        assert!(matches!(ui.sent()[..], [Cmd::SetProxyPort(p)] if p == u32::from(proxy)));
+
+        // Leaving the field does the same.
+        ui.snap(|s| {
+            s.messages.clear();
+            s.messages.insert(Area::Api, error());
+        });
+        ui.click("api-port-input");
+        ui.keys("cmd-a backspace");
+        ui.click("label-Theme");
+        assert_eq!(ui.text(Port::Api), api.to_string());
+        assert!(matches!(ui.sent()[..], [Cmd::SetApiPort(p)] if p == u32::from(api)));
+
+        // Without a message nothing is sent, and a new port is kept, not applied, on leaving.
+        ui.snap(|s| s.messages.clear());
+        ui.click("api-port-input");
+        ui.keys("cmd-a backspace");
+        ui.click("label-Theme");
+        assert_eq!(ui.text(Port::Api), api.to_string());
+        ui.click("proxy-port-input");
+        ui.keys("cmd-a");
+        ui.cx.simulate_input("7890");
+        ui.click("label-Theme");
+        assert_eq!(ui.text(Port::Proxy), "7890");
         assert!(ui.sent().is_empty());
     }
 

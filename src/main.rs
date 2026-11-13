@@ -86,6 +86,7 @@ fn open_window(state: &Entity<AppState>, cx: &mut App) {
         move |window, cx| {
             view.update(cx, |this, cx| {
                 this.focus.focus(window);
+                this.watch_port_focus(window, cx);
                 // Editing detection is on activation; the 30s tick covers a window left in front.
                 cx.observe_window_activation(window, |this, window, _| {
                     if window.is_window_active() {
