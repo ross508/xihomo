@@ -855,6 +855,54 @@ async fn active_profile_cannot_be_removed() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn profiles_stay_in_the_order_they_were_added() {
+    let mut a = idle("profile-order");
+    let names =
+        |a: &Actor| -> Vec<String> { a.snap.profiles.iter().map(|p| p.name.clone()).collect() };
+    let sources = a.paths.data.join("sources");
+    fs::create_dir_all(&sources).unwrap();
+    for name in ["b", "a", "c"] {
+        let file = sources.join(format!("{name}.yaml"));
+        fs::write(&file, "a: 1\n").unwrap();
+        a.handle(if name == "a" {
+            Cmd::LinkProfile(file)
+        } else {
+            Cmd::ImportProfile(file)
+        })
+        .await;
+    }
+    assert_eq!(names(&a), ["b", "a", "c"]);
+    assert_eq!(saved(&a).profile_order, ["b", "a", "c"]);
+
+    // Replaced rather than edited in place, as atomic saves and `ln -sf` do: same place.
+    let b = a.paths.profiles().join("b.yaml");
+    fs::remove_file(&b).unwrap();
+    fs::write(&b, "a: 2\n").unwrap();
+    assert!(a.refresh_profiles());
+    assert_eq!(names(&a), ["b", "a", "c"]);
+
+    // Deleted, then added again: a new profile, so last.
+    a.handle(Cmd::RemoveProfile("b".into())).await;
+    a.handle(Cmd::ImportProfile(sources.join("b.yaml"))).await;
+    assert_eq!(names(&a), ["a", "c", "b"]);
+
+    // A failed listing forgets nothing.
+    let profiles = a.paths.profiles();
+    let moved = a.paths.config.join("profiles-moved");
+    fs::rename(&profiles, &moved).unwrap();
+    assert!(!a.refresh_profiles());
+    fs::rename(&moved, &profiles).unwrap();
+    assert_eq!(saved(&a).profile_order, ["a", "c", "b"]);
+
+    // The next launch shows the recorded order from its first frame.
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let next = Actor::new(a.paths.clone(), tx, Arc::new(AtomicBool::new(false)))
+        .unwrap()
+        .0;
+    assert_eq!(names(&next), ["a", "c", "b"]);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn reconciliation_runs_first_then_only_on_list_changes() {
     let mut a = idle("reconcile-trigger");
     fs::write(a.paths.profiles().join("p.yaml"), "a: 1\n").unwrap();

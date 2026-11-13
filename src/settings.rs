@@ -342,6 +342,8 @@ pub struct AppData {
     pub proxy_on: bool,
     /// The user's outbound mode; `None` keeps each profile's own `mode`.
     pub mode: Option<String>,
+    /// Profile names in the order they were added; see `profiles::arrange`.
+    pub profile_order: Vec<String>,
 }
 
 impl Default for AppData {
@@ -354,6 +356,7 @@ impl Default for AppData {
             core_on: true,
             proxy_on: false,
             mode: None,
+            profile_order: Vec::new(),
         }
     }
 }

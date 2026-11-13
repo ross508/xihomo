@@ -356,10 +356,13 @@ impl Actor {
         let first_run = !paths.app_data().exists();
         let (secret, regenerated) = paths.secret()?;
         let api = Api::new(settings.controller_port, &secret)?;
+        // Arranged but not recorded: a failed listing here must not forget the order.
+        let mut listed = profiles::list(&paths).unwrap_or_default();
+        profiles::arrange(&mut listed, &app.profile_order);
         let snap = Snapshot {
             phase: Phase::Stopped,
             installed: update::installed(&paths),
-            profiles: profiles::list(&paths).unwrap_or_default(),
+            profiles: listed,
             config_dir: paths.config.clone(),
             ..Snapshot::default()
         };
@@ -1353,8 +1356,15 @@ impl Actor {
     /// False when `profiles/` could not be listed; the previous list stays on screen.
     fn refresh_profiles(&mut self) -> bool {
         match profiles::list(&self.paths) {
-            Ok(list) => {
+            Ok(mut list) => {
+                let order = profiles::arrange(&mut list, &self.app.profile_order);
                 self.snap.profiles = list;
+                if order != self.app.profile_order {
+                    self.app.profile_order = order;
+                    if let Err(e) = self.app.save(&self.paths) {
+                        self.say(Area::Profiles, format!("{e:#}"), true);
+                    }
+                }
                 true
             }
             Err(e) => {

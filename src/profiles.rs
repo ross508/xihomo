@@ -89,6 +89,20 @@ pub fn list(paths: &Paths) -> Result<Vec<Profile>> {
     Ok(out)
 }
 
+/// Puts `list` in the order profiles were added and returns that order to record. Names in
+/// `order` keep their place whatever happens to their files; names not listed are dropped;
+/// new ones go last, oldest file or link first, then (as `list` gives them) by name.
+pub fn arrange(list: &mut [Profile], order: &[String]) -> Vec<String> {
+    list.sort_by_cached_key(|p| match order.iter().position(|n| *n == p.name) {
+        Some(i) => (i, None),
+        None => (
+            order.len(),
+            fs::symlink_metadata(&p.path).and_then(|m| m.created()).ok(),
+        ),
+    });
+    list.iter().map(|p| p.name.clone()).collect()
+}
+
 pub fn profile_path(paths: &Paths, name: &str) -> Result<PathBuf> {
     list(paths)?
         .into_iter()
@@ -838,5 +852,25 @@ mod tests {
         let before = current_fingerprint(&paths, "p").unwrap();
         fs::write(paths.overrides(), "log-level: info\n").unwrap();
         assert_ne!(current_fingerprint(&paths, "p").unwrap(), before);
+    }
+
+    #[test]
+    fn arrange_keeps_recorded_places_and_adds_new_profiles_oldest_first() {
+        let paths = temp_paths("arrange");
+        for name in ["c", "b", "a"] {
+            fs::write(paths.profiles().join(format!("{name}.yaml")), "a: 1\n").unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let names = |list: &[Profile]| list.iter().map(|p| p.name.clone()).collect::<Vec<_>>();
+
+        // Nothing recorded yet (an upgrade): creation time decides, not the name.
+        let mut listed = list(&paths).unwrap();
+        assert_eq!(arrange(&mut listed, &[]), ["c", "b", "a"]);
+
+        // Recorded names keep their place, a gone one is dropped, and new ones follow.
+        let mut listed = list(&paths).unwrap();
+        let order = ["a".to_owned(), "gone".to_owned()];
+        assert_eq!(arrange(&mut listed, &order), ["a", "c", "b"]);
+        assert_eq!(names(&listed), ["a", "c", "b"]);
     }
 }
