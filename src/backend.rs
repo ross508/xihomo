@@ -4,7 +4,7 @@ use crate::api::{Api, Connection, Group, LineSplitter, LogBuffer, LogLine, parse
 use crate::core::{self, Core};
 use crate::profiles::{self, Profile};
 use crate::proxy;
-use crate::settings::{self, AppData, Paths, Settings, Theme, write_private};
+use crate::settings::{self, AppData, LogLevel, Paths, Settings, Theme, write_private};
 use crate::update::{self, Release};
 use anyhow::{Context, Result, anyhow, bail};
 use std::collections::BTreeMap;
@@ -109,6 +109,7 @@ pub struct Snapshot {
     pub icon_set: String,
     pub theme: Theme,
     pub keep_dock_icon: bool,
+    pub log_level: LogLevel,
     pub mixed_port: u16,
     pub controller_port: u16,
     pub allow_lan: bool,
@@ -160,6 +161,7 @@ pub enum Cmd {
     SetIconSet(String),
     SetTheme(Theme),
     SetKeepDockIcon(bool),
+    SetLogLevel(LogLevel),
     /// Ports arrive as typed, up to five digits; the backend validates them.
     SetProxyPort(u32),
     SetAllowLan(bool),
@@ -201,7 +203,8 @@ impl Cmd {
             | Cmd::ActivateVersion(_)
             | Cmd::DeleteVersion(_)
             | Cmd::Checked(_)
-            | Cmd::Staged(_) => Area::Update,
+            | Cmd::Staged(_)
+            | Cmd::SetLogLevel(_) => Area::Update,
             Cmd::SetIconSet(_) | Cmd::SetTheme(_) | Cmd::SetKeepDockIcon(_) => Area::Files,
             Cmd::SetProxyPort(_) | Cmd::SetAllowLan(_) => Area::Listen,
             Cmd::SetApiPort(_) | Cmd::RegenerateSecret => Area::Api,
@@ -455,6 +458,7 @@ impl Actor {
         self.snap.icon_set = self.settings.icon_set.clone();
         self.snap.theme = self.settings.theme;
         self.snap.keep_dock_icon = self.settings.keep_dock_icon;
+        self.snap.log_level = self.settings.log_level;
         self.snap.mixed_port = self.settings.mixed_port;
         self.snap.controller_port = self.settings.controller_port;
         self.snap.allow_lan = self.settings.allow_lan;
@@ -596,6 +600,7 @@ impl Actor {
                 .map(|()| self.settings.icon_set = set),
             Cmd::SetTheme(theme) => Settings::write_key(&self.paths, "theme", theme)
                 .map(|()| self.settings.theme = theme),
+            Cmd::SetLogLevel(level) => self.set_log_level(level).await,
             Cmd::SetKeepDockIcon(on) => Settings::write_key(&self.paths, "keep_dock_icon", on)
                 .map(|()| self.settings.keep_dock_icon = on),
             Cmd::SetProxyPort(port) => self.set_proxy_port(port).await,
@@ -1159,6 +1164,22 @@ impl Actor {
     }
 
     /// Reload applies allow-lan and rebuilds the listeners; open connections stay.
+    /// Live, without a reload: the core's level and the Logs tab's stream both follow.
+    async fn set_log_level(&mut self, level: LogLevel) -> Result<()> {
+        if level == self.settings.log_level {
+            return Ok(());
+        }
+        Settings::write_key(&self.paths, "log_level", level)?;
+        self.settings.log_level = level;
+        if self.core.is_some() {
+            self.spawn_log_task();
+            self.api
+                .patch(serde_json::json!({ "log-level": level.as_str() }))
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn set_allow_lan(&mut self, on: bool) -> Result<()> {
         if on == self.settings.allow_lan {
             return Ok(());
@@ -1515,11 +1536,16 @@ impl Actor {
         self.refresh_runtime().await
     }
 
+    /// Replaces a running stream, so a new level takes effect at once.
     fn spawn_log_task(&mut self) {
+        if let Some(task) = self.log_task.take() {
+            task.abort();
+        }
         let (api, logs, log_tx) = (self.api.clone(), self.logs.clone(), self.log_tx.clone());
+        let level = self.settings.log_level.as_str();
         self.log_task = Some(tokio::task::spawn_local(async move {
             loop {
-                if let Ok(mut resp) = api.logs().await {
+                if let Ok(mut resp) = api.logs(level).await {
                     let mut splitter = LineSplitter::new(LOG_LINE_BYTES);
                     while let Ok(Some(chunk)) = resp.chunk().await {
                         let mut logs = logs.lock().unwrap();

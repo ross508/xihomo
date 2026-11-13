@@ -116,6 +116,48 @@ local_test!(start_control_stop, a, _rx, {
         .unwrap();
 });
 
+local_test!(
+    log_level_changes_the_running_core_without_a_restart,
+    a,
+    _rx,
+    {
+        a.handle(Cmd::Start).await;
+        assert_eq!(a.snap.phase, Phase::Running, "{:?}", a.snap.error());
+        let pid = a.core.as_ref().unwrap().pid();
+        let level = async |a: &Actor| {
+            let body: serde_json::Value = reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap()
+                .get(format!(
+                    "http://127.0.0.1:{}/configs",
+                    a.settings.controller_port
+                ))
+                .bearer_auth(&a.secret)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            body["log-level"].as_str().unwrap().to_owned()
+        };
+        assert_eq!(level(&a).await, "info");
+        a.handle(Cmd::SetLogLevel(LogLevel::Debug)).await;
+        assert!(
+            a.snap.message(Area::Update).is_none(),
+            "{}",
+            message(&a, Area::Update)
+        );
+        assert_eq!(level(&a).await, "debug");
+        assert_eq!(a.core.as_ref().unwrap().pid(), pid, "the same process");
+        a.publish();
+        assert_eq!(a.snap.log_level, LogLevel::Debug);
+        assert_eq!(saved_settings(&a).log_level, LogLevel::Debug);
+        a.handle(Cmd::Stop).await;
+    }
+);
+
 /// A tunnel through the core's mixed port to a loopback listener of the test's own, returned
 /// with the listener's end so neither closes early.
 async fn tunnel(a: &Actor) -> (std::net::TcpStream, std::net::TcpStream) {

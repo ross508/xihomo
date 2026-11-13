@@ -196,8 +196,7 @@ impl Api {
         })
     }
 
-    /// What a dashboard does to change the running core.
-    #[cfg(test)]
+    /// Changes the running core's settings, as a dashboard does.
     pub async fn patch(&self, body: Value) -> Result<()> {
         self.send(Method::PATCH, self.url(&["configs"]), Some(body))
             .await?;
@@ -308,9 +307,10 @@ impl Api {
     }
 
     /// Mihomo streams one JSON object per line over plain HTTP; no WebSocket is needed.
-    pub async fn logs(&self) -> Result<Response> {
+    /// Lines at `level` and above, whatever the core's own `log-level`, which gates only its stdout.
+    pub async fn logs(&self, level: &str) -> Result<Response> {
         let mut url = self.url(&["logs"]);
-        url.set_query(Some("level=info"));
+        url.set_query(Some(&format!("level={level}")));
         let resp = self
             .streaming
             .get(url)

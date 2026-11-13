@@ -1688,14 +1688,27 @@ impl AppState {
                 self.cmd(|| Cmd::CheckUpdate),
             ),
         };
-        column = column
-            .child(self.titled("Core", Area::Update, s.update_busy.clone(), p, cx))
-            .child(field(
-                "Versions",
-                versions,
-                Some(action.into_any_element()),
+        let mut levels = div().flex().flex_wrap().gap_1();
+        for (level, label) in [
+            (settings::LogLevel::Silent, "Silent"),
+            (settings::LogLevel::Error, "Error"),
+            (settings::LogLevel::Warning, "Warning"),
+            (settings::LogLevel::Info, "Info"),
+            (settings::LogLevel::Debug, "Debug"),
+        ] {
+            levels = levels.child(button(
+                format!("log-level-{}", level.as_str()),
+                label,
                 p,
+                s.log_level == level,
+                s.log_level != level,
+                self.cmd(move || Cmd::SetLogLevel(level)),
             ));
+        }
+        column = column
+            .child(self.titled("Runtime", Area::Update, s.update_busy.clone(), p, cx))
+            .child(field("Log Level", levels, None, p))
+            .child(field("Core", versions, Some(action.into_any_element()), p));
         div()
             .id("settings")
             .size_full()
@@ -3065,6 +3078,28 @@ mod gpui_tests {
     }
 
     #[gpui::test]
+    fn log_level_sits_above_core_under_runtime_and_follows_the_snapshot(cx: &mut TestAppContext) {
+        let mut ui = settings_tab(cx);
+        let top = |ui: &mut Ui, id| ui.cx.debug_bounds(id).unwrap().top();
+        assert!(top(&mut ui, "label-Log Level") < top(&mut ui, "label-Core"));
+        ui.click("log-level-info");
+        assert!(ui.sent().is_empty(), "already Info");
+        ui.click("log-level-debug");
+        assert!(matches!(
+            ui.sent()[..],
+            [Cmd::SetLogLevel(settings::LogLevel::Debug)]
+        ));
+        ui.snap(|s| s.log_level = settings::LogLevel::Debug);
+        ui.click("log-level-debug");
+        assert!(ui.sent().is_empty(), "already Debug");
+        ui.click("log-level-silent");
+        assert!(matches!(
+            ui.sent()[..],
+            [Cmd::SetLogLevel(settings::LogLevel::Silent)]
+        ));
+    }
+
+    #[gpui::test]
     fn dock_icon_choice_follows_the_snapshot_on_the_label_column(cx: &mut TestAppContext) {
         let mut ui = open(cx, running());
         ui.keys("cmd-4");
@@ -3541,7 +3576,8 @@ mod gpui_tests {
         for (label, ids) in [
             ("label-Secret", &["secret", "secret-show", "regenerate"][..]),
             ("label-Available To", &["lan-off"]),
-            ("label-Versions", &["check"]),
+            ("label-Core", &["check"]),
+            ("label-Log Level", &["log-level-silent"]),
         ] {
             let label = ui.cx.debug_bounds(label).unwrap();
             for id in ids {

@@ -1,4 +1,4 @@
-use crate::settings::{Paths, Settings};
+use crate::settings::{LogLevel, Paths, Settings};
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -17,6 +17,7 @@ const WRITTEN: &[&str] = &[
     "external-controller",
     "secret",
     "tun",
+    "log-level",
 ];
 
 /// Keys xihomo removes: other listeners, controllers and UIs it does not manage.
@@ -278,6 +279,7 @@ pub struct Runtime<'a> {
     pub secret: &'a str,
     /// The user's remembered mode, which beats the profile's and the overrides'.
     pub mode: Option<&'a str>,
+    pub log_level: LogLevel,
 }
 
 impl<'a> Runtime<'a> {
@@ -288,6 +290,7 @@ impl<'a> Runtime<'a> {
             allow_lan: settings.allow_lan,
             secret,
             mode,
+            log_level: settings.log_level,
         }
     }
 }
@@ -361,6 +364,7 @@ pub fn own(map: &mut Mapping, rt: &Runtime) -> Vec<String> {
     let mut tun = Mapping::new();
     tun.insert("enable".into(), false.into());
     map.insert("tun".into(), tun.into());
+    map.insert("log-level".into(), rt.log_level.as_str().into());
     if let Some(mode) = rt.mode {
         map.insert("mode".into(), mode.into());
     }
@@ -474,6 +478,7 @@ mod tests {
         allow_lan: false,
         secret: "s3",
         mode: None,
+        log_level: LogLevel::Info,
     };
 
     fn rt_default() -> Runtime<'static> {
@@ -490,19 +495,33 @@ mod tests {
     #[test]
     fn runtime_fields_beat_source_and_overrides_replace_whole_values() {
         let source = b"mixed-port: 7890\nexternal-controller: 0.0.0.0:9090\nsecret: old\nlog-level: debug\ndns: {enable: true, ipv6: true}\nrules: [\"MATCH,DIRECT\"]\n";
-        let c = compose(source, b"dns: {enable: false}\nlog-level: info\n", &RT).unwrap();
+        let debug = Runtime {
+            log_level: LogLevel::Debug,
+            ..RT
+        };
+        let c = compose(source, b"dns: {enable: false}\nlog-level: error\n", &debug).unwrap();
         let v = parsed(&c.yaml);
         assert_eq!(v["mixed-port"], Value::from(10999));
         assert_eq!(v["external-controller"].as_str(), Some("127.0.0.1:11000"));
         assert_eq!(v["secret"].as_str(), Some("s3"));
-        assert_eq!(v["log-level"].as_str(), Some("info"));
+        assert_eq!(
+            v["log-level"].as_str(),
+            Some("debug"),
+            "xihomo's, not the profile's"
+        );
         assert!(
             v["dns"].get("ipv6").is_none(),
             "mappings replace, never merge"
         );
         assert_eq!(v["rules"][0].as_str(), Some("MATCH,DIRECT"));
-        assert!(c.notices.is_empty());
-        assert_eq!(c.ignored, ["mixed-port", "external-controller", "secret"]);
+        assert_eq!(
+            c.notices,
+            ["overrides.yaml: log-level ignored (set by xihomo)"]
+        );
+        assert_eq!(
+            c.ignored,
+            ["mixed-port", "external-controller", "secret", "log-level"]
+        );
     }
 
     #[test]
@@ -540,14 +559,10 @@ mod tests {
         assert_eq!(v["mixed-port"], Value::from(10999));
         assert_eq!(v["secret"].as_str(), Some("s3"));
         assert!(v.get("port").is_none());
-        assert_eq!(
-            v["log-level"].as_str(),
-            Some("debug"),
-            "other keys still apply"
-        );
+        assert_eq!(v["log-level"].as_str(), Some("info"));
         assert_eq!(
             c.notices,
-            ["overrides.yaml: mixed-port, secret, port ignored (set by xihomo)"]
+            ["overrides.yaml: mixed-port, secret, port, log-level ignored (set by xihomo)"]
         );
         assert_eq!(c.ignored, ["mixed-port"], "only the profile's own keys");
     }
@@ -615,6 +630,7 @@ mod tests {
             allow_lan: true,
             secret: "new",
             mode: Some("global"),
+            log_level: LogLevel::Warning,
         };
         reown(&paths.last_good(), &now).unwrap();
         let v = parsed(&fs::read_to_string(paths.last_good()).unwrap());
@@ -623,7 +639,7 @@ mod tests {
         assert_eq!(v["secret"].as_str(), Some("new"));
         assert_eq!(v["allow-lan"], Value::from(true));
         assert_eq!(v["mode"].as_str(), Some("global"));
-        assert_eq!(v["log-level"].as_str(), Some("debug"));
+        assert_eq!(v["log-level"].as_str(), Some("warning"));
     }
 
     #[test]
