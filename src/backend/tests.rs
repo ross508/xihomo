@@ -1781,3 +1781,33 @@ async fn busy_is_published_before_a_user_command_runs_and_cleared_after() {
         "left to the user command that raised it"
     );
 }
+
+local_test!(
+    startup_errors_reach_logs_although_the_stream_starts_later,
+    a,
+    _rx,
+    {
+        // A DNS port someone else holds: Mihomo starts anyway and only logs it.
+        let port = spare(&a, 1);
+        let _udp = std::net::UdpSocket::bind(("127.0.0.1", port)).unwrap();
+        let _tcp = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let profile = format!("{GOOD}dns: {{enable: true, listen: '127.0.0.1:{port}'}}\n");
+        fs::write(a.paths.profiles().join("good.yaml"), profile).unwrap();
+        a.handle(Cmd::Start).await;
+        assert_eq!(a.snap.phase, Phase::Running, "{:?}", a.snap.error());
+        let logs: Vec<(String, String)> = a
+            .logs
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|l| (l.level.to_string(), l.text.to_string()))
+            .collect();
+        assert!(
+            logs.iter()
+                .any(|(level, text)| level == "error"
+                    && text.starts_with("Start DNS server(UDP) error")),
+            "{logs:?}"
+        );
+        a.handle(Cmd::Stop).await;
+    }
+);

@@ -1,4 +1,4 @@
-use crate::api::LineSplitter;
+use crate::api::{LineSplitter, LogLine};
 use crate::settings::{Paths, write_private};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -262,27 +262,62 @@ pub async fn recover_orphan(paths: &Paths) -> Result<bool> {
     Ok(same)
 }
 
+/// A warning or error from Mihomo's console output (`time=… level=error msg="…"`), as the
+/// Logs tab shows the live stream's.
+fn console_issue(line: &str) -> Option<LogLine> {
+    let level = match line.split(' ').find_map(|f| f.strip_prefix("level="))? {
+        "warning" => "warning",
+        "error" | "fatal" | "panic" => "error",
+        _ => return None,
+    };
+    let msg = line.split_once(" msg=")?.1;
+    let text = match msg.strip_prefix('"').and_then(|m| m.strip_suffix('"')) {
+        Some(quoted) => quoted.replace("\\\"", "\"").replace("\\\\", "\\"),
+        None => msg.to_owned(),
+    };
+    Some(LogLine {
+        level: level.into(),
+        text: text.into(),
+    })
+}
+
+type Lines<T> = Arc<Mutex<VecDeque<T>>>;
+
+fn push_bounded<T>(lines: &Lines<T>, line: T) {
+    let mut lines = lines.lock().unwrap();
+    if lines.len() == TAIL_LINES {
+        lines.pop_front();
+    }
+    lines.push_back(line);
+}
+
 /// The owned child. Dropping it kills the process (`kill_on_drop`).
 pub struct Core {
     child: Child,
     pid: i32,
     pub home: PathBuf,
-    tail: Arc<Mutex<VecDeque<String>>>,
+    tail: Lines<String>,
+    /// Warnings and errors kept apart, so a long startup does not push them out of `tail`.
+    issues: Lines<LogLine>,
     journal: PathBuf,
 }
 
 /// Reads raw bytes so neither invalid UTF-8 nor a huge line can stop draining and block the child.
-fn drain(mut stream: impl AsyncRead + Unpin + 'static, tail: Arc<Mutex<VecDeque<String>>>) {
+fn drain(
+    mut stream: impl AsyncRead + Unpin + 'static,
+    tail: Lines<String>,
+    issues: Lines<LogLine>,
+) {
     tokio::task::spawn_local(async move {
         let mut splitter = LineSplitter::new(TAIL_LINE_BYTES);
         let mut buf = [0u8; 8192];
         while let Ok(n @ 1..) = stream.read(&mut buf).await {
-            let mut tail = tail.lock().unwrap();
             splitter.feed(&buf[..n], |line| {
-                if tail.len() == TAIL_LINES {
-                    tail.pop_front();
+                let line = String::from_utf8_lossy(line).into_owned();
+                if let Some(issue) = console_issue(&line) {
+                    push_bounded(&issues, issue);
                 }
-                tail.push_back(String::from_utf8_lossy(line).into_owned());
+                push_bounded(&tail, line);
             });
         }
     });
@@ -311,14 +346,24 @@ impl Core {
                 exe: exe.to_owned(),
             })?,
         )?;
-        let tail = Arc::new(Mutex::new(VecDeque::new()));
-        drain(child.stdout.take().context("core stdout")?, tail.clone());
-        drain(child.stderr.take().context("core stderr")?, tail.clone());
+        let tail = Lines::default();
+        let issues = Lines::default();
+        drain(
+            child.stdout.take().context("core stdout")?,
+            tail.clone(),
+            issues.clone(),
+        );
+        drain(
+            child.stderr.take().context("core stderr")?,
+            tail.clone(),
+            issues.clone(),
+        );
         Ok(Self {
             child,
             pid,
             home: home.to_owned(),
             tail,
+            issues,
             journal,
         })
     }
@@ -334,6 +379,11 @@ impl Core {
     /// The drain tasks run concurrently; give them a moment to read what a dead child last wrote.
     pub async fn settle_output(&self) {
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    /// The warnings and errors printed so far, each handed out once.
+    pub fn take_issues(&self) -> Vec<LogLine> {
+        self.issues.lock().unwrap().drain(..).collect()
     }
 
     /// Recent core output, used to explain startup failures and unexpected exits.
@@ -383,6 +433,37 @@ pub(crate) mod tests {
         assert_eq!(rejection_reason(out), "proxy group[0]: bad");
         assert_eq!(rejection_reason("a\nb\nc\nd\n"), "b c d");
         assert_eq!(rejection_reason(""), "");
+    }
+
+    #[test]
+    fn console_warnings_and_errors_become_log_lines() {
+        let issue =
+            |line: &str| console_issue(line).map(|l| (l.level.to_string(), l.text.to_string()));
+        assert_eq!(
+            issue(
+                r#"time="2026-11-15T15:00:12+08:00" level=error msg="Start DNS server(UDP) error: listen udp :53: bind: address already in use""#
+            ),
+            Some((
+                "error".into(),
+                "Start DNS server(UDP) error: listen udp :53: bind: address already in use".into()
+            ))
+        );
+        assert_eq!(
+            issue(r#"time="t" level=warning msg="[CacheFile] can't open \"cache.db\"""#),
+            Some((
+                "warning".into(),
+                r#"[CacheFile] can't open "cache.db""#.into()
+            ))
+        );
+        assert_eq!(
+            issue(r#"time="t" level=fatal msg=boom"#),
+            Some(("error".into(), "boom".into()))
+        );
+        assert_eq!(
+            issue(r#"time="t" level=info msg="Mixed(http+socks) proxy listening""#),
+            None
+        );
+        assert_eq!(issue("configuration file test failed"), None);
     }
 
     #[test]

@@ -1059,6 +1059,16 @@ impl Actor {
         };
         match ready {
             Ok(()) => {
+                // The live stream starts only now, and Mihomo does not replay what it said while
+                // starting: a port in use, say, would never reach Logs.
+                let issues = core.take_issues();
+                if !issues.is_empty() {
+                    let mut logs = self.logs.lock().unwrap();
+                    for line in issues {
+                        logs.push(line);
+                    }
+                    self.log_tx.send_replace(logs.generation);
+                }
                 self.core = Some(core);
                 self.spawn_log_task();
                 self.reconcile_connection_task();
