@@ -1811,3 +1811,46 @@ local_test!(
         a.handle(Cmd::Stop).await;
     }
 );
+
+local_test!(
+    a_dns_port_another_process_holds_is_reported_with_lan_access,
+    a,
+    _rx,
+    {
+        let (taken, free) = (spare(&a, 1), spare(&a, 2));
+        let udp = std::net::UdpSocket::bind(("127.0.0.1", taken)).unwrap();
+        let tcp = std::net::TcpListener::bind(("127.0.0.1", taken)).unwrap();
+        let profile = |port| format!("{GOOD}dns: {{enable: true, listen: '127.0.0.1:{port}'}}\n");
+        let shown = |a: &mut Actor| {
+            a.publish();
+            a.snap.dns_port_taken
+        };
+        fs::write(a.paths.profiles().join("good.yaml"), profile(taken)).unwrap();
+        a.handle(Cmd::Start).await;
+        assert_eq!(a.snap.phase, Phase::Running, "{:?}", a.snap.error());
+        assert_eq!(shown(&mut a), None, "only with LAN access");
+        a.handle(Cmd::SetAllowLan(true)).await;
+        assert_eq!(shown(&mut a), Some(taken));
+
+        // Freed now, but a reload with the same listen does not bind again, as Mihomo's source says.
+        drop((udp, tcp));
+        a.handle(Cmd::Reload).await;
+        assert_eq!(shown(&mut a), Some(taken), "{:?}", a.snap.error());
+        assert!(
+            std::net::TcpStream::connect(("127.0.0.1", taken)).is_err(),
+            "still nobody there"
+        );
+
+        // A new listen binds again.
+        fs::write(a.paths.profiles().join("good.yaml"), profile(free)).unwrap();
+        a.handle(Cmd::Reload).await;
+        assert_eq!(shown(&mut a), None, "{:?}", a.snap.error());
+        assert!(
+            std::net::TcpStream::connect(("127.0.0.1", free)).is_ok(),
+            "the core serves it"
+        );
+        a.handle(Cmd::SetAllowLan(false)).await;
+        a.handle(Cmd::Stop).await;
+        assert_eq!(shown(&mut a), None);
+    }
+);

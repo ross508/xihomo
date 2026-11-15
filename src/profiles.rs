@@ -447,6 +447,21 @@ pub fn compose(source: &[u8], overrides: &[u8], rt: &Runtime) -> Result<Composed
     })
 }
 
+/// Where a composed file's DNS server listens: with `dns.enable` and a `listen` with a port.
+pub fn dns_listen(file: &Path) -> Option<String> {
+    let map = mapping(&read_bounded(file).ok()?, "config").ok()?;
+    let dns = map.get("dns")?;
+    if dns.get("enable")?.as_bool() != Some(true) {
+        return None;
+    }
+    let listen = dns.get("listen")?.as_str()?;
+    listen_port(listen).map(|_| listen.to_owned())
+}
+
+pub fn listen_port(listen: &str) -> Option<u16> {
+    listen.rsplit_once(':')?.1.parse().ok().filter(|&p| p != 0)
+}
+
 /// Writes the owned fields into `last-good.yaml` again, with the current settings.
 pub fn reown(path: &Path, rt: &Runtime) -> Result<()> {
     let mut map = mapping(&read_bounded(path)?, "last-good.yaml")?;
@@ -583,6 +598,29 @@ mod tests {
         assert_eq!(on["dns"]["nameserver"][0].as_str(), Some("1.1.1.1"));
         let bare = parsed(&compose(b"mode: direct\n", b"", &rt).unwrap().yaml);
         assert_eq!(bare["dns"], parsed("{enable: true}"));
+    }
+
+    #[test]
+    fn the_dns_port_comes_from_an_enabled_listen() {
+        let paths = temp_paths("dns-port");
+        let port = |yaml: &str| {
+            let file = paths.runtime().join("c.yaml");
+            fs::write(&file, yaml).unwrap();
+            dns_listen(&file).and_then(|l| listen_port(&l))
+        };
+        assert_eq!(port("dns: {enable: true, listen: ':53'}\n"), Some(53));
+        assert_eq!(
+            port("dns: {enable: true, listen: '0.0.0.0:1053'}\n"),
+            Some(1053)
+        );
+        assert_eq!(
+            port("dns: {enable: true, listen: '[::]:5353'}\n"),
+            Some(5353)
+        );
+        assert_eq!(port("dns: {enable: false, listen: ':53'}\n"), None);
+        assert_eq!(port("dns: {enable: true}\n"), None, "no server");
+        assert_eq!(port("dns: {enable: true, listen: ':0'}\n"), None);
+        assert_eq!(port("mode: rule\n"), None);
     }
 
     #[test]

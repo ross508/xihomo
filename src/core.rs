@@ -10,6 +10,7 @@ use std::net::{Ipv4Addr, TcpListener};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -299,7 +300,14 @@ pub struct Core {
     tail: Lines<String>,
     /// Warnings and errors kept apart, so a long startup does not push them out of `tail`.
     issues: Lines<LogLine>,
+    /// How many times the DNS server found its port held by another process.
+    dns_taken: Arc<AtomicU32>,
     journal: PathBuf,
+}
+
+/// Mihomo's line for a DNS listener whose port another process holds. It keeps running.
+fn dns_port_taken(issue: &LogLine) -> bool {
+    issue.text.starts_with("Start DNS server(") && issue.text.contains("address already in use")
 }
 
 /// Reads raw bytes so neither invalid UTF-8 nor a huge line can stop draining and block the child.
@@ -307,6 +315,7 @@ fn drain(
     mut stream: impl AsyncRead + Unpin + 'static,
     tail: Lines<String>,
     issues: Lines<LogLine>,
+    dns_taken: Arc<AtomicU32>,
 ) {
     tokio::task::spawn_local(async move {
         let mut splitter = LineSplitter::new(TAIL_LINE_BYTES);
@@ -315,6 +324,9 @@ fn drain(
             splitter.feed(&buf[..n], |line| {
                 let line = String::from_utf8_lossy(line).into_owned();
                 if let Some(issue) = console_issue(&line) {
+                    if dns_port_taken(&issue) {
+                        dns_taken.fetch_add(1, Ordering::SeqCst);
+                    }
                     push_bounded(&issues, issue);
                 }
                 push_bounded(&tail, line);
@@ -348,15 +360,18 @@ impl Core {
         )?;
         let tail = Lines::default();
         let issues = Lines::default();
+        let dns_taken = Arc::new(AtomicU32::new(0));
         drain(
             child.stdout.take().context("core stdout")?,
             tail.clone(),
             issues.clone(),
+            dns_taken.clone(),
         );
         drain(
             child.stderr.take().context("core stderr")?,
             tail.clone(),
             issues.clone(),
+            dns_taken.clone(),
         );
         Ok(Self {
             child,
@@ -364,6 +379,7 @@ impl Core {
             home: home.to_owned(),
             tail,
             issues,
+            dns_taken,
             journal,
         })
     }
@@ -379,6 +395,11 @@ impl Core {
     /// The drain tasks run concurrently; give them a moment to read what a dead child last wrote.
     pub async fn settle_output(&self) {
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    /// How many times it has said so far that its DNS port was in use.
+    pub fn dns_taken(&self) -> u32 {
+        self.dns_taken.load(Ordering::SeqCst)
     }
 
     /// The warnings and errors printed so far, each handed out once.
@@ -464,6 +485,16 @@ pub(crate) mod tests {
             None
         );
         assert_eq!(issue("configuration file test failed"), None);
+        let taken = |line: &str| console_issue(line).is_some_and(|l| dns_port_taken(&l));
+        assert!(taken(
+            r#"time="t" level=error msg="Start DNS server(TCP) error: listen tcp :53: bind: address already in use""#
+        ));
+        assert!(!taken(
+            r#"time="t" level=error msg="Start DNS server(UDP) error: listen udp :53: bind: permission denied""#
+        ));
+        assert!(!taken(
+            r#"time="t" level=error msg="Start Mixed(http+socks) server error: address already in use""#
+        ));
     }
 
     #[test]

@@ -223,6 +223,8 @@ pub struct Snapshot {
     /// TUN is asked for, but the selected core file is not authorized to run as root.
     pub tun_needs_auth: bool,
     pub tun_stack: TunStack,
+    /// With LAN access on: the running profile's DNS port, while another process holds it.
+    pub dns_port_taken: Option<u16>,
     /// At most one message per topic; a later user command of that topic clears it.
     pub messages: BTreeMap<Topic, Message>,
     pub icon_set: String,
@@ -529,6 +531,10 @@ struct Actor {
     /// Services that got our proxy, so ones appearing later can be added.
     proxied: Vec<String>,
     read_proxy: fn(&[u16]) -> proxy::State,
+    /// Where the running core's DNS server listens, and whether it found that port taken. Mihomo
+    /// binds again only when `listen` changes, so the result holds until then.
+    dns_listen: Option<String>,
+    dns_taken: bool,
     /// Whether the next start or reload composes with TUN. `app.tun_on` is what the user asked.
     tun: bool,
     /// Asks for administrator rights; blocking. Tests replace it.
@@ -614,6 +620,8 @@ impl Actor {
             } else {
                 proxy::state
             },
+            dns_listen: None,
+            dns_taken: false,
             tun: false,
             authorize: core::authorize,
             switching_from: None,
@@ -677,6 +685,11 @@ impl Actor {
         self.snap.keep_dock_icon = self.settings.keep_dock_icon;
         self.snap.log_level = self.settings.log_level;
         self.snap.tun_stack = self.settings.tun_stack;
+        self.snap.dns_port_taken = self
+            .dns_listen
+            .as_deref()
+            .and_then(profiles::listen_port)
+            .filter(|_| self.dns_taken && self.settings.allow_lan && self.core.is_some());
         self.snap.tun_needs_auth = self.app.tun_on
             && self.snap.tun_device.is_none()
             && self
@@ -1076,6 +1089,14 @@ impl Actor {
                 // "The core is not running" no longer holds.
                 self.clear(Topic::Groups);
                 self.check_tun().await;
+                self.dns_listen = profiles::dns_listen(file);
+                if let Some(core) = &self.core {
+                    if self.dns_listen.is_some() {
+                        // It binds while starting; give that line a moment to be read.
+                        core.settle_output().await;
+                    }
+                    self.dns_taken = core.dns_taken() > 0;
+                }
                 Ok(())
             }
             Err(e) => {
@@ -1229,6 +1250,8 @@ impl Actor {
         self.snap.groups.clear();
         self.snap.nodes.clear();
         self.snap.tun_device = None;
+        self.dns_listen = None;
+        self.dns_taken = false;
         self.snap.edited = false;
         self.fingerprint = None;
     }
@@ -1534,9 +1557,20 @@ impl Actor {
 
     async fn reload_running(&mut self) -> Result<()> {
         self.new_epoch();
+        let listen = profiles::dns_listen(&self.paths.candidate());
+        let taken_before = self.core.as_ref().map_or(0, Core::dns_taken);
         self.api.reload(&self.paths.candidate()).await?;
         self.confirm_ports().await?;
         self.check_tun().await;
+        if listen != self.dns_listen
+            && let Some(core) = &self.core
+        {
+            if listen.is_some() {
+                core.settle_output().await;
+            }
+            self.dns_taken = core.dns_taken() > taken_before;
+            self.dns_listen = listen;
+        }
         Ok(())
     }
 

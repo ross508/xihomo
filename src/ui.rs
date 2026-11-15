@@ -132,6 +132,8 @@ pub struct AppState {
     latency_url: PortField,
     /// The secret is shown in full; hidden again on a tab change or when the window closes.
     secret_shown: bool,
+    /// The icon whose note is open. A click anywhere else closes it.
+    note: Option<&'static str>,
     /// The button waiting for its confirming click, and the timer token that may disarm it.
     confirm: Option<(String, u64)>,
     /// "Copied" next to a section title.
@@ -341,6 +343,13 @@ fn status_text(s: &Snapshot) -> String {
     }
 }
 
+/// The tooltip of the warning beside the LAN address.
+fn dns_port_text(port: u16) -> String {
+    format!(
+        "This profile's DNS port {port} is in use by another app, so other devices can't use the core for DNS."
+    )
+}
+
 /// The TUN button's label and whether it is enabled. It shows what `/configs` reports, not the
 /// remembered choice, so a TUN asked for but not running reads Off.
 fn tun_button(s: &Snapshot) -> (&'static str, bool) {
@@ -430,6 +439,8 @@ enum Icon {
     Bolt,
     /// An `i` in a ring: more about the line it ends.
     Info,
+    /// A `!` cut out of a triangle: a problem with the line it ends.
+    Warning,
 }
 
 fn symbol(icon: Icon, color: Hsla) -> gpui::Canvas<()> {
@@ -578,6 +589,22 @@ fn symbol(icon: Icon, color: Hsla) -> gpui::Canvas<()> {
                     fills.push(disc(7., 4.2, 1.));
                     strokes.push(line(&[(7., 6.4), (7., 10.4)]));
                 }
+                // The `!` is a second and third outline in the triangle's path, and the even-odd
+                // fill rule (the default) leaves them out.
+                Icon::Warning => {
+                    let mut sign = PathBuilder::fill();
+                    sign.add_polygon(&[at(7., 1.), at(13.6, 12.8), at(0.4, 12.8)], true);
+                    sign.add_polygon(
+                        &[at(6.2, 4.6), at(7.8, 4.6), at(7.6, 8.8), at(6.4, 8.8)],
+                        true,
+                    );
+                    let radii = point(unit * 0.9, unit * 0.9);
+                    sign.move_to(at(6.1, 10.6));
+                    sign.arc_to(radii, px(0.), false, true, at(7.9, 10.6));
+                    sign.arc_to(radii, px(0.), false, true, at(6.1, 10.6));
+                    sign.close();
+                    fills.push(sign);
+                }
                 Icon::Confirm => {
                     let mut check = PathBuilder::stroke(unit * 1.8);
                     check.add_polygon(&[at(2.8, 7.4), at(5.8, 10.4), at(11.4, 3.8)], false);
@@ -617,18 +644,22 @@ struct Tip {
 
 impl Render for Tip {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .px_2()
-            .py_1()
-            .rounded(px(5.))
-            .border_1()
-            .border_color(self.p.border)
-            .bg(self.p.panel)
-            .shadow_md()
-            .text_size(px(11.))
-            .text_color(self.p.text)
-            .child(self.text.clone())
+        tip_box(self.text.clone(), self.p)
     }
+}
+
+fn tip_box(text: SharedString, p: Palette) -> gpui::Div {
+    div()
+        .px_2()
+        .py_1()
+        .rounded(px(5.))
+        .border_1()
+        .border_color(p.border)
+        .bg(p.panel)
+        .shadow_md()
+        .text_size(px(11.))
+        .text_color(p.text)
+        .child(text)
 }
 
 /// A borderless button for secondary actions: accent text, a background only under the pointer.
@@ -946,6 +977,7 @@ impl AppState {
             api_port,
             latency_url,
             secret_shown: false,
+            note: None,
             confirm: None,
             copied: None,
             timers: 0,
@@ -1469,6 +1501,7 @@ impl AppState {
     pub fn set_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
         self.tab = tab;
         self.secret_shown = false;
+        self.note = None;
         self.sync_visibility();
         self.rebuild_logs();
         cx.notify();
@@ -2452,27 +2485,62 @@ impl AppState {
             .items_center()
             .gap_1()
             .child(
-                div()
-                    .id("profiles-info")
-                    .debug_selector(|| "profiles-info".to_owned())
-                    // The hover area reaches 6px past the 11px icon; the margins keep the line
-                    // laid out as if it held the icon alone.
-                    .size(px(23.))
-                    .p(px(6.))
-                    .m(px(-6.))
-                    .tooltip(move |_, cx| {
-                        let text = "Ports, API, LAN access and TUN come from xihomo. \
-                                        Profiles cannot change them."
-                            .into();
-                        cx.new(|_| Tip { text, p }).into()
-                    })
-                    .child(symbol(Icon::Info, p.dim.opacity(0.8)).size_full()),
+                self.note_icon(
+                    "profiles-info",
+                    "Ports, API, LAN access and TUN come from xihomo. Profiles cannot change them.",
+                    p,
+                    cx,
+                )
+                // The hover area reaches 6px past the 11px icon; the margins keep the line
+                // laid out as if it held the icon alone.
+                .size(px(23.))
+                .p(px(6.))
+                .m(px(-6.))
+                .child(symbol(Icon::Info, p.dim.opacity(0.8)).size_full()),
             ),
         )
     }
 }
 
 impl AppState {
+    /// An icon that explains itself in a note under it on a click, not on hover.
+    fn note_icon(
+        &self,
+        id: &'static str,
+        text: impl Into<SharedString>,
+        p: Palette,
+        cx: &mut Context<Self>,
+    ) -> Stateful<gpui::Div> {
+        let icon = div()
+            .id(id)
+            .debug_selector(move || id.to_owned())
+            .relative()
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.note = (this.note != Some(id)).then_some(id);
+                cx.notify();
+            }));
+        if self.note != Some(id) {
+            return icon;
+        }
+        let note = tip_box(text.into(), p)
+            .debug_selector(|| "note".to_owned())
+            // A click on the note closes it and must not reach the controls under it.
+            .occlude()
+            .mt_1();
+        icon.on_mouse_down_out(cx.listener(|this, _, _, cx| {
+            this.note = None;
+            cx.notify();
+        }))
+        .child(
+            div()
+                .absolute()
+                .top_full()
+                .left_0()
+                .child(deferred(anchored().child(note))),
+        )
+    }
+
     /// The input, and Apply while the typed value differs from the saved one.
     fn port_controls(
         &mut self,
@@ -2610,6 +2678,18 @@ impl AppState {
                 Some(address) => choice.child(mono(address).ml_2()),
                 None => choice.child(div().ml_2().text_color(p.dim).child("No network")),
             };
+            if let Some(port) = s.dns_port_taken {
+                choice = choice.child(
+                    self.note_icon("dns-port-taken", dns_port_text(port), p, cx)
+                        // As tall as the buttons beside it, so the triangle sits on their centre
+                        // line, with a few pixels either side to hover.
+                        .h(CONTROL_HEIGHT)
+                        .px_1()
+                        .flex()
+                        .items_center()
+                        .child(symbol(Icon::Warning, p.warning).size(px(13.))),
+                );
+            }
         }
         column = column
             .child(field("Available To", choice, None, p))
@@ -3815,6 +3895,50 @@ mod gpui_tests {
         assert!(0. < halfway && halfway < 1., "{halfway}");
         ui.wait(BUSY_FADE);
         assert_eq!(fade(&mut ui), 0.);
+    }
+
+    #[gpui::test]
+    fn a_taken_dns_port_shows_a_warning_beside_the_lan_address(cx: &mut TestAppContext) {
+        let mut ui = settings_tab(cx);
+        ui.snap(|s| {
+            s.allow_lan = true;
+            s.lan_ip = Some(Ipv4Addr::new(192, 168, 1, 23));
+        });
+        assert!(ui.cx.debug_bounds("dns-port-taken").is_none());
+        ui.snap(|s| s.dns_port_taken = Some(1053));
+        assert!(ui.cx.debug_bounds("dns-port-taken").is_some());
+        assert_eq!(
+            dns_port_text(1053),
+            "This profile's DNS port 1053 is in use by another app, so other devices can't use the core for DNS."
+        );
+    }
+
+    #[gpui::test]
+    fn an_icon_shows_its_note_on_a_click_not_on_hover(cx: &mut TestAppContext) {
+        let mut ui = settings_tab(cx);
+        let icon = ui.cx.debug_bounds("profiles-info").unwrap().center();
+        ui.cx.simulate_mouse_move(icon, None, Modifiers::default());
+        ui.frame();
+        assert!(ui.cx.debug_bounds("note").is_none());
+        ui.click("profiles-info");
+        assert!(ui.cx.debug_bounds("note").is_some());
+        ui.click("profiles-info");
+        assert_eq!(ui.read(|a| a.note), None);
+        ui.click("profiles-info");
+        assert_eq!(ui.read(|a| a.note), Some("profiles-info"));
+        ui.click("theme-dark");
+        assert_eq!(ui.read(|a| a.note), None);
+    }
+
+    #[gpui::test]
+    fn no_dns_warning_without_lan_access(cx: &mut TestAppContext) {
+        let mut ui = settings_tab(cx);
+        ui.snap(|s| {
+            s.allow_lan = false;
+            s.lan_ip = Some(Ipv4Addr::new(192, 168, 1, 23));
+            s.dns_port_taken = Some(53);
+        });
+        assert!(ui.cx.debug_bounds("dns-port-taken").is_none());
     }
 
     #[gpui::test]
