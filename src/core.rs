@@ -135,24 +135,47 @@ const AUTHORIZE: [&str; 4] = [
     "end run",
 ];
 
-fn authorize_args(exe: &Path) -> Vec<OsString> {
-    let mut args: Vec<OsString> = AUTHORIZE
+/// The built-in core cannot carry the setuid bit inside the app, so it is copied out first.
+/// `-X` leaves out the source's extended attributes. A copy made from a quarantined app is still
+/// quarantined, because macOS marks what that app's processes write, but with the app's own
+/// record, which Open Anyway already approved.
+const AUTHORIZE_COPY: [&str; 6] = [
+    "on run argv",
+    "set s to quoted form of item 1 of argv",
+    "set d to quoted form of item 2 of argv",
+    "set p to quoted form of item 3 of argv",
+    "do shell script \"/bin/mkdir -p \" & d & \" && /bin/cp -X \" & s & \" \" & p & \" && /usr/sbin/chown root:wheel \" & p & \" && /bin/chmod 4755 \" & p with prompt \"xihomo needs administrator rights so Mihomo can turn on TUN.\" with administrator privileges",
+    "end run",
+];
+
+fn authorize_args(exe: &Path, from: Option<&Path>) -> Vec<OsString> {
+    let script: &[&str] = if from.is_some() {
+        &AUTHORIZE_COPY
+    } else {
+        &AUTHORIZE
+    };
+    let mut args: Vec<OsString> = script
         .iter()
         .flat_map(|line| ["-e".into(), (*line).into()])
         .collect();
+    if let Some(from) = from {
+        args.push(from.into());
+        args.push(exe.parent().unwrap_or(exe).into());
+    }
     args.push(exe.into());
     args
 }
 
 /// The only place xihomo asks for administrator rights: makes `exe` setuid root, once per core
-/// file. Blocking while the dialog is open. `false` when the user cancelled.
-pub fn authorize(exe: &Path) -> Result<bool> {
+/// file, after copying it from `from` when given. Blocking while the dialog is open. `false` when
+/// the user cancelled.
+pub fn authorize(exe: &Path, from: Option<&Path>) -> Result<bool> {
     // Layer 1 tests must never ask for a password or change an owner.
     if cfg!(test) {
         panic!("test tried to authorize {}", exe.display());
     }
     let output = std::process::Command::new("/usr/bin/osascript")
-        .args(authorize_args(exe))
+        .args(authorize_args(exe, from))
         .output()
         .context("cannot run osascript")?;
     if output.status.success() {
@@ -515,7 +538,7 @@ pub(crate) mod tests {
     #[test]
     fn the_authorization_passes_the_path_as_an_argument() {
         let exe = Path::new("/Users/a b/it's \"x\"/v1/mihomo");
-        let args = authorize_args(exe);
+        let args = authorize_args(exe, None);
         assert_eq!(args.last().unwrap(), exe.as_os_str(), "passed unchanged");
         let script: Vec<&str> = args[..args.len() - 1]
             .chunks(2)
@@ -534,6 +557,32 @@ pub(crate) mod tests {
             !script.concat().contains("it's"),
             "the path is not in the script"
         );
+    }
+
+    #[test]
+    fn the_built_in_core_is_copied_out_and_authorized_in_one_prompt() {
+        let from = Path::new("/Applications/x y.app/Contents/MacOS/mihomo");
+        let exe = Path::new("/Users/a b/it's/bin/v1/mihomo");
+        let args = authorize_args(exe, Some(from));
+        let n = args.len();
+        assert_eq!(
+            &args[n - 3..],
+            [
+                from.as_os_str(),
+                Path::new("/Users/a b/it's/bin/v1").as_os_str(),
+                exe.as_os_str()
+            ],
+            "source, directory and copy, passed unchanged"
+        );
+        let script: Vec<&str> = args[..n - 3]
+            .chunks(2)
+            .map(|pair| pair[1].to_str().unwrap())
+            .collect();
+        assert_eq!(script, AUTHORIZE_COPY);
+        assert!(script[4].starts_with(
+            "do shell script \"/bin/mkdir -p \" & d & \" && /bin/cp -X \" & s & \" \" & p & \" && /usr/sbin/chown root:wheel \" & p & \" && /bin/chmod 4755 \" & p "
+        ));
+        assert!(!script.concat().contains("it's"));
     }
 
     #[test]

@@ -203,7 +203,10 @@ pub struct Snapshot {
     pub phase: Phase,
     pub core_version: Option<String>,
     pub previous_version: Option<String>,
+    /// Every version that resolves: the downloads and the built-in one.
     pub installed: Vec<String>,
+    /// The app bundle's own core version, which cannot be deleted.
+    pub builtin: Option<String>,
     pub profiles: Vec<Profile>,
     pub active: Option<String>,
     /// The active profile or overrides changed on disk since activation; a reload is on offer.
@@ -538,7 +541,12 @@ struct Actor {
     /// Whether the next start or reload composes with TUN. `app.tun_on` is what the user asked.
     tun: bool,
     /// Asks for administrator rights; blocking. Tests replace it.
-    authorize: fn(&Path) -> Result<bool>,
+    authorize: fn(&Path, Option<&Path>) -> Result<bool>,
+    /// The app bundle's core. Tests supply a fake one.
+    builtin: Option<update::Builtin>,
+    /// An app update brought a newer built-in core, but the running TUN needs its setuid copy
+    /// first: asked once, after the launch restore.
+    builtin_waits: bool,
     /// The previous proxy port while the system proxy moves off it; it still counts as ours.
     switching_from: Option<u16>,
     next_message: u64,
@@ -574,12 +582,15 @@ impl Actor {
         let first_run = !paths.app_data().exists();
         let (secret, regenerated) = paths.secret()?;
         let api = Api::new(settings.controller_port, &secret)?;
+        // Tests must not depend on how the test binary is bundled.
+        let builtin = if cfg!(test) { None } else { update::builtin() };
         // Arranged but not recorded: a failed listing here must not forget the order.
         let mut listed = profiles::list(&paths).unwrap_or_default();
         profiles::arrange(&mut listed, &app.profile_order);
         let snap = Snapshot {
             phase: Phase::Stopped,
-            installed: update::installed(&paths),
+            installed: update::versions(&paths, builtin.as_ref()),
+            builtin: builtin.as_ref().map(|b| b.version.clone()),
             profiles: listed,
             config_dir: paths.config.clone(),
             // Read at launch, before the first publish: the theme, menu bar icon and Dock.
@@ -624,6 +635,8 @@ impl Actor {
             dns_taken: false,
             tun: false,
             authorize: core::authorize,
+            builtin,
+            builtin_waits: false,
             switching_from: None,
             next_message: 0,
             epoch: 0,
@@ -700,7 +713,8 @@ impl Actor {
         self.snap.allow_lan = self.settings.allow_lan;
         self.snap.secret.clone_from(&self.secret);
         self.snap.latency_url.clone_from(&self.settings.latency_url);
-        self.snap.installed = update::installed(&self.paths);
+        self.snap.installed = update::versions(&self.paths, self.builtin.as_ref());
+        self.snap.builtin = self.builtin.as_ref().map(|b| b.version.clone());
         if self.core.is_none() {
             self.snap.mode = self.app.mode.clone().unwrap_or_default();
         }
@@ -733,10 +747,98 @@ impl Actor {
                 Err(e) => self.say(Topic::Core, format!("{e:#}"), true),
             }
         }
+        self.settle_builtin();
         self.refresh_profiles();
         self.read_proxy_state();
         // Queued, so the window shows the launch state before a core starts.
         let _ = self.tx.send(Cmd::Restore);
+    }
+
+    fn resolve(&self, version: &str) -> Option<PathBuf> {
+        update::resolve(&self.paths, self.builtin.as_ref(), version)
+    }
+
+    /// At launch, before the core starts: versions that left with an old app, the move to a new
+    /// app's core, and a download the built-in core duplicates.
+    fn settle_builtin(&mut self) {
+        let Some(builtin) = self.builtin.clone() else {
+            return;
+        };
+        let before = self.app.clone();
+        let resolves =
+            |a: &Self, v: &Option<String>| v.as_deref().is_some_and(|v| a.resolve(v).is_some());
+        if self.app.core_version.is_some() && !resolves(self, &self.app.core_version) {
+            self.app.core_version = Some(builtin.version.clone());
+        }
+        if !resolves(self, &self.app.previous_core_version) {
+            self.app.previous_core_version = None;
+        }
+        // Once per built-in version, and never to an older core.
+        if self.app.builtin_seen.as_ref() != Some(&builtin.version) {
+            self.app.builtin_seen = Some(builtin.version.clone());
+            let newer = self
+                .app
+                .core_version
+                .as_deref()
+                .is_none_or(|current| update::newer(&builtin.version, current));
+            // A running TUN keeps its setuid core until the new one has its own copy.
+            let tun_waits = self.app.tun_on
+                && self.exe().is_ok_and(|(exe, _)| core::authorized(&exe))
+                && !self
+                    .resolve(&builtin.version)
+                    .is_some_and(|exe| core::authorized(&exe));
+            if newer && tun_waits {
+                self.builtin_waits = true;
+            } else if newer {
+                self.app.previous_core_version =
+                    self.app.core_version.replace(builtin.version.clone());
+                self.log(
+                    false,
+                    &format!("Using the built-in core {}", builtin.version),
+                );
+            }
+        }
+        if self.app != before
+            && let Err(e) = self.app.save(&self.paths)
+        {
+            self.say(Topic::Core, format!("{e:#}"), true);
+        }
+        match update::remove_duplicate(&self.paths, &builtin) {
+            Ok(true) => self.log(
+                false,
+                &format!(
+                    "Removed the download of {}: the built-in core is the same file",
+                    builtin.version
+                ),
+            ),
+            Ok(false) => {}
+            Err(e) => self.log(true, &format!("{e:#}")),
+        }
+    }
+
+    /// After an app update moved a TUN user: the previous setuid core already runs, so the
+    /// network never waits for this prompt. Cancelled, the previous core keeps running, and
+    /// `builtin_seen` keeps the next launch from asking again.
+    async fn adopt_builtin(&mut self) {
+        let Some(builtin) = self.builtin.clone() else {
+            return;
+        };
+        let version = builtin.version;
+        let result = match self.authorize_core(&builtin.exe, &version).await {
+            Ok(true) => self.activate_version(&version).await,
+            Ok(false) => {
+                let text = format!(
+                    "The new core {version} is not in use yet, because authorization was cancelled. Choose it in Settings to use it"
+                );
+                self.say(Topic::Core, text, false);
+                return;
+            }
+            Err(e) => Err(e),
+        };
+        if let Err(e) = result {
+            let text = format!("The new core {version} is not in use yet: {e:#}");
+            self.say(Topic::Core, text, true);
+        }
     }
 
     fn log(&mut self, error: bool, text: &str) {
@@ -860,7 +962,7 @@ impl Actor {
             }
             Cmd::CheckUpdate => self.check_update(),
             Cmd::Download => match self.snap.latest.clone() {
-                Some(r) if update::installed(&self.paths).contains(&r.version) => {
+                Some(r) if self.resolve(&r.version).is_some() => {
                     self.activate_version(&r.version).await
                 }
                 _ => self.download(),
@@ -946,12 +1048,16 @@ impl Actor {
             && self.app.core_version.is_some()
             && self.app.active_profile.is_some()
         {
-            // Never a dialog nobody clicked for: xihomo may start at login.
+            // Never a dialog nobody clicked for: xihomo may start at login. The one exception
+            // follows below, once this core runs: an app update's new core for a TUN user.
             self.plan_tun(false).await;
             self.start().await
         } else {
             Ok(())
         };
+        if std::mem::take(&mut self.builtin_waits) {
+            self.adopt_builtin().await;
+        }
         let guarded = self.guard_proxy().await;
         started.and(guarded)
     }
@@ -962,7 +1068,10 @@ impl Actor {
             .core_version
             .clone()
             .context("No Mihomo core installed yet: use Settings → Check for Update")?;
-        Ok((self.paths.core_exe(&version), version))
+        let exe = self
+            .resolve(&version)
+            .unwrap_or_else(|| self.paths.core_exe(&version));
+        Ok((exe, version))
     }
 
     fn runtime(&self) -> profiles::Runtime<'_> {
@@ -1386,7 +1495,7 @@ impl Actor {
             self.say(Topic::Tun, text.to_owned(), true);
             return false;
         }
-        match self.authorize_core(exe).await {
+        match self.authorize_core(exe, version).await {
             Ok(true) => true,
             Ok(false) => {
                 self.app.tun_on = false;
@@ -1405,17 +1514,33 @@ impl Actor {
     }
 
     /// Off the actor thread, so the core's output keeps draining while the dialog is open.
-    async fn authorize_core(&mut self, exe: &Path) -> Result<bool> {
+    /// The built-in core cannot be setuid inside the app, so it is copied to `bin/<version>/`,
+    /// where the version resolves from then on. That directory is made as the user first, so
+    /// pruning can remove it without administrator rights.
+    async fn authorize_core(&mut self, exe: &Path, version: &str) -> Result<bool> {
+        let dest = self.paths.core_exe(version);
+        let from = (exe != dest).then(|| exe.to_owned());
+        let dir = self.paths.bin().join(version);
+        let made = from.is_some() && !dir.exists();
+        if made {
+            fs::create_dir(&dir).with_context(|| format!("create {}", dir.display()))?;
+        }
         self.snap.tun_busy = Some(TunBusy::Authorizing);
         self.publish();
-        let (authorize, file) = (self.authorize, exe.to_owned());
-        let result = tokio::task::spawn_blocking(move || authorize(&file)).await;
+        let (authorize, file) = (self.authorize, dest.clone());
+        let result = tokio::task::spawn_blocking(move || authorize(&file, from.as_deref())).await;
         self.snap.tun_busy = None;
-        let granted = result.context("authorization stopped")??;
+        let granted = result
+            .context("authorization stopped")
+            .and_then(|granted| granted);
+        if made && !matches!(granted, Ok(true)) {
+            let _ = fs::remove_dir_all(&dir);
+        }
+        let granted = granted?;
         if granted {
             self.log(
                 false,
-                &format!("Authorized {} to run as root", exe.display()),
+                &format!("Authorized {} to run as root", dest.display()),
             );
             // Best effort: the cache.db fallback covers a home it could not reach.
             if let Err(e) = core::share_homes(&self.paths.homes()) {
@@ -2260,10 +2385,14 @@ impl Actor {
     fn on_checked(&mut self, result: Result<Release, String>) -> Result<()> {
         self.snap.update_busy = None;
         let release = result.map_err(|e| anyhow!("Update check failed: {e}"))?;
-        if self.app.core_version.as_deref() == Some(&release.version) {
+        // Against every version, the built-in one included.
+        let have = update::versions(&self.paths, self.builtin.as_ref());
+        if have.iter().any(|v| !update::newer(&release.version, v)) {
             self.say(Topic::CoreUpdate, "Up to date".to_owned(), false);
+            self.snap.latest = None;
+        } else {
+            self.snap.latest = Some(release);
         }
-        self.snap.latest = Some(release);
         Ok(())
     }
 
@@ -2312,6 +2441,9 @@ impl Actor {
         if !update::valid_version(version) {
             bail!("{version} is not a core version");
         }
+        if self.builtin.as_ref().is_some_and(|b| b.version == version) {
+            bail!("{version} is built in");
+        }
         fs::remove_dir_all(self.paths.bin().join(version))
             .with_context(|| format!("delete {version}"))?;
         if self.app.previous_core_version.as_deref() == Some(version) {
@@ -2328,10 +2460,12 @@ impl Actor {
         if self.app.core_version.as_deref() == Some(target) {
             return Ok(());
         }
-        let exe = self.paths.core_exe(target);
-        if !update::valid_version(target) || !exe.is_file() {
+        let Some(mut exe) = update::valid_version(target)
+            .then(|| self.resolve(target))
+            .flatten()
+        else {
             bail!("{target} is not installed");
-        }
+        };
         let last_good = self.paths.last_good();
         if let Some(home) = self
             .app
@@ -2353,6 +2487,10 @@ impl Actor {
             // The new file is not authorized yet; asked while the old core still runs.
             if self.app.tun_on {
                 self.tun = self.tun_allowed(&exe, target, true).await;
+                // The built-in core's authorization made a copy, which it resolves to now.
+                exe = self
+                    .resolve(target)
+                    .with_context(|| format!("{target} is not installed"))?;
             }
             let (old_exe, old_version) = self.exe()?;
             self.read_proxy_state();

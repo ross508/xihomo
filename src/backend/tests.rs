@@ -1141,6 +1141,235 @@ async fn startup_uses_a_core_placed_by_hand_instead_of_deleting_it() {
     assert_eq!(a.snap.error(), None);
 }
 
+/// A fake app bundle beside the data directory: its core holds `bytes`.
+fn bundle(a: &mut Actor, version: &str, bytes: &str) -> PathBuf {
+    let macos = a
+        .paths
+        .data
+        .with_file_name(format!("{version}.app/Contents/MacOS"));
+    fs::create_dir_all(&macos).unwrap();
+    let exe = macos.join("mihomo");
+    fs::write(&exe, bytes).unwrap();
+    a.builtin = Some(update::Builtin {
+        version: version.into(),
+        exe: exe.clone(),
+    });
+    exe
+}
+
+/// The next launch, with the same data and a fresh actor.
+fn relaunch(a: &Actor) -> Actor {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut next = Actor::new(a.paths.clone(), tx, Arc::new(AtomicBool::new(false)))
+        .unwrap()
+        .0;
+    next.builtin = a.builtin.clone();
+    next
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_first_launch_uses_the_built_in_core() {
+    let mut a = idle("builtin-first");
+    let exe = bundle(&mut a, "v1.19.34", "x");
+    a.startup().await;
+    assert_eq!(a.app.core_version.as_deref(), Some("v1.19.34"));
+    assert_eq!(saved(&a).builtin_seen.as_deref(), Some("v1.19.34"));
+    assert_eq!(a.exe().unwrap().0, exe, "run in place, nothing copied");
+    assert!(update::installed(&a.paths).is_empty());
+    a.publish();
+    assert_eq!(a.snap.installed, ["v1.19.34"]);
+    assert_eq!(a.snap.builtin.as_deref(), Some("v1.19.34"));
+    a.handle(Cmd::DeleteVersion("v1.19.34".into())).await;
+    assert!(a.snap.error().unwrap().contains("in use"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn the_old_built_in_version_follows_the_new_one_after_an_app_update() {
+    let mut a = idle("builtin-follow");
+    a.app.core_version = Some("v1.19.33".into());
+    a.app.builtin_seen = Some("v1.19.33".into());
+    // The old app's core left with it: v1.19.33 resolves nowhere now.
+    bundle(&mut a, "v1.19.34", "x");
+    a.startup().await;
+    assert_eq!(a.app.core_version.as_deref(), Some("v1.19.34"));
+    assert_eq!(a.app.previous_core_version, None);
+    assert_eq!(saved(&a).builtin_seen.as_deref(), Some("v1.19.34"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn versions_that_resolve_nowhere_are_cleared_before_anything_starts() {
+    let mut a = idle("builtin-unresolvable");
+    install(&a, &["v1.19.35"]);
+    a.app.core_version = Some("v1.19.20".into());
+    a.app.previous_core_version = Some("v1.19.21".into());
+    a.app.builtin_seen = Some("v1.19.34".into());
+    bundle(&mut a, "v1.19.34", "x");
+    a.startup().await;
+    let s = saved(&a);
+    assert_eq!(s.core_version.as_deref(), Some("v1.19.34"));
+    assert_eq!(s.previous_core_version, None);
+
+    // Without a bundle, as today: nothing changes.
+    let mut b = idle("no-builtin-unresolvable");
+    b.app.core_version = Some("v1.19.20".into());
+    b.app.previous_core_version = Some("v1.19.21".into());
+    b.startup().await;
+    assert_eq!(b.app.core_version.as_deref(), Some("v1.19.20"));
+    assert_eq!(b.app.previous_core_version.as_deref(), Some("v1.19.21"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_app_update_moves_to_a_newer_built_in_core_once_and_never_to_an_older_one() {
+    let mut a = idle("builtin-move");
+    install(&a, &["v1.19.33"]);
+    a.app.core_version = Some("v1.19.33".into());
+    a.app.builtin_seen = Some("v1.19.33".into());
+    a.app.save(&a.paths).unwrap();
+    bundle(&mut a, "v1.19.34", "x");
+    a.startup().await;
+    assert_eq!(a.app.core_version.as_deref(), Some("v1.19.34"));
+    assert_eq!(a.app.previous_core_version.as_deref(), Some("v1.19.33"));
+
+    // The user switches back: the next launch leaves it.
+    a.handle(Cmd::ActivateVersion("v1.19.33".into())).await;
+    assert_eq!(a.snap.error(), None);
+    let mut next = relaunch(&a);
+    next.startup().await;
+    assert_eq!(next.app.core_version.as_deref(), Some("v1.19.33"));
+    assert_eq!(next.app.previous_core_version.as_deref(), Some("v1.19.34"));
+    next.handle(Cmd::DeleteVersion("v1.19.34".into())).await;
+    assert!(next.snap.error().unwrap().contains("built in"));
+
+    // A newer download stays when the app ships an older core.
+    install(&next, &["v1.19.36"]);
+    next.handle(Cmd::ActivateVersion("v1.19.36".into())).await;
+    let mut later = relaunch(&next);
+    bundle(&mut later, "v1.19.35", "y");
+    later.startup().await;
+    assert_eq!(later.app.core_version.as_deref(), Some("v1.19.36"));
+    assert_eq!(saved(&later).builtin_seen.as_deref(), Some("v1.19.35"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_download_the_built_in_core_duplicates_is_removed_at_launch() {
+    let mut a = idle("builtin-duplicate");
+    install(&a, &["v1.19.34"]);
+    a.app.core_version = Some("v1.19.34".into());
+    let exe = bundle(&mut a, "v1.19.34", "x");
+    a.startup().await;
+    assert!(update::installed(&a.paths).is_empty());
+    assert_eq!(a.app.core_version.as_deref(), Some("v1.19.34"));
+    assert_eq!(a.exe().unwrap().0, exe);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn check_for_update_compares_against_the_built_in_core_too() {
+    let mut a = idle("builtin-check");
+    install(&a, &["v1.19.33"]);
+    a.app.core_version = Some("v1.19.33".into());
+    bundle(&mut a, "v1.19.34", "x");
+    let release = |v: &str| Release {
+        version: v.into(),
+        url: String::new(),
+        sha256: String::new(),
+    };
+    a.handle(Cmd::Checked(Ok(release("v1.19.34")))).await;
+    assert_eq!(message(&a, Topic::CoreUpdate), "Up to date");
+    assert_eq!(a.snap.latest, None);
+    a.handle(Cmd::Checked(Ok(release("v1.19.35")))).await;
+    assert_eq!(a.snap.latest, Some(release("v1.19.35")));
+}
+
+/// Stands in for the administrator dialog's copy, without the owner change only root can make.
+fn grant_copy(exe: &Path, from: Option<&Path>) -> Result<bool> {
+    fs::copy(from.unwrap(), exe).unwrap();
+    Ok(true)
+}
+
+/// A TUN user after an app update: the current core is setuid root. `/usr/bin/sudo` stands in
+/// for it, by its metadata only: nothing here starts a core.
+fn tun_user_after_update(name: &str) -> Actor {
+    let mut a = idle(name);
+    fs::create_dir_all(a.paths.bin().join("v1.19.33")).unwrap();
+    std::os::unix::fs::symlink("/usr/bin/sudo", a.paths.core_exe("v1.19.33")).unwrap();
+    assert!(core::authorized(&a.paths.core_exe("v1.19.33")));
+    a.app.core_version = Some("v1.19.33".into());
+    a.app.builtin_seen = Some("v1.19.33".into());
+    a.app.tun_on = true;
+    a.app.core_on = false;
+    bundle(&mut a, "v1.19.34", "x");
+    a
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_tun_user_keeps_the_setuid_core_when_the_new_one_is_not_authorized() {
+    let mut a = tun_user_after_update("builtin-tun-cancel");
+    a.authorize = cancel_authorization;
+    a.startup().await;
+    assert_eq!(
+        a.app.core_version.as_deref(),
+        Some("v1.19.33"),
+        "not moved yet"
+    );
+    assert_eq!(saved(&a).builtin_seen.as_deref(), Some("v1.19.34"));
+    a.handle(Cmd::Restore).await;
+    let builtin = a.builtin.clone().unwrap();
+    assert!(builtin.exe.with_file_name("asked").exists(), "asked once");
+    assert_eq!(a.app.core_version.as_deref(), Some("v1.19.33"));
+    assert!(saved(&a).tun_on, "cancelling keeps TUN");
+    let note = a.snap.message(Topic::Core).unwrap();
+    assert!(
+        !note.error && note.text.contains("not in use yet"),
+        "{note:?}"
+    );
+    assert!(!note.text.contains(';'));
+    assert!(
+        !a.paths.bin().join("v1.19.34").exists(),
+        "no empty directory left"
+    );
+
+    // The next launch does not ask again.
+    fs::remove_file(builtin.exe.with_file_name("asked")).unwrap();
+    let mut next = relaunch(&a);
+    next.authorize = cancel_authorization;
+    next.startup().await;
+    next.handle(Cmd::Restore).await;
+    assert!(!builtin.exe.with_file_name("asked").exists());
+    assert_eq!(next.app.core_version.as_deref(), Some("v1.19.33"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_granted_prompt_copies_the_built_in_core_and_moves_to_it() {
+    let mut a = tun_user_after_update("builtin-tun-grant");
+    a.authorize = grant_copy;
+    a.startup().await;
+    a.handle(Cmd::Restore).await;
+    assert_eq!(a.snap.error(), None);
+    assert_eq!(a.app.core_version.as_deref(), Some("v1.19.34"));
+    assert_eq!(a.app.previous_core_version.as_deref(), Some("v1.19.33"));
+    assert_eq!(a.exe().unwrap().0, a.paths.core_exe("v1.19.34"), "the copy");
+    assert_eq!(
+        fs::read_to_string(a.paths.core_exe("v1.19.34")).unwrap(),
+        "x"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_tun_user_moves_without_a_prompt_when_the_new_version_has_a_setuid_copy() {
+    let mut a = tun_user_after_update("builtin-tun-copy");
+    fs::create_dir_all(a.paths.bin().join("v1.19.34")).unwrap();
+    std::os::unix::fs::symlink("/usr/bin/sudo", a.paths.core_exe("v1.19.34")).unwrap();
+    a.authorize = cancel_authorization;
+    a.startup().await;
+    assert_eq!(a.app.core_version.as_deref(), Some("v1.19.34"));
+    a.handle(Cmd::Restore).await;
+    assert!(!a.builtin.unwrap().exe.with_file_name("asked").exists());
+    assert!(
+        a.paths.core_exe("v1.19.34").exists(),
+        "a setuid copy is kept"
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn restore_picks_the_default_profile_and_skips_without_a_core() {
     let mut a = idle("restore-default");
@@ -1563,9 +1792,10 @@ local_test!(latency_tests_run_against_the_real_core, a, rx, {
     assert!(a.snap.nodes.is_empty());
 });
 
-/// Stands in for the administrator dialog: notes the request beside the file, then cancels.
-fn cancel_authorization(exe: &Path) -> Result<bool> {
-    fs::write(exe.with_file_name("asked"), "").unwrap();
+/// Stands in for the administrator dialog: notes the request beside the file, or beside the
+/// built-in core it would copy, then cancels.
+fn cancel_authorization(exe: &Path, from: Option<&Path>) -> Result<bool> {
+    fs::write(from.unwrap_or(exe).with_file_name("asked"), "").unwrap();
     Ok(false)
 }
 

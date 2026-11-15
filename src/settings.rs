@@ -419,6 +419,9 @@ pub struct AppData {
     pub active_profile: Option<String>,
     pub core_version: Option<String>,
     pub previous_core_version: Option<String>,
+    /// The built-in core version already handled at launch, so an app update moves the user to
+    /// its core once.
+    pub builtin_seen: Option<String>,
     pub last_good_home: Option<PathBuf>,
     /// The user's last Start/Stop, System Proxy and TUN choices, restored at launch.
     pub core_on: bool,
@@ -436,6 +439,7 @@ impl Default for AppData {
             active_profile: None,
             core_version: None,
             previous_core_version: None,
+            builtin_seen: None,
             last_good_home: None,
             core_on: true,
             proxy_on: false,

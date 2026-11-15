@@ -375,6 +375,14 @@ fn button(
     chip(id, p, selected, enabled, on_click).child(label.into())
 }
 
+fn version_label(version: &str, builtin: bool) -> String {
+    if builtin {
+        format!("{version} (built-in)")
+    } else {
+        version.to_owned()
+    }
+}
+
 /// A button's frame, states and click handling, without its content.
 fn chip(
     id: impl Into<SharedString>,
@@ -2217,20 +2225,24 @@ impl AppState {
         let mut versions = div().flex().flex_wrap().gap_1().items_center();
         for version in &s.installed {
             let pick = version.clone();
-            versions = versions.child(
-                button(
-                    format!("core-{version}"),
-                    version.clone(),
-                    p,
-                    s.core_version.as_deref() == Some(version),
-                    !busy,
-                    self.cmd(move || Cmd::ActivateVersion(pick.clone())),
-                )
-                .on_mouse_down(
+            let builtin = s.builtin.as_ref() == Some(version);
+            let chip = button(
+                format!("core-{version}"),
+                version_label(version, builtin),
+                p,
+                s.core_version.as_deref() == Some(version),
+                !busy,
+                self.cmd(move || Cmd::ActivateVersion(pick.clone())),
+            );
+            // The built-in core goes only with the app.
+            versions = versions.child(if builtin {
+                chip
+            } else {
+                chip.on_mouse_down(
                     MouseButton::Right,
                     Self::open_menu(Deletable::Version(version.clone()), cx),
-                ),
-            );
+                )
+            });
         }
         if s.installed.is_empty() {
             versions = versions.child(div().text_color(p.dim).child("No core installed"));
@@ -3708,6 +3720,30 @@ mod gpui_tests {
         assert!(ui.read(|s| s.context_menu.is_some()));
         ui.click("delete-version");
         assert!(ui.sent().is_empty());
+    }
+
+    #[gpui::test]
+    fn the_built_in_version_is_listed_once_and_cannot_be_deleted(cx: &mut TestAppContext) {
+        assert_eq!(version_label("v1.19.34", true), "v1.19.34 (built-in)");
+        assert_eq!(version_label("v1.19.33", false), "v1.19.33");
+        let snapshot = Snapshot {
+            installed: vec!["v1.19.33".into(), "v1.19.34".into()],
+            builtin: Some("v1.19.34".into()),
+            core_version: Some("v1.19.33".into()),
+            ..running()
+        };
+        let mut ui = open(cx, snapshot);
+        ui.keys("cmd-4");
+        ui.drain();
+        ui.right_click("core-v1.19.34");
+        assert!(ui.read(|s| s.context_menu.is_none()), "no Delete");
+        ui.click("core-v1.19.34");
+        assert!(matches!(&ui.sent()[..], [Cmd::ActivateVersion(v)] if v == "v1.19.34"));
+        ui.right_click("core-v1.19.33");
+        assert!(
+            ui.read(|s| s.context_menu.is_some()),
+            "a download can be deleted"
+        );
     }
 
     #[gpui::test]
