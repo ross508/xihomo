@@ -430,10 +430,12 @@ pub fn compose(source: &[u8], overrides: &[u8], rt: &Runtime) -> Result<Composed
             refused.join(", ")
         ));
     }
-    // A default, not an owned key: latency tests time one round trip on an open connection,
-    // as other Mihomo GUIs report it, unless the profile or overrides.yaml says otherwise.
-    map.entry("unified-delay".into())
-        .or_insert(Value::Bool(true));
+    // Defaults, not owned keys, so the profile or overrides.yaml may turn them off. Latency
+    // tests time one round trip on an open connection, as other Mihomo GUIs report it, and a
+    // host's addresses are dialled at once, the first to connect winning.
+    for key in ["unified-delay", "tcp-concurrent"] {
+        map.entry(key.into()).or_insert(Value::Bool(true));
+    }
     let had_tun = matches!(map.get("listeners"), Some(Value::Sequence(l))
         if l.iter().any(|l| l.get("type").and_then(Value::as_str) == Some("tun")));
     let ignored = own(&mut map, rt);
@@ -647,20 +649,20 @@ mod tests {
     }
 
     #[test]
-    fn unified_delay_is_on_unless_the_profile_or_overrides_set_it() {
-        let unified = |source: &[u8], overrides: &[u8]| {
-            parsed(&compose(source, overrides, &RT).unwrap().yaml)["unified-delay"].as_bool()
-        };
-        assert_eq!(unified(b"a: 1\n", b""), Some(true));
-        assert_eq!(unified(b"unified-delay: false\n", b""), Some(false));
-        assert_eq!(
-            unified(b"unified-delay: true\n", b"unified-delay: false\n"),
-            Some(false)
-        );
-        assert_eq!(
-            unified(b"unified-delay: false\n", b"unified-delay: true\n"),
-            Some(true)
-        );
+    fn unified_delay_and_tcp_concurrent_are_on_unless_the_profile_or_overrides_set_them() {
+        for key in ["unified-delay", "tcp-concurrent"] {
+            let value = |source: String, overrides: String| {
+                let yaml = compose(source.as_bytes(), overrides.as_bytes(), &RT)
+                    .unwrap()
+                    .yaml;
+                parsed(&yaml)[key].as_bool()
+            };
+            let set = |on: bool| format!("{key}: {on}\n");
+            assert_eq!(value("a: 1\n".into(), String::new()), Some(true));
+            assert_eq!(value(set(false), String::new()), Some(false));
+            assert_eq!(value(set(true), set(false)), Some(false));
+            assert_eq!(value(set(false), set(true)), Some(true));
+        }
     }
 
     #[test]
