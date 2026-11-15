@@ -6,7 +6,7 @@ use crate::api::{
 use crate::core::{self, Core};
 use crate::profiles::{self, Profile};
 use crate::proxy;
-use crate::settings::{self, AppData, LogLevel, Paths, Settings, Theme, write_private};
+use crate::settings::{self, AppData, LogLevel, Paths, Settings, Theme, TunStack, write_private};
 use crate::update::{self, Release};
 use anyhow::{Context, Result, anyhow, bail};
 use std::collections::{BTreeMap, BTreeSet};
@@ -23,6 +23,8 @@ use tokio::task::JoinHandle;
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const PORT_GRACE: Duration = Duration::from_secs(5);
 const PROXY_SETTLE: Duration = Duration::from_secs(2);
+/// How long a start or reload may take to bring the TUN up.
+const TUN_SETTLE: Duration = Duration::from_secs(5);
 const LOG_LINES: usize = 2000;
 const LOG_BYTES: usize = 2 * 1024 * 1024;
 const LOG_LINE_BYTES: usize = 64 * 1024;
@@ -91,6 +93,15 @@ pub enum Phase {
     Failed(String),
 }
 
+/// A TUN switch in progress.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TunBusy {
+    /// The administrator dialog is open.
+    Authorizing,
+    TurningOn,
+    TurningOff,
+}
+
 /// Where a message is shown: next to the part of the UI it is about. There is no global banner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Area {
@@ -116,6 +127,8 @@ pub enum Topic {
     /// Running the last-good configuration instead of the chosen profile.
     LastGood,
     SystemProxy,
+    /// Why TUN is not running although `tun_on` asks for it.
+    Tun,
     /// The 30-second proxy guard and new-service sync.
     ProxyCheck,
     Profile,
@@ -137,13 +150,14 @@ pub enum Topic {
     CoreVersion,
     CoreReplaced,
     LogLevel,
+    TunStack,
     LatencyUrl,
 }
 
 impl Topic {
     pub fn area(self) -> Area {
         match self {
-            Self::Core | Self::LastGood => Area::Core,
+            Self::Core | Self::LastGood | Self::Tun => Area::Core,
             Self::SystemProxy | Self::ProxyCheck => Area::Proxy,
             Self::Profile | Self::Providers | Self::ProfileList => Area::Profiles,
             Self::Groups => Area::Groups,
@@ -154,6 +168,7 @@ impl Topic {
             | Self::CoreVersion
             | Self::CoreReplaced
             | Self::LogLevel
+            | Self::TunStack
             | Self::LatencyUrl => Area::Update,
         }
     }
@@ -168,6 +183,7 @@ impl Topic {
             "theme" => Self::Theme,
             "keep_dock_icon" => Self::DockIcon,
             "log_level" => Self::LogLevel,
+            "tun_stack" => Self::TunStack,
             "latency_url" => Self::LatencyUrl,
             _ => Self::SettingsFile,
         }
@@ -196,8 +212,17 @@ pub struct Snapshot {
     pub groups: Vec<Group>,
     /// The system proxy is on, whoever set it.
     pub proxy_on: bool,
+    /// The backend is handling a user command. Others are refused meanwhile, except Stop; the
+    /// specific busy states below only say what is happening.
+    pub busy: bool,
     /// A proxy write is running: `Some(true)` turning on, `Some(false)` turning off.
     pub proxy_busy: Option<bool>,
+    /// The running core's TUN interface, as `/configs` reports it.
+    pub tun_device: Option<String>,
+    pub tun_busy: Option<TunBusy>,
+    /// TUN is asked for, but the selected core file is not authorized to run as root.
+    pub tun_needs_auth: bool,
+    pub tun_stack: TunStack,
     /// At most one message per topic; a later user command of that topic clears it.
     pub messages: BTreeMap<Topic, Message>,
     pub icon_set: String,
@@ -289,6 +314,8 @@ pub enum Cmd {
     CloseConnection(String),
     CloseAll,
     SetProxy(bool),
+    SetTun(bool),
+    SetTunStack(TunStack),
     WatchConnections(bool),
     CheckUpdate,
     Download,
@@ -334,6 +361,8 @@ impl Cmd {
     fn topic(&self) -> Topic {
         match self {
             Cmd::SetProxy(_) | Cmd::GuardProxy => Topic::SystemProxy,
+            Cmd::SetTun(_) => Topic::Tun,
+            Cmd::SetTunStack(_) => Topic::TunStack,
             Cmd::Select { .. } | Cmd::TestNode(_) | Cmd::TestGroup(_) | Cmd::Tested { .. } => {
                 Topic::Groups
             }
@@ -385,6 +414,9 @@ impl Cmd {
 pub struct Handle {
     tx: mpsc::UnboundedSender<Cmd>,
     cancel: Arc<AtomicBool>,
+    /// Raised here when a user command is sent, lowered by the backend when it is done, so a
+    /// second click is refused even before the snapshot says busy.
+    busy: Arc<AtomicBool>,
     pub snapshot: watch::Receiver<Arc<Snapshot>>,
     pub connections: watch::Receiver<Arc<Vec<Connection>>>,
     pub log_generation: watch::Receiver<u64>,
@@ -401,6 +433,7 @@ impl Handle {
         let handle = Self {
             tx,
             cancel: Arc::new(AtomicBool::new(false)),
+            busy: Arc::new(AtomicBool::new(false)),
             snapshot: watch::channel(Arc::new(snapshot)).1,
             connections: watch::channel(Arc::new(Vec::new())).1,
             log_generation: watch::channel(0).1,
@@ -410,9 +443,22 @@ impl Handle {
         (handle, rx)
     }
 
+    /// One user command at a time: another one sent meanwhile is dropped, except Stop, which
+    /// also interrupts a start. Clicks then never act on a state they did not see.
+    /// What the backend does when a command is done; for tests without one.
+    #[cfg(test)]
+    pub fn settle(&self) {
+        self.busy.store(false, Ordering::SeqCst);
+    }
+
     pub fn send(&self, cmd: Cmd) {
-        if matches!(cmd, Cmd::Stop) {
-            self.cancel.store(true, Ordering::SeqCst);
+        if cmd.is_user_action() {
+            let was_busy = self.busy.swap(true, Ordering::SeqCst);
+            if matches!(cmd, Cmd::Stop) {
+                self.cancel.store(true, Ordering::SeqCst);
+            } else if was_busy {
+                return;
+            }
         }
         let _ = self.tx.send(cmd);
     }
@@ -431,8 +477,10 @@ pub fn spawn(paths: Paths) -> Result<Handle> {
     paths.ensure()?;
     let (tx, rx) = mpsc::unbounded_channel();
     let cancel = Arc::new(AtomicBool::new(false));
-    let (actor, snapshot, connections, log_generation, logs) =
+    let busy = Arc::new(AtomicBool::new(false));
+    let (mut actor, snapshot, connections, log_generation, logs) =
         Actor::new(paths, tx.clone(), cancel.clone())?;
+    actor.busy = busy.clone();
     let (quit_tx, quit_requested) = watch::channel(false);
     std::thread::Builder::new()
         .name("xihomo-backend".into())
@@ -446,6 +494,7 @@ pub fn spawn(paths: Paths) -> Result<Handle> {
     Ok(Handle {
         tx,
         cancel,
+        busy,
         snapshot,
         connections,
         log_generation,
@@ -462,6 +511,8 @@ struct Actor {
     api: Api,
     tx: mpsc::UnboundedSender<Cmd>,
     cancel: Arc<AtomicBool>,
+    /// Shared with `Handle`; lowered when a user command is done.
+    busy: Arc<AtomicBool>,
     core: Option<Core>,
     fingerprint: Option<String>,
     snap: Snapshot,
@@ -478,6 +529,10 @@ struct Actor {
     /// Services that got our proxy, so ones appearing later can be added.
     proxied: Vec<String>,
     read_proxy: fn(&[u16]) -> proxy::State,
+    /// Whether the next start or reload composes with TUN. `app.tun_on` is what the user asked.
+    tun: bool,
+    /// Asks for administrator rights; blocking. Tests replace it.
+    authorize: fn(&Path) -> Result<bool>,
     /// The previous proxy port while the system proxy moves off it; it still counts as ours.
     switching_from: Option<u16>,
     next_message: u64,
@@ -496,12 +551,6 @@ type Parts = (
     watch::Receiver<u64>,
     Arc<Mutex<LogBuffer>>,
 );
-
-/// Something accepts connections on the loopback port, as the system proxy would connect.
-fn listening(port: u16) -> bool {
-    let addr = (Ipv4Addr::LOCALHOST, port).into();
-    std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok()
-}
 
 async fn wait_core(core: &mut Option<Core>) -> std::io::Result<std::process::ExitStatus> {
     match core {
@@ -545,6 +594,7 @@ impl Actor {
             api,
             tx,
             cancel,
+            busy: Arc::new(AtomicBool::new(false)),
             core: None,
             fingerprint: None,
             snap,
@@ -564,6 +614,8 @@ impl Actor {
             } else {
                 proxy::state
             },
+            tun: false,
+            authorize: core::authorize,
             switching_from: None,
             next_message: 0,
             epoch: 0,
@@ -624,6 +676,12 @@ impl Actor {
         self.snap.theme = self.settings.theme;
         self.snap.keep_dock_icon = self.settings.keep_dock_icon;
         self.snap.log_level = self.settings.log_level;
+        self.snap.tun_stack = self.settings.tun_stack;
+        self.snap.tun_needs_auth = self.app.tun_on
+            && self.snap.tun_device.is_none()
+            && self
+                .exe()
+                .is_ok_and(|(exe, _)| exe.is_file() && !core::authorized(&exe));
         self.snap.mixed_port = self.settings.mixed_port;
         self.snap.controller_port = self.settings.controller_port;
         self.snap.allow_lan = self.settings.allow_lan;
@@ -699,13 +757,27 @@ impl Actor {
     }
 
     /// Only user choices are remembered; crashes, failed starts and Quit leave them alone.
-    fn remember(&mut self, core_on: bool, proxy_on: bool) -> Result<()> {
+    fn remember(&mut self, core_on: bool, proxy_on: bool, tun_on: bool) -> Result<()> {
         self.app.core_on = core_on;
         self.app.proxy_on = proxy_on;
+        self.app.tun_on = tun_on;
         self.app.save(&self.paths)
     }
 
     async fn handle(&mut self, cmd: Cmd) {
+        let user = cmd.is_user_action();
+        if user {
+            self.snap.busy = true;
+            self.publish();
+        }
+        self.handle_inner(cmd).await;
+        if user {
+            self.snap.busy = false;
+            self.busy.store(false, Ordering::SeqCst);
+        }
+    }
+
+    async fn handle_inner(&mut self, cmd: Cmd) {
         let topic = cmd.topic();
         if cmd.is_user_action() {
             self.clear(topic);
@@ -719,12 +791,20 @@ impl Actor {
             self.publish();
         }
         let result = match cmd {
-            Cmd::Start => match self.remember(true, self.app.proxy_on) {
-                Ok(()) => self.start().await,
-                Err(e) => Err(e),
+            Cmd::Start => match self.remember(true, self.app.proxy_on, self.app.tun_on) {
+                Ok(()) if self.core.is_none() => {
+                    // A click: the one moment a start may ask for authorization.
+                    self.plan_tun(true).await;
+                    self.start().await
+                }
+                other => other,
             },
-            Cmd::Stop => match self.remember(false, false) {
-                Ok(()) => self.stop().await,
+            // Stop turns everything off, so the TUN reason no longer applies.
+            Cmd::Stop => match self.remember(false, false, false) {
+                Ok(()) => {
+                    self.clear(Topic::Tun);
+                    self.stop().await
+                }
                 Err(e) => Err(e),
             },
             Cmd::Activate(name) => self.activate(&name).await,
@@ -748,10 +828,16 @@ impl Actor {
             }
             Cmd::CloseConnection(id) => self.api.close_connection(&id).await,
             Cmd::CloseAll => self.api.close_all().await,
-            Cmd::SetProxy(on) => match self.remember(self.app.core_on, on) {
+            Cmd::SetProxy(on) => match self.remember(self.app.core_on, on, self.app.tun_on) {
                 Ok(()) => self.apply_proxy(on).await,
                 Err(e) => Err(e),
             },
+            Cmd::SetTun(on) => {
+                let result = self.set_tun(on).await;
+                self.snap.tun_busy = None;
+                result
+            }
+            Cmd::SetTunStack(stack) => self.set_tun_stack(stack).await,
             Cmd::GuardProxy => self.guard_proxy().await,
             Cmd::Restore => self.restore().await,
             Cmd::WatchConnections(on) => {
@@ -847,6 +933,8 @@ impl Actor {
             && self.app.core_version.is_some()
             && self.app.active_profile.is_some()
         {
+            // Never a dialog nobody clicked for: xihomo may start at login.
+            self.plan_tun(false).await;
             self.start().await
         } else {
             Ok(())
@@ -865,7 +953,12 @@ impl Actor {
     }
 
     fn runtime(&self) -> profiles::Runtime<'_> {
-        profiles::Runtime::new(&self.settings, &self.secret, self.app.mode.as_deref())
+        profiles::Runtime::new(
+            &self.settings,
+            &self.secret,
+            self.app.mode.as_deref(),
+            self.tun,
+        )
     }
 
     /// Compose and test a candidate with the selected core. Nothing is activated or persisted.
@@ -917,10 +1010,21 @@ impl Actor {
     }
 
     async fn launch(&mut self, exe: &Path, home: &Path, file: &Path) -> Result<()> {
-        self.ports_free().await?;
+        self.ports_free(exe).await?;
         // A port or secret changed since it was written must not make recovery fail.
         if file == self.paths.last_good() {
             profiles::reown(file, &self.runtime())?;
+        }
+        match core::discard_unwritable_cache(home) {
+            Ok(true) => self.log(
+                false,
+                &format!(
+                    "Deleted {}/cache.db: it could not be written",
+                    home.display()
+                ),
+            ),
+            Ok(false) => {}
+            Err(e) => self.log(true, &format!("{e:#}")),
         }
         let mut core = Core::spawn(exe, &self.paths, home, file)?;
         let deadline = Instant::now() + READY_TIMEOUT;
@@ -961,6 +1065,7 @@ impl Actor {
                 self.snap.phase = Phase::Running;
                 // "The core is not running" no longer holds.
                 self.clear(Topic::Groups);
+                self.check_tun().await;
                 Ok(())
             }
             Err(e) => {
@@ -983,12 +1088,13 @@ impl Actor {
 
     /// A port in use stops a launch; the error names the setting, also shown in its section
     /// until the port is free again.
-    async fn ports_free(&mut self) -> Result<()> {
+    async fn ports_free(&mut self, exe: &Path) -> Result<()> {
+        let as_root = core::authorized(exe);
         for (port, topic, section) in [
             (self.settings.mixed_port, Topic::ProxyPort, "PROXY"),
             (self.settings.controller_port, Topic::ApiPort, "API"),
         ] {
-            if core::ensure_ports_free(&[port]).await.is_err() {
+            if core::ensure_ports_free(&[port], as_root).await.is_err() {
                 self.say(
                     topic,
                     format!("Port {port} is in use. Change it here"),
@@ -1031,7 +1137,7 @@ impl Actor {
             .active_profile
             .clone()
             .context("Choose a profile first")?;
-        self.ports_free().await?;
+        self.ports_free(&exe).await?;
         let primary = async {
             let candidate = self.prepare(&exe, &name).await?;
             self.launch_candidate(&exe, &candidate.home).await?;
@@ -1088,10 +1194,13 @@ impl Actor {
     async fn stop_child(&mut self) -> Result<()> {
         self.abort_tasks();
         self.clear_runtime();
-        match self.core.take() {
-            Some(core) => core.stop().await,
-            None => Ok(()),
-        }
+        let Some(core) = self.core.take() else {
+            return Ok(());
+        };
+        // Lets the aborted streams close their connections before the core closes them, so the
+        // TIME_WAIT is on xihomo's side (see `Api::new`).
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        core.stop().await
     }
 
     fn abort_tasks(&mut self) {
@@ -1109,6 +1218,7 @@ impl Actor {
         self.snap.mode.clear();
         self.snap.groups.clear();
         self.snap.nodes.clear();
+        self.snap.tun_device = None;
         self.snap.edited = false;
         self.fingerprint = None;
     }
@@ -1214,6 +1324,167 @@ impl Actor {
         Ok(())
     }
 
+    /// Before a start: whether it composes with TUN. Only a click may ask for authorization.
+    async fn plan_tun(&mut self, prompt: bool) {
+        self.tun = false;
+        self.clear(Topic::Tun);
+        if let (true, Ok((exe, version))) = (self.app.tun_on, self.exe()) {
+            self.tun = self.tun_allowed(&exe, &version, prompt).await;
+        }
+    }
+
+    /// Whether `exe` may run with TUN, asking for authorization if `prompt`. When not, says why
+    /// in `Topic::Tun`. A cancelled dialog is the user's choice, so it turns `tun_on` off.
+    async fn tun_allowed(&mut self, exe: &Path, version: &str, prompt: bool) -> bool {
+        if !update::supports_tun(version) {
+            let text = format!(
+                "TUN is off: it needs core {} or newer. Update the core in Settings",
+                update::TUN_MIN
+            );
+            self.say(Topic::Tun, text, true);
+            return false;
+        }
+        if core::authorized(exe) {
+            return true;
+        }
+        if !prompt {
+            let text =
+                "TUN is off: this core needs administrator authorization. Turn TUN on to authorize";
+            self.say(Topic::Tun, text.to_owned(), true);
+            return false;
+        }
+        match self.authorize_core(exe).await {
+            Ok(true) => true,
+            Ok(false) => {
+                self.app.tun_on = false;
+                if let Err(e) = self.app.save(&self.paths) {
+                    self.log(true, &format!("{e:#}"));
+                }
+                let text = "TUN stays off: authorization was cancelled".to_owned();
+                self.say(Topic::Tun, text, false);
+                false
+            }
+            Err(e) => {
+                self.say(Topic::Tun, format!("TUN is off: {e:#}"), true);
+                false
+            }
+        }
+    }
+
+    /// Off the actor thread, so the core's output keeps draining while the dialog is open.
+    async fn authorize_core(&mut self, exe: &Path) -> Result<bool> {
+        self.snap.tun_busy = Some(TunBusy::Authorizing);
+        self.publish();
+        let (authorize, file) = (self.authorize, exe.to_owned());
+        let result = tokio::task::spawn_blocking(move || authorize(&file)).await;
+        self.snap.tun_busy = None;
+        let granted = result.context("authorization stopped")??;
+        if granted {
+            self.log(
+                false,
+                &format!("Authorized {} to run as root", exe.display()),
+            );
+            // Best effort: the cache.db fallback covers a home it could not reach.
+            if let Err(e) = core::share_homes(&self.paths.homes()) {
+                self.log(true, &format!("{e:#}"));
+            }
+        }
+        Ok(granted)
+    }
+
+    /// Mihomo keeps running when TUN fails and only logs it, so `/configs` is the only way to
+    /// know. The TUN can come up a moment after the API does.
+    async fn check_tun(&mut self) {
+        let deadline = Instant::now() + TUN_SETTLE;
+        loop {
+            self.snap.tun_device = self.api.runtime().await.ok().and_then(|c| c.tun_device);
+            if self.snap.tun_device.is_some() == self.tun || Instant::now() > deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        match (self.tun, self.snap.tun_device.is_some()) {
+            (true, false) => {
+                let tail = self.core.as_ref().map(|c| c.tail(40)).unwrap_or_default();
+                let lines: Vec<&str> = tail.lines().filter(|l| l.contains("TUN")).collect();
+                let reason = core::rejection_reason(&lines.join("\n"));
+                let text = if reason.is_empty() {
+                    "TUN did not start. See Logs".to_owned()
+                } else {
+                    format!("TUN did not start: {reason}")
+                };
+                self.say(Topic::Tun, text, true);
+            }
+            (false, true) => self.say(Topic::Tun, "TUN did not turn off".to_owned(), true),
+            (true, true) => self.clear(Topic::Tun),
+            // Off as asked; a reason it is off stays.
+            (false, false) => {}
+        }
+    }
+
+    /// A reload switches TUN in the running core. Only a new authorization restarts it, since the
+    /// running process is still the user's.
+    async fn set_tun(&mut self, on: bool) -> Result<()> {
+        self.running_or_err()?;
+        let (exe, version) = self.exe()?;
+        if !on {
+            self.app.tun_on = false;
+            self.app.save(&self.paths)?;
+            self.snap.tun_busy = Some(TunBusy::TurningOff);
+            self.publish();
+            return self.reload_tun(false).await;
+        }
+        let fresh = !core::authorized(&exe);
+        if !self.tun_allowed(&exe, &version, true).await {
+            return Ok(());
+        }
+        self.app.tun_on = true;
+        self.app.save(&self.paths)?;
+        self.snap.tun_busy = Some(TunBusy::TurningOn);
+        self.publish();
+        if fresh {
+            self.tun = true;
+            return self
+                .restart_with(self.settings.clone(), self.secret.clone())
+                .await;
+        }
+        self.reload_tun(true).await
+    }
+
+    async fn reload_tun(&mut self, on: bool) -> Result<()> {
+        let previous = std::mem::replace(&mut self.tun, on);
+        match self.reload_with(self.settings.clone()).await {
+            Ok((name, candidate)) => {
+                self.commit(&name, candidate)?;
+                self.refresh_with_global_default().await
+            }
+            Err(e) => {
+                self.tun = previous;
+                Err(e)
+            }
+        }
+    }
+
+    /// Applied by reload while TUN runs, which recreates it with the new stack.
+    async fn set_tun_stack(&mut self, stack: TunStack) -> Result<()> {
+        // Chosen again: writes it, so a bad value read at launch is fixed in the file too.
+        if stack == self.settings.tun_stack {
+            return Settings::write_key(&self.paths, "tun_stack", stack);
+        }
+        let mut next = self.settings.clone();
+        next.tun_stack = stack;
+        if !(self.tun && self.core.is_some()) {
+            Settings::write_key(&self.paths, "tun_stack", stack)?;
+            self.settings = next;
+            return Ok(());
+        }
+        let (name, candidate) = self.reload_with(next).await?;
+        let saved = Settings::write_key(&self.paths, "tun_stack", stack);
+        self.commit(&name, candidate)?;
+        self.refresh_with_global_default().await?;
+        saved
+    }
+
     async fn activate(&mut self, name: &str) -> Result<()> {
         let (exe, _) = self.exe()?;
         let candidate = self.prepare(&exe, name).await?;
@@ -1254,7 +1525,9 @@ impl Actor {
     async fn reload_running(&mut self) -> Result<()> {
         self.new_epoch();
         self.api.reload(&self.paths.candidate()).await?;
-        self.confirm_ports().await
+        self.confirm_ports().await?;
+        self.check_tun().await;
+        Ok(())
     }
 
     /// After a failed reload: back to the last committed configuration.
@@ -1277,7 +1550,7 @@ impl Actor {
 
     /// A port typed in Settings: unprivileged, not the other port, and free right now. The
     /// running core holds the current ports, so only a new one is probed.
-    async fn check_port(port: u32, other: u16, other_name: &str) -> Result<u16> {
+    async fn check_port(port: u32, other: u16, other_name: &str, as_root: bool) -> Result<u16> {
         let port = u16::try_from(port)
             .ok()
             .filter(|&p| settings::valid_port(p))
@@ -1285,7 +1558,7 @@ impl Actor {
         if port == other {
             bail!("Port {port} is the {other_name} port");
         }
-        core::ensure_ports_free(&[port])
+        core::ensure_ports_free(&[port], as_root)
             .await
             .map_err(|_| anyhow!("Port {port} is in use"))?;
         Ok(port)
@@ -1344,7 +1617,13 @@ impl Actor {
         if port == u32::from(self.settings.mixed_port) {
             return Ok(());
         }
-        let port = Self::check_port(port, self.settings.controller_port, "API").await?;
+        let port = Self::check_port(
+            port,
+            self.settings.controller_port,
+            "API",
+            self.runs_as_root(),
+        )
+        .await?;
         let mut next = self.settings.clone();
         next.mixed_port = port;
         if self.core.is_none() {
@@ -1509,7 +1788,8 @@ impl Actor {
         if port == u32::from(self.settings.controller_port) {
             return Ok(());
         }
-        let port = Self::check_port(port, self.settings.mixed_port, "proxy").await?;
+        let port =
+            Self::check_port(port, self.settings.mixed_port, "proxy", self.runs_as_root()).await?;
         let mut next = self.settings.clone();
         next.controller_port = port;
         if self.core.is_none() {
@@ -1613,6 +1893,11 @@ impl Actor {
         }
     }
 
+    /// The selected core file starts as root.
+    fn runs_as_root(&self) -> bool {
+        self.exe().is_ok_and(|(exe, _)| core::authorized(&exe))
+    }
+
     fn running_or_err(&self) -> Result<()> {
         if self.core.is_none() {
             bail!("The core is not running");
@@ -1655,7 +1940,9 @@ impl Actor {
     }
 
     async fn refresh_runtime(&mut self) -> Result<()> {
-        self.snap.mode = self.api.runtime().await?.mode;
+        let core = self.api.runtime().await?;
+        self.snap.mode = core.mode;
+        self.snap.tun_device = core.tun_device;
         (self.snap.groups, self.snap.nodes) = self.api.proxies(&self.settings.latency_url).await?;
         Ok(())
     }
@@ -1799,7 +2086,7 @@ impl Actor {
         if port == saved {
             self.clear(Topic::ExternalPort);
         } else {
-            if port != 0 && listening(port) {
+            if port != 0 && core::listening(port) {
                 Settings::write_key(&self.paths, "mixed_port", port)?;
                 self.settings.mixed_port = port;
                 let moved = self.move_proxy(saved).await;
@@ -2019,6 +2306,10 @@ impl Actor {
                 .last_good_home
                 .clone()
                 .context("no last-good home")?;
+            // The new file is not authorized yet; asked while the old core still runs.
+            if self.app.tun_on {
+                self.tun = self.tun_allowed(&exe, target, true).await;
+            }
             let (old_exe, old_version) = self.exe()?;
             self.read_proxy_state();
             let proxy_was_on = self.proxy.ours;

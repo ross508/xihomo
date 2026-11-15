@@ -1,4 +1,4 @@
-use crate::backend::{Cmd, Phase, Snapshot};
+use crate::backend::{Cmd, Phase, Snapshot, TunBusy};
 use crate::icons::{self, State};
 use crate::settings::Theme;
 use anyhow::Result;
@@ -12,6 +12,7 @@ use tray_icon::{TrayIcon, TrayIconBuilder};
 
 pub const CORE: &str = "core";
 pub const PROXY: &str = "proxy";
+pub const TUN: &str = "tun";
 pub const RELOAD: &str = "reload";
 pub const CHECK_NOW: &str = "check-now";
 pub const OPEN: &str = "open";
@@ -76,9 +77,11 @@ fn item(id: &str, label: &str, enabled: bool) -> Entry {
 }
 
 pub fn menu_model(s: &Snapshot) -> Vec<Entry> {
+    // While the backend handles a command, only Stop, Show and Quit stay usable.
+    let idle = !s.busy;
     let (label, enabled) = match s.phase {
-        Phase::Stopped => ("Start Core", true),
-        Phase::Failed(_) => ("Retry Start", true),
+        Phase::Stopped => ("Start Core", idle),
+        Phase::Failed(_) => ("Retry Start", idle),
         Phase::Running | Phase::Starting => ("Stop Core", true),
         Phase::Stopping => ("Stopping…", false),
     };
@@ -88,7 +91,7 @@ pub fn menu_model(s: &Snapshot) -> Vec<Entry> {
         .map(|p| Entry::Item {
             id: Some(format!("{PROFILE_PREFIX}{}", p.name)),
             label: p.name.clone(),
-            enabled: p.problem.is_none(),
+            enabled: p.problem.is_none() && idle,
             checked: Some(s.active.as_deref() == Some(&p.name)),
         })
         .collect::<Vec<_>>();
@@ -108,7 +111,7 @@ pub fn menu_model(s: &Snapshot) -> Vec<Entry> {
     menu.extend(MODES.map(|(mode, label)| Entry::Item {
         id: Some(format!("{MODE_PREFIX}{mode}")),
         label: label.to_owned(),
-        enabled: s.phase != Phase::Stopping,
+        enabled: s.phase != Phase::Stopping && idle,
         checked: Some(s.mode == mode),
     }));
     menu.extend([
@@ -122,8 +125,22 @@ pub fn menu_model(s: &Snapshot) -> Vec<Entry> {
             }
             .to_owned(),
             // Turning it off stays possible whatever the core is doing.
-            enabled: s.proxy_busy.is_none() && (s.phase == Phase::Running || s.proxy_on),
+            enabled: idle && s.proxy_busy.is_none() && (s.phase == Phase::Running || s.proxy_on),
             checked: Some(s.proxy_on),
+        },
+        Entry::Item {
+            id: Some(TUN.to_owned()),
+            label: match s.tun_busy {
+                Some(TunBusy::Authorizing) => "TUN: Authorizing…",
+                Some(TunBusy::TurningOn) => "TUN: Turning On…",
+                Some(TunBusy::TurningOff) => "TUN: Turning Off…",
+                // Visible with the window closed; a click authorizes, as the button does.
+                None if s.tun_needs_auth => "TUN: Needs Authorization",
+                None => "TUN",
+            }
+            .to_owned(),
+            enabled: idle && s.tun_busy.is_none() && s.phase == Phase::Running,
+            checked: Some(s.tun_device.is_some()),
         },
         Entry::Separator,
         Entry::Submenu {
@@ -134,10 +151,14 @@ pub fn menu_model(s: &Snapshot) -> Vec<Entry> {
     ]);
     if s.edited {
         // Waits for a providers update, as the window's Reload does.
-        menu.push(item(RELOAD, "Reload Edited Profile", !s.providers_busy));
+        menu.push(item(
+            RELOAD,
+            "Reload Edited Profile",
+            idle && !s.providers_busy,
+        ));
     }
     menu.extend([
-        item(CHECK_NOW, "Check Now", true),
+        item(CHECK_NOW, "Check Now", idle),
         Entry::Separator,
         item(QUIT, "Quit", true),
     ]);
@@ -159,6 +180,7 @@ pub fn menu_action(id: &str, s: &Snapshot) -> Option<MenuAction> {
             _ => Cmd::Start,
         }),
         PROXY => MenuAction::Send(Cmd::SetProxy(!s.proxy_on)),
+        TUN => MenuAction::Send(Cmd::SetTun(s.tun_device.is_none())),
         RELOAD if s.providers_busy => return None,
         RELOAD => MenuAction::Send(Cmd::Reload),
         CHECK_NOW => MenuAction::Send(Cmd::CheckNow),
@@ -405,6 +427,79 @@ mod tests {
     }
 
     #[test]
+    fn tun_item_shows_the_actual_state_and_a_missing_authorization() {
+        let mut s = snapshot(Phase::Stopped);
+        assert_eq!(
+            state(&menu_model(&s), TUN),
+            ("TUN".into(), false, Some(false))
+        );
+        s.phase = Phase::Running;
+        assert_eq!(
+            state(&menu_model(&s), TUN),
+            ("TUN".into(), true, Some(false))
+        );
+        s.tun_needs_auth = true;
+        assert_eq!(
+            state(&menu_model(&s), TUN),
+            ("TUN: Needs Authorization".into(), true, Some(false))
+        );
+        assert!(matches!(
+            menu_action(TUN, &s),
+            Some(MenuAction::Send(Cmd::SetTun(true)))
+        ));
+        s.tun_busy = Some(TunBusy::Authorizing);
+        assert_eq!(
+            state(&menu_model(&s), TUN),
+            ("TUN: Authorizing…".into(), false, Some(false))
+        );
+        s.tun_busy = None;
+        s.tun_needs_auth = false;
+        s.tun_device = Some("utun9".into());
+        assert_eq!(
+            state(&menu_model(&s), TUN),
+            ("TUN".into(), true, Some(true))
+        );
+        assert!(matches!(
+            menu_action(TUN, &s),
+            Some(MenuAction::Send(Cmd::SetTun(false)))
+        ));
+        s.tun_busy = Some(TunBusy::TurningOff);
+        assert_eq!(
+            state(&menu_model(&s), TUN),
+            ("TUN: Turning Off…".into(), false, Some(true))
+        );
+    }
+
+    #[test]
+    fn while_busy_only_stop_show_and_quit_are_usable() {
+        let busy = |phase| {
+            let s = Snapshot {
+                busy: true,
+                edited: true,
+                ..snapshot(phase)
+            };
+            let mut enabled = Vec::new();
+            fn walk(entries: &[Entry], out: &mut Vec<String>) {
+                for e in entries {
+                    match e {
+                        Entry::Item {
+                            id: Some(id),
+                            enabled: true,
+                            ..
+                        } => out.push(id.clone()),
+                        Entry::Submenu { items, .. } => walk(items, out),
+                        _ => {}
+                    }
+                }
+            }
+            walk(&menu_model(&s), &mut enabled);
+            enabled
+        };
+        assert_eq!(busy(Phase::Running), [OPEN, CORE, QUIT], "Stop");
+        assert_eq!(busy(Phase::Stopped), [OPEN, QUIT], "no Start");
+    }
+
+    #[test]
     fn profiles_show_selection_and_broken_links() {
         let model = menu_model(&snapshot(Phase::Running));
         assert_eq!(
@@ -460,6 +555,7 @@ mod tests {
                 "Direct",
                 "-",
                 "System Proxy",
+                "TUN",
                 "-",
                 "Profile",
                 "Reload Edited Profile",

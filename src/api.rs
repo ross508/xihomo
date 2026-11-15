@@ -26,6 +26,8 @@ pub struct CoreConfig {
     pub mode: String,
     pub mixed_port: u16,
     pub allow_lan: bool,
+    /// The TUN interface, only while TUN is enabled and has one.
+    pub tun_device: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -178,10 +180,14 @@ pub fn parse_groups(body: &Value) -> Vec<Group> {
 impl Api {
     pub fn new(port: u16, secret: &str) -> Result<Self> {
         // Explicit no_proxy: controller traffic must never leave through an inherited proxy.
+        // No idle keep-alive: xihomo then closes its own connections first, so a stopping core
+        // leaves no TIME_WAIT on the controller port. A root core's TIME_WAIT would keep the
+        // user's next core from binding it for 30 s.
         let builder = || {
             Client::builder()
                 .no_proxy()
                 .connect_timeout(Duration::from_secs(2))
+                .pool_max_idle_per_host(0)
         };
         Ok(Self {
             client: builder().timeout(Duration::from_secs(10)).build()?,
@@ -255,6 +261,7 @@ impl Api {
             mode: body["mode"].as_str().unwrap_or_default().to_owned(),
             mixed_port: body["mixed-port"].as_u64().unwrap_or_default() as u16,
             allow_lan: body["allow-lan"].as_bool().unwrap_or_default(),
+            tun_device: tun_device(&body),
         })
     }
 
@@ -525,6 +532,13 @@ pub fn parse_log_line(bytes: &[u8]) -> Option<LogLine> {
     })
 }
 
+/// Mihomo keeps running when its TUN fails, with `enable` on and no device.
+fn tun_device(configs: &Value) -> Option<String> {
+    let tun = &configs["tun"];
+    let device = tun["device"].as_str().filter(|d| !d.is_empty())?;
+    (tun["enable"].as_bool() == Some(true)).then(|| device.to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,6 +548,23 @@ mod tests {
             level: "info".into(),
             text: text.into(),
         }
+    }
+
+    #[test]
+    fn tun_is_up_only_when_enabled_with_a_device() {
+        let device = |tun: Value| tun_device(&json!({ "mode": "rule", "tun": tun }));
+        assert_eq!(
+            device(json!({"enable": true, "device": "utun9", "stack": "Mips"})).as_deref(),
+            Some("utun9")
+        );
+        assert_eq!(
+            device(json!({"enable": true, "device": ""})),
+            None,
+            "TUN failed"
+        );
+        assert_eq!(device(json!({"enable": false, "device": "utun9"})), None);
+        assert_eq!(device(json!({"enable": true})), None);
+        assert_eq!(tun_device(&json!({"mode": "rule"})), None);
     }
 
     #[test]

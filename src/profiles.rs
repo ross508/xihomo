@@ -1,4 +1,4 @@
-use crate::settings::{LogLevel, Paths, Settings};
+use crate::settings::{LogLevel, Paths, Settings, TunStack};
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -280,10 +280,12 @@ pub struct Runtime<'a> {
     /// The user's remembered mode, which beats the profile's and the overrides'.
     pub mode: Option<&'a str>,
     pub log_level: LogLevel,
+    /// `Some` composes with TUN on, with this stack.
+    pub tun: Option<TunStack>,
 }
 
 impl<'a> Runtime<'a> {
-    pub fn new(settings: &Settings, secret: &'a str, mode: Option<&'a str>) -> Self {
+    pub fn new(settings: &Settings, secret: &'a str, mode: Option<&'a str>, tun: bool) -> Self {
         Self {
             mixed_port: settings.mixed_port,
             controller_port: settings.controller_port,
@@ -291,6 +293,7 @@ impl<'a> Runtime<'a> {
             secret,
             mode,
             log_level: settings.log_level,
+            tun: tun.then_some(settings.tun_stack),
         }
     }
 }
@@ -361,14 +364,40 @@ pub fn own(map: &mut Mapping, rt: &Runtime) -> Vec<String> {
         format!("127.0.0.1:{}", rt.controller_port).into(),
     );
     map.insert("secret".into(), rt.secret.into());
-    let mut tun = Mapping::new();
-    tun.insert("enable".into(), false.into());
-    map.insert("tun".into(), tun.into());
+    map.insert("tun".into(), tun(rt.tun));
+    if rt.tun.is_some() {
+        // TUN hijacks DNS to Mihomo, which then has to serve it.
+        match map.get_mut("dns") {
+            Some(Value::Mapping(dns)) => {
+                dns.insert("enable".into(), true.into());
+            }
+            _ => {
+                map.insert("dns".into(), parsed_value("{enable: true}"));
+            }
+        }
+    }
     map.insert("log-level".into(), rt.log_level.as_str().into());
     if let Some(mode) = rt.mode {
         map.insert("mode".into(), mode.into());
     }
     overridden
+}
+
+fn parsed_value(yaml: &str) -> Value {
+    yaml_serde::from_str(yaml).expect("static YAML")
+}
+
+fn tun(stack: Option<TunStack>) -> Value {
+    let Some(stack) = stack else {
+        return parsed_value("{enable: false}");
+    };
+    let mut tun = parsed_value(
+        "{enable: true, auto-route: true, auto-detect-interface: true, dns-hijack: ['any:53'], dns-mode: native}",
+    );
+    tun.as_mapping_mut()
+        .unwrap()
+        .insert("stack".into(), stack.as_str().into());
+    tun
 }
 
 pub struct Composed {
@@ -409,7 +438,7 @@ pub fn compose(source: &[u8], overrides: &[u8], rt: &Runtime) -> Result<Composed
         if l.iter().any(|l| l.get("type").and_then(Value::as_str) == Some("tun")));
     let ignored = own(&mut map, rt);
     if had_tun {
-        notices.push("TUN listeners were removed: xihomo V1 uses the system proxy".to_owned());
+        notices.push("TUN listeners were removed: xihomo sets up TUN itself".to_owned());
     }
     Ok(Composed {
         yaml: yaml_serde::to_string(&map)?,
@@ -483,6 +512,7 @@ mod tests {
         secret: "s3",
         mode: None,
         log_level: LogLevel::Info,
+        tun: None,
     };
 
     fn rt_default() -> Runtime<'static> {
@@ -526,6 +556,33 @@ mod tests {
             c.ignored,
             ["mixed-port", "external-controller", "secret", "log-level"]
         );
+    }
+
+    #[test]
+    fn tun_is_written_off_or_on_with_dns_enabled() {
+        let source = b"tun: {enable: true, stack: system, device: utun3}\ndns: {enable: false, nameserver: [1.1.1.1]}\n";
+        let off = parsed(&compose(source, b"", &RT).unwrap().yaml);
+        assert_eq!(off["tun"], parsed("{enable: false}"));
+        assert_eq!(off["dns"]["enable"], Value::from(false), "left alone");
+
+        let rt = Runtime {
+            tun: Some(TunStack::Gvisor),
+            ..RT
+        };
+        let c = compose(source, b"tun: {enable: false}\n", &rt).unwrap();
+        assert_eq!(c.ignored, ["tun"]);
+        assert_eq!(c.notices, ["overrides.yaml: tun ignored (set by xihomo)"]);
+        let on = parsed(&c.yaml);
+        assert_eq!(
+            on["tun"],
+            parsed(
+                "{enable: true, auto-route: true, auto-detect-interface: true, dns-hijack: ['any:53'], dns-mode: native, stack: gvisor}"
+            )
+        );
+        assert_eq!(on["dns"]["enable"], Value::from(true));
+        assert_eq!(on["dns"]["nameserver"][0].as_str(), Some("1.1.1.1"));
+        let bare = parsed(&compose(b"mode: direct\n", b"", &rt).unwrap().yaml);
+        assert_eq!(bare["dns"], parsed("{enable: true}"));
     }
 
     #[test]
@@ -652,6 +709,7 @@ mod tests {
             secret: "new",
             mode: Some("global"),
             log_level: LogLevel::Warning,
+            tun: Some(TunStack::System),
         };
         reown(&paths.last_good(), &now).unwrap();
         let v = parsed(&fs::read_to_string(paths.last_good()).unwrap());
@@ -661,6 +719,7 @@ mod tests {
         assert_eq!(v["allow-lan"], Value::from(true));
         assert_eq!(v["mode"].as_str(), Some("global"));
         assert_eq!(v["log-level"].as_str(), Some("warning"));
+        assert_eq!(v["tun"]["stack"].as_str(), Some("system"));
     }
 
     #[test]

@@ -3,8 +3,11 @@ use crate::settings::{Paths, write_private};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::ffi::{CStr, OsString};
 use std::fs;
+use std::io::ErrorKind;
 use std::net::{Ipv4Addr, TcpListener};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
@@ -17,16 +20,33 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const TAIL_LINES: usize = 40;
 const TAIL_LINE_BYTES: usize = 4096;
 
+/// Something accepts connections on the loopback port, as the system proxy would connect.
+pub fn listening(port: u16) -> bool {
+    let addr = (Ipv4Addr::LOCALHOST, port).into();
+    std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok()
+}
+
+/// Connections a stopped root core closed stay in TIME_WAIT for up to 30 s, and macOS refuses the
+/// user's bind over a root one meanwhile, although nothing listens. A root core binds anyway.
+const CLOSING_WAIT: Duration = Duration::from_secs(36);
+
 /// Only touch the ports through a bind attempt, so an unrelated listener is refused, never signalled.
 /// Binds wildcard too: on BSD sockets a specific bind can succeed alongside a wildcard listener.
 /// A brief retry rides out a probe socket held for an instant by a concurrently forked child.
-pub async fn ensure_ports_free(ports: &[u16]) -> Result<()> {
+/// A port held only by closing connections is free for a core that runs as root (`as_root`);
+/// for one that runs as the user, it is waited for.
+pub async fn ensure_ports_free(ports: &[u16], as_root: bool) -> Result<()> {
     for &port in ports {
         for addr in [Ipv4Addr::LOCALHOST, Ipv4Addr::UNSPECIFIED] {
+            let start = std::time::Instant::now();
             let mut attempt = 0;
             while let Err(e) = TcpListener::bind((addr, port)) {
+                let closing = !listening(port);
+                if closing && as_root {
+                    break;
+                }
                 attempt += 1;
-                if attempt == 6 {
+                if attempt >= 6 && !(closing && start.elapsed() < CLOSING_WAIT) {
                     bail!(
                         "port {port} is in use by another process ({e}), so xihomo will not control it"
                     );
@@ -84,7 +104,7 @@ pub async fn validate(
 }
 
 /// Mihomo's own error lines, without logfmt noise; the last lines if it printed none.
-fn rejection_reason(output: &str) -> String {
+pub fn rejection_reason(output: &str) -> String {
     let errors: Vec<&str> = output
         .lines()
         .filter(|l| l.contains("level=error") || l.contains("level=fatal"))
@@ -98,6 +118,101 @@ fn rejection_reason(output: &str) -> String {
         return lines[lines.len().saturating_sub(3)..].join(" ");
     }
     errors.join(". ")
+}
+
+/// The core file runs as root wherever it is started: owned by root, with the setuid bit.
+pub fn authorized(exe: &Path) -> bool {
+    fs::metadata(exe).is_ok_and(|m| m.uid() == 0 && m.mode() & 0o4000 != 0)
+}
+
+/// The path goes in as an argument, so AppleScript needs no escaping, and `quoted form of`
+/// quotes it for the shell.
+const AUTHORIZE: [&str; 4] = [
+    "on run argv",
+    "set p to quoted form of item 1 of argv",
+    "do shell script \"/usr/sbin/chown root:wheel \" & p & \" && /bin/chmod 4755 \" & p with prompt \"xihomo needs administrator rights so Mihomo can turn on TUN.\" with administrator privileges",
+    "end run",
+];
+
+fn authorize_args(exe: &Path) -> Vec<OsString> {
+    let mut args: Vec<OsString> = AUTHORIZE
+        .iter()
+        .flat_map(|line| ["-e".into(), (*line).into()])
+        .collect();
+    args.push(exe.into());
+    args
+}
+
+/// The only place xihomo asks for administrator rights: makes `exe` setuid root, once per core
+/// file. Blocking while the dialog is open. `false` when the user cancelled.
+pub fn authorize(exe: &Path) -> Result<bool> {
+    // Layer 1 tests must never ask for a password or change an owner.
+    if cfg!(test) {
+        panic!("test tried to authorize {}", exe.display());
+    }
+    let output = std::process::Command::new("/usr/bin/osascript")
+        .args(authorize_args(exe))
+        .output()
+        .context("cannot run osascript")?;
+    if output.status.success() {
+        return Ok(true);
+    }
+    let error = String::from_utf8_lossy(&output.stderr);
+    if error.contains("(-128)") {
+        return Ok(false);
+    }
+    bail!("Authorization failed: {}", error.trim())
+}
+
+fn acl_entry(user: &str) -> String {
+    format!(
+        "user:{user} allow list,search,add_file,add_subdirectory,delete,delete_child,read,write,append,readattr,writeattr,readextattr,writeextattr,readsecurity,file_inherit,directory_inherit"
+    )
+}
+
+fn user_name() -> Result<String> {
+    // Safety: the entry is copied out at once; nothing else in xihomo calls getpwuid.
+    unsafe {
+        let entry = libc::getpwuid(libc::getuid());
+        if entry.is_null() {
+            bail!("cannot read this user's name");
+        }
+        Ok(CStr::from_ptr((*entry).pw_name).to_str()?.to_owned())
+    }
+}
+
+/// What a root core creates under `homes` inherits an entry that lets the user read, write and
+/// delete it. Added to what exists too, since homes made earlier inherit nothing from `homes`.
+/// Run as the user; adding the same entry again changes nothing.
+pub fn share_homes(homes: &Path) -> Result<()> {
+    let output = std::process::Command::new("/bin/chmod")
+        .args(["-R", "+a"])
+        .arg(acl_entry(&user_name()?))
+        .arg(homes)
+        .output()
+        .context("cannot run chmod")?;
+    if !output.status.success() {
+        bail!(
+            "cannot share {} with this user: {}",
+            homes.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// A `cache.db` the user cannot write, left by a root core, makes a core running as the user run
+/// without a cache and forget every selection. Opening for append neither creates nor truncates
+/// it, and deleting it needs only the home, which is the user's. `true` when it was deleted.
+pub fn discard_unwritable_cache(home: &Path) -> Result<bool> {
+    let path = home.join("cache.db");
+    match fs::OpenOptions::new().append(true).open(&path) {
+        Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+            fs::remove_file(&path).with_context(|| format!("delete {}", path.display()))?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -270,18 +385,152 @@ pub(crate) mod tests {
         assert_eq!(rejection_reason(""), "");
     }
 
+    #[test]
+    fn only_a_setuid_root_file_is_authorized() {
+        let paths = temp_paths("authorized");
+        let exe = paths.data.join("mihomo");
+        fs::write(&exe, "x").unwrap();
+        let mode = |m| fs::set_permissions(&exe, std::os::unix::fs::PermissionsExt::from_mode(m));
+        mode(0o4755).unwrap();
+        assert!(!authorized(&exe), "setuid, but owned by this user");
+        mode(0o755).unwrap();
+        assert!(!authorized(&exe));
+        assert!(!authorized(&paths.data.join("missing")));
+        // Root-owned without the setuid bit; root-owned with it would be authorized.
+        assert!(!authorized(Path::new("/bin/ls")));
+    }
+
+    #[test]
+    fn the_authorization_passes_the_path_as_an_argument() {
+        let exe = Path::new("/Users/a b/it's \"x\"/v1/mihomo");
+        let args = authorize_args(exe);
+        assert_eq!(args.last().unwrap(), exe.as_os_str(), "passed unchanged");
+        let script: Vec<&str> = args[..args.len() - 1]
+            .chunks(2)
+            .map(|pair| {
+                assert_eq!(pair[0], "-e");
+                pair[1].to_str().unwrap()
+            })
+            .collect();
+        assert_eq!(script, AUTHORIZE);
+        assert!(script[1].contains("quoted form of item 1 of argv"));
+        assert!(script[2].starts_with(
+            "do shell script \"/usr/sbin/chown root:wheel \" & p & \" && /bin/chmod 4755 \" & p "
+        ));
+        assert!(script[2].ends_with("with administrator privileges"));
+        assert!(
+            !script.concat().contains("it's"),
+            "the path is not in the script"
+        );
+    }
+
+    #[test]
+    fn homes_pass_their_acl_on_to_what_is_created_later() {
+        let paths = temp_paths("acl");
+        let earlier = paths.home("earlier");
+        fs::create_dir_all(&earlier).unwrap();
+        share_homes(&paths.homes()).unwrap();
+        share_homes(&paths.homes()).unwrap();
+        fs::create_dir_all(earlier.join("providers")).unwrap();
+        fs::write(earlier.join("providers/p.yaml"), "x").unwrap();
+        let acl = |path: &Path| {
+            let out = std::process::Command::new("/bin/ls")
+                .arg("-led")
+                .arg(path)
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let user = user_name().unwrap();
+        let own = acl(&paths.homes());
+        assert_eq!(
+            own.matches(&format!("user:{user} allow")).count(),
+            1,
+            "{own}"
+        );
+        for path in [earlier.join("providers"), earlier.join("providers/p.yaml")] {
+            let text = acl(&path);
+            assert!(
+                text.contains(&format!("user:{user} inherited allow")),
+                "{text}"
+            );
+        }
+        assert!(acl(&earlier).contains(&format!("user:{user} allow")));
+    }
+
+    #[test]
+    fn only_an_unwritable_cache_is_discarded() {
+        let paths = temp_paths("cache");
+        let home = paths.home("p");
+        fs::create_dir_all(&home).unwrap();
+        let cache = home.join("cache.db");
+        assert!(!discard_unwritable_cache(&home).unwrap(), "missing");
+        assert!(!cache.exists(), "not created");
+        fs::write(&cache, "selections").unwrap();
+        assert!(!discard_unwritable_cache(&home).unwrap());
+        assert_eq!(
+            fs::read_to_string(&cache).unwrap(),
+            "selections",
+            "kept whole"
+        );
+        fs::set_permissions(&cache, std::os::unix::fs::PermissionsExt::from_mode(0o444)).unwrap();
+        assert!(discard_unwritable_cache(&home).unwrap());
+        assert!(!cache.exists());
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn occupied_port_is_refused_and_a_briefly_held_one_is_not() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
-        let err = ensure_ports_free(&[port]).await.unwrap_err().to_string();
+        let err = ensure_ports_free(&[port], true)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("in use"), "{err}");
 
         let release = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(100));
             drop(listener);
         });
-        ensure_ports_free(&[port]).await.unwrap();
+        ensure_ports_free(&[port], false).await.unwrap();
+        release.join().unwrap();
+    }
+
+    /// A socket bound to the port without listening: binds fail, connections are refused, as
+    /// with the TIME_WAIT a root core leaves behind.
+    fn held(port: u16) -> i32 {
+        unsafe {
+            let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+            let mut addr: libc::sockaddr_in = std::mem::zeroed();
+            addr.sin_family = libc::AF_INET as _;
+            addr.sin_port = port.to_be();
+            addr.sin_addr.s_addr = u32::from(Ipv4Addr::LOCALHOST).to_be();
+            let len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+            assert_eq!(libc::bind(fd, (&raw const addr).cast(), len), 0);
+            fd
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_port_held_without_a_listener_is_free_for_root_and_waited_for_otherwise() {
+        let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let fd = held(port);
+        assert!(!listening(port));
+        ensure_ports_free(&[port], true).await.unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(800));
+            unsafe { libc::close(fd) };
+        });
+        let start = std::time::Instant::now();
+        ensure_ports_free(&[port], false).await.unwrap();
+        assert!(
+            start.elapsed() >= Duration::from_millis(700),
+            "waited, past the brief retry"
+        );
         release.join().unwrap();
     }
 

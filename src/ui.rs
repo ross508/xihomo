@@ -1,5 +1,5 @@
 use crate::api::{Connection, Latency, LogLine};
-use crate::backend::{Area, Cmd, Handle, Message, Phase, Snapshot, Topic};
+use crate::backend::{Area, Cmd, Handle, Message, Phase, Snapshot, Topic, TunBusy};
 use crate::icons;
 use crate::input::{Cancelled, Changed, Submitted, TextInput};
 use crate::placement::{self, Placement};
@@ -137,6 +137,11 @@ pub struct AppState {
     /// "Copied" next to a section title.
     copied: Option<(Area, u64)>,
     timers: u64,
+    /// The busy look: its level moves toward `snap.busy` over `BUSY_FADE`, a frame at a time.
+    busy: Busy,
+    busy_level: f32,
+    busy_target: bool,
+    busy_since: std::time::Instant,
     /// Messages that have been on screen, by id; `true` once one that is not an error timed out.
     shown: HashMap<u64, bool>,
     /// Measures what fits beside a title; set at each frame with the window's font.
@@ -324,11 +329,28 @@ fn status_text(s: &Snapshot) -> String {
         // The reason takes the room, as the heading's message.
         Phase::Failed(_) => channel.trim_start_matches(" · ").to_owned(),
         _ => format!(
-            "{} · proxy {}{lan} · API {}{channel}",
+            "{} · proxy {}{lan} · API {}{}{channel}",
             s.core_version.as_deref().unwrap_or("no core"),
             s.mixed_port,
             s.controller_port,
+            s.tun_device
+                .as_ref()
+                .map(|d| format!(" · TUN {d}"))
+                .unwrap_or_default(),
         ),
+    }
+}
+
+/// The TUN button's label and whether it is enabled. It shows what `/configs` reports, not the
+/// remembered choice, so a TUN asked for but not running reads Off.
+fn tun_button(s: &Snapshot) -> (&'static str, bool) {
+    let running = s.phase == Phase::Running;
+    match s.tun_busy {
+        Some(TunBusy::Authorizing) => ("TUN: Authorizing…", false),
+        Some(TunBusy::TurningOn) => ("TUN: Turning On…", false),
+        Some(TunBusy::TurningOff) => ("TUN: Turning Off…", false),
+        None if s.tun_device.is_some() => ("TUN: On", running),
+        None => ("TUN: Off", running),
     }
 }
 
@@ -736,6 +758,37 @@ fn hint(text: String, p: Palette) -> gpui::Div {
 /// Width of the label column, so every row's controls start at the same edge.
 const LABEL_WIDTH: Pixels = px(104.);
 
+/// How long the busy look takes to fade in or out.
+const BUSY_FADE: Duration = Duration::from_millis(200);
+
+/// What a busy backend does to an area of the window: `on` blocks hover and clicks at once, and
+/// `fade` (0 to 1, eased in) dims it, so a busy moment of a few milliseconds never blinks. Every
+/// control inside a covered area gets both, so new rows and buttons need nothing of their own.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Busy {
+    on: bool,
+    fade: f32,
+}
+
+impl Busy {
+    fn cover(self, content: impl IntoElement) -> gpui::Div {
+        div()
+            .relative()
+            .opacity(1. - 0.5 * self.fade)
+            .child(content)
+            .when(self.on, |area| {
+                area.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .block_mouse_except_scroll(),
+                )
+            })
+    }
+}
+
 /// The height of a button or field, the line every part of a Settings row is centred on.
 const CONTROL_HEIGHT: Pixels = px(27.);
 
@@ -896,6 +949,10 @@ impl AppState {
             confirm: None,
             copied: None,
             timers: 0,
+            busy: Busy::default(),
+            busy_level: 0.,
+            busy_target: false,
+            busy_since: cx.background_executor().now(),
             shown: HashMap::new(),
             measure: None,
             content_width: px(0.),
@@ -1017,6 +1074,31 @@ impl AppState {
             &self.field(port).input.read(cx).text(),
             Self::default_port(port),
         )
+    }
+
+    /// Moves the busy level toward the backend's state by the time since the last frame, and asks
+    /// for another frame until it gets there.
+    fn update_busy(&mut self, window: &mut Window, cx: &App) {
+        let now = cx.background_executor().now();
+        let on = self.snap.busy;
+        if on != self.busy_target {
+            self.busy_target = on;
+            self.busy_since = now;
+        }
+        let step = (now - self.busy_since).as_secs_f32() / BUSY_FADE.as_secs_f32();
+        self.busy_since = now;
+        self.busy_level = if on {
+            (self.busy_level + step).min(1.)
+        } else {
+            (self.busy_level - step).max(0.)
+        };
+        if self.busy_level != f32::from(u8::from(on)) {
+            window.request_animation_frame();
+        }
+        self.busy = Busy {
+            on,
+            fade: self.busy_level * self.busy_level,
+        };
     }
 
     /// Nothing can be applied while the core starts or stops, or another change is applied.
@@ -1494,6 +1576,8 @@ impl AppState {
             None if proxy_on => ("System Proxy: On", true),
             None => ("System Proxy: Off", running),
         };
+        let tun_on = s.tun_device.is_some();
+        let (tun_label, tun_enabled) = tun_button(&s);
         // The phase is the heading.
         let failed = matches!(s.phase, Phase::Failed(_));
         let items: Vec<(String, Hsla)> = self
@@ -1534,31 +1618,51 @@ impl AppState {
 
         // A list gets a heading, a setting a label beside it, as in Settings. Messages go beside
         // the headings, so none of them adds a line.
-        let mut column = div().flex().flex_col().text_size(px(12.));
-        column = column.child(status).child(field(
-            "Core",
-            div()
-                .flex()
-                .gap_2()
-                .child(button(
-                    "core",
-                    core_label,
-                    p,
-                    false,
-                    s.phase != Phase::Stopping,
-                    self.cmd(core_cmd),
-                ))
-                .child(button(
-                    "proxy",
-                    proxy_label,
-                    p,
-                    proxy_on,
-                    proxy_enabled,
-                    self.cmd(move || Cmd::SetProxy(!proxy_on)),
-                )),
-            None,
+        // Stop stays usable while busy: it also interrupts a start. Below this row, everything
+        // is covered at once.
+        let cover = self.busy;
+        let core = button(
+            "core",
+            core_label,
             p,
-        ));
+            false,
+            s.phase != Phase::Stopping,
+            self.cmd(core_cmd),
+        );
+        let head = div()
+            .flex()
+            .flex_col()
+            .text_size(px(12.))
+            .child(status)
+            .child(field(
+                "Core",
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(match s.phase {
+                        Phase::Running | Phase::Starting => core.into_any_element(),
+                        _ => cover.cover(core).into_any_element(),
+                    })
+                    .child(cover.cover(button(
+                        "proxy",
+                        proxy_label,
+                        p,
+                        proxy_on,
+                        proxy_enabled,
+                        self.cmd(move || Cmd::SetProxy(!proxy_on)),
+                    )))
+                    .child(cover.cover(button(
+                        "tun",
+                        tun_label,
+                        p,
+                        tun_on,
+                        tun_enabled,
+                        self.cmd(move || Cmd::SetTun(!tun_on)),
+                    ))),
+                None,
+                p,
+            ));
+        let mut column = div().flex().flex_col().text_size(px(12.));
 
         // Shown while stopped too: a choice is remembered and applied at the next start.
         let mut modes = div().flex().gap_1();
@@ -1724,7 +1828,8 @@ impl AppState {
             .id("control")
             .size_full()
             .overflow_y_scroll()
-            .child(column)
+            .child(head)
+            .child(self.busy.cover(column))
             .into_any_element()
     }
 
@@ -1911,12 +2016,16 @@ impl AppState {
         )
         .w_full()
         .flex_1();
-        div()
-            .flex()
-            .flex_col()
+        self.busy
+            .cover(
+                div()
+                    .flex()
+                    .flex_col()
+                    .size_full()
+                    .child(header)
+                    .child(list),
+            )
             .size_full()
-            .child(header)
-            .child(list)
             .into_any_element()
     }
 
@@ -2133,10 +2242,27 @@ impl AppState {
                 self.cmd(move || Cmd::SetLogLevel(level)),
             ));
         }
+        let stack_error = has_error(Topic::TunStack);
+        let mut stacks = div().flex().flex_wrap().gap_1();
+        for (stack, label) in [
+            (settings::TunStack::Mips, "Mips"),
+            (settings::TunStack::Gvisor, "gVisor"),
+            (settings::TunStack::System, "System"),
+        ] {
+            stacks = stacks.child(button(
+                format!("tun-stack-{}", stack.as_str()),
+                label,
+                p,
+                s.tun_stack == stack,
+                s.tun_stack != stack || stack_error,
+                self.cmd(move || Cmd::SetTunStack(stack)),
+            ));
+        }
         column = column
             .child(self.titled("Runtime", Area::Update, s.update_busy.clone(), 0., p, cx))
             .child(field("Latency URL", self.latency_controls(p, cx), None, p))
             .child(field("Log Level", levels, None, p))
+            .child(field("TUN Stack", stacks, None, p))
             .child(field("Core", versions, Some(action.into_any_element()), p));
         div()
             .id("settings")
@@ -2152,7 +2278,7 @@ impl AppState {
                     }
                 }),
             )
-            .child(column)
+            .child(self.busy.cover(column))
             .into_any_element()
     }
 
@@ -2602,6 +2728,7 @@ impl Render for AppState {
                     self.snap.active.as_ref() == Some(name),
                 ),
             };
+            let in_use = in_use || self.snap.busy;
             let delete = div()
                 .id(selector)
                 .debug_selector(|| selector.to_owned())
@@ -2651,6 +2778,7 @@ impl Render for AppState {
                 ),
             )
         });
+        self.update_busy(window, cx);
         let body = match self.tab {
             Tab::Control => self.render_control(p, window.viewport_size().width, cx),
             Tab::Connections => self.render_connections(p, cx),
@@ -2923,7 +3051,9 @@ mod gpui_tests {
 
     impl Ui<'_> {
         /// The test window has no display link, so layout happens only when asked.
+        /// Each frame also stands for a backend that has handled what was sent.
         fn frame(&mut self) {
+            self.view.update(self.cx, |this, _| this.handle.settle());
             self.cx.update(|window, cx| window.draw(cx).clear());
             self.cx.run_until_parked();
         }
@@ -3594,6 +3724,170 @@ mod gpui_tests {
         ));
     }
 
+    #[test]
+    fn the_tun_button_shows_the_actual_state() {
+        let with = |phase: Phase, device: Option<&str>, busy| {
+            tun_button(&Snapshot {
+                phase,
+                tun_device: device.map(str::to_owned),
+                tun_busy: busy,
+                ..Snapshot::default()
+            })
+        };
+        assert_eq!(with(Phase::Stopped, None, None), ("TUN: Off", false));
+        assert_eq!(with(Phase::Running, None, None), ("TUN: Off", true));
+        assert_eq!(
+            with(Phase::Running, None, Some(TunBusy::Authorizing)),
+            ("TUN: Authorizing…", false)
+        );
+        assert_eq!(
+            with(Phase::Running, None, Some(TunBusy::TurningOn)),
+            ("TUN: Turning On…", false)
+        );
+        assert_eq!(
+            with(Phase::Running, Some("utun9"), Some(TunBusy::TurningOff)),
+            ("TUN: Turning Off…", false)
+        );
+        assert_eq!(with(Phase::Running, Some("utun9"), None), ("TUN: On", true));
+    }
+
+    #[gpui::test]
+    fn the_tun_button_follows_system_proxy_and_sends_the_opposite(cx: &mut TestAppContext) {
+        let mut ui = open(cx, running());
+        let bounds = |ui: &mut Ui, id| ui.cx.debug_bounds(id).unwrap();
+        let (proxy, tun) = (bounds(&mut ui, "proxy"), bounds(&mut ui, "tun"));
+        assert!(tun.left() > proxy.right() && tun.top() == proxy.top());
+        ui.click("tun");
+        assert!(matches!(ui.sent()[..], [Cmd::SetTun(true)]));
+        ui.snap(|s| s.tun_device = Some("utun9".into()));
+        ui.click("tun");
+        assert!(matches!(ui.sent()[..], [Cmd::SetTun(false)]));
+        ui.snap(|s| s.tun_busy = Some(TunBusy::TurningOff));
+        ui.click("tun");
+        assert!(ui.sent().is_empty(), "disabled while switching");
+        ui.snap(|s| {
+            s.tun_busy = None;
+            s.tun_device = None;
+            s.phase = Phase::Stopped;
+        });
+        ui.click("tun");
+        assert!(ui.sent().is_empty(), "disabled while stopped");
+    }
+
+    #[gpui::test]
+    fn while_busy_only_stop_can_be_clicked(cx: &mut TestAppContext) {
+        let mut ui = open(cx, running());
+        ui.click("group-PICK");
+        ui.drain();
+        ui.snap(|s| s.busy = true);
+        for id in ["tun", "proxy", "global", "profile-work", "pick-PICK-REJECT"] {
+            ui.click(id);
+            assert!(ui.sent().is_empty(), "{id}");
+        }
+        ui.click("core");
+        assert!(matches!(ui.sent()[..], [Cmd::Stop]));
+        ui.snap(|s| s.busy = false);
+        ui.click("global");
+        assert!(matches!(&ui.sent()[..], [Cmd::SetMode(m)] if m == "global"));
+    }
+
+    #[gpui::test]
+    fn the_busy_look_fades_so_a_moment_of_busy_never_blinks(cx: &mut TestAppContext) {
+        let mut ui = open(cx, running());
+        let fade = |ui: &mut Ui| ui.read(|s| s.busy.fade);
+        let frame = Duration::from_millis(16);
+        // A command of one frame: the area hardly changes, then is back.
+        ui.snap(|s| s.busy = true);
+        ui.wait(frame);
+        assert!(fade(&mut ui) < 0.01, "{}", fade(&mut ui));
+        ui.snap(|s| s.busy = false);
+        ui.wait(frame);
+        assert_eq!(fade(&mut ui), 0.);
+        // A long one fades in fully over BUSY_FADE, and out again.
+        ui.snap(|s| s.busy = true);
+        for _ in 0..14 {
+            ui.wait(frame);
+        }
+        assert_eq!(fade(&mut ui), 1.);
+        ui.snap(|s| s.busy = false);
+        ui.wait(BUSY_FADE / 2);
+        let halfway = fade(&mut ui);
+        assert!(0. < halfway && halfway < 1., "{halfway}");
+        ui.wait(BUSY_FADE);
+        assert_eq!(fade(&mut ui), 0.);
+    }
+
+    #[gpui::test]
+    fn settings_are_covered_while_busy(cx: &mut TestAppContext) {
+        let mut ui = settings_tab(cx);
+        ui.snap(|s| s.busy = true);
+        for id in [
+            "theme-dark",
+            "tun-stack-gvisor",
+            "log-level-debug",
+            "import",
+        ] {
+            ui.click(id);
+            assert!(ui.sent().is_empty(), "{id}");
+        }
+        ui.snap(|s| s.busy = false);
+        ui.click("theme-dark");
+        assert!(matches!(ui.sent()[..], [Cmd::SetTheme(Theme::Dark)]));
+    }
+
+    #[gpui::test]
+    fn a_tun_reason_shows_on_controls_status_line_with_a_dot(cx: &mut TestAppContext) {
+        let mut ui = open(cx, running());
+        ui.click("tab-logs");
+        let text = "TUN did not start: Start TUN listening error: operation not permitted";
+        ui.snap(|s| {
+            s.messages.insert(
+                Topic::Tun,
+                Message {
+                    text: text.into(),
+                    error: true,
+                    id: 1,
+                },
+            );
+        });
+        assert!(ui.read(|s| s.unseen_error(Tab::Control)));
+        assert!(ui.cx.debug_bounds("tab-control-dot").is_some());
+        ui.click("tab-control");
+        let shown = ui.view.update(ui.cx, |this, cx| this.status_messages(cx));
+        assert_eq!(shown, [(text.to_owned(), true)]);
+        assert!(!ui.read(|s| s.unseen_error(Tab::Control)));
+    }
+
+    #[gpui::test]
+    fn tun_stack_sits_between_log_level_and_core(cx: &mut TestAppContext) {
+        let mut ui = settings_tab(cx);
+        let top = |ui: &mut Ui, id| ui.cx.debug_bounds(id).unwrap().top();
+        assert!(top(&mut ui, "label-Log Level") < top(&mut ui, "label-TUN Stack"));
+        assert!(top(&mut ui, "label-TUN Stack") < top(&mut ui, "label-Core"));
+        let left = |ui: &mut Ui, id| ui.cx.debug_bounds(id).unwrap().left();
+        let order =
+            ["tun-stack-mips", "tun-stack-gvisor", "tun-stack-system"].map(|id| left(&mut ui, id));
+        assert!(
+            order.windows(2).all(|w| w[0] < w[1]),
+            "Mips, gVisor, System"
+        );
+        ui.click("tun-stack-mips");
+        assert!(ui.sent().is_empty(), "already Mips");
+        ui.click("tun-stack-gvisor");
+        assert!(matches!(
+            ui.sent()[..],
+            [Cmd::SetTunStack(settings::TunStack::Gvisor)]
+        ));
+        ui.snap(|s| s.tun_stack = settings::TunStack::System);
+        ui.click("tun-stack-system");
+        assert!(ui.sent().is_empty(), "already System");
+        ui.click("tun-stack-mips");
+        assert!(matches!(
+            ui.sent()[..],
+            [Cmd::SetTunStack(settings::TunStack::Mips)]
+        ));
+    }
+
     #[gpui::test]
     fn dock_icon_choice_follows_the_snapshot_on_the_label_column(cx: &mut TestAppContext) {
         let mut ui = open(cx, running());
@@ -3715,6 +4009,11 @@ mod gpui_tests {
         assert_eq!(
             status_text(&s),
             format!("v1.19.33 · proxy 10999 · LAN · API 11000{dev}")
+        );
+        s.tun_device = Some("utun9".into());
+        assert_eq!(
+            status_text(&s),
+            format!("v1.19.33 · proxy 10999 · LAN · API 11000 · TUN utun9{dev}")
         );
         // A failure's reason takes the room; only the channel stays.
         s.phase = Phase::Failed("boom".into());

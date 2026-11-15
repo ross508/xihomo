@@ -228,6 +228,26 @@ impl LogLevel {
     }
 }
 
+/// Mihomo's TUN `stack`. `mixed` is not offered.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum TunStack {
+    #[default]
+    Mips,
+    Gvisor,
+    System,
+}
+
+impl TunStack {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mips => "mips",
+            Self::Gvisor => "gvisor",
+            Self::System => "system",
+        }
+    }
+}
+
 /// `settings.yaml`: only what the user edits. xihomo changes only the key edited in the GUI.
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct Settings {
@@ -242,6 +262,7 @@ pub struct Settings {
     pub log_level: LogLevel,
     /// What every latency test xihomo runs requests, kept as typed: Mihomo keys results by it.
     pub latency_url: String,
+    pub tun_stack: TunStack,
 }
 
 pub const DEFAULT_LATENCY_URL: &str = "https://cp.cloudflare.com/generate_204";
@@ -272,6 +293,7 @@ impl Default for Settings {
             keep_dock_icon: true,
             log_level: LogLevel::Info,
             latency_url: DEFAULT_LATENCY_URL.into(),
+            tun_stack: TunStack::Mips,
         }
     }
 }
@@ -337,6 +359,7 @@ impl Settings {
                 keep_dock_icon: field(&map, "keep_dock_icon", d.keep_dock_icon, &mut invalid),
                 log_level: field(&map, "log_level", d.log_level, &mut invalid),
                 latency_url: d.latency_url.clone(),
+                tun_stack: field(&map, "tun_stack", d.tun_stack, &mut invalid),
             };
             if let Some(value) = map.get("latency_url") {
                 match value.as_str().and_then(latency_url) {
@@ -397,9 +420,10 @@ pub struct AppData {
     pub core_version: Option<String>,
     pub previous_core_version: Option<String>,
     pub last_good_home: Option<PathBuf>,
-    /// The user's last Start/Stop and System Proxy choices, restored at launch.
+    /// The user's last Start/Stop, System Proxy and TUN choices, restored at launch.
     pub core_on: bool,
     pub proxy_on: bool,
+    pub tun_on: bool,
     /// The user's outbound mode; `None` keeps each profile's own `mode`.
     pub mode: Option<String>,
     /// Profile names in the order they were added; see `profiles::arrange`.
@@ -415,6 +439,7 @@ impl Default for AppData {
             last_good_home: None,
             core_on: true,
             proxy_on: false,
+            tun_on: false,
             mode: None,
             profile_order: Vec::new(),
         }
@@ -477,7 +502,7 @@ mod tests {
         assert_eq!(Settings::load(&paths).unwrap().0, Settings::default());
         fs::write(
             paths.settings(),
-            "theme: dark\nmixed_port: 7000\nkeep_dock_icon: false\nlog_level: debug\nunknown: 1\n",
+            "theme: dark\nmixed_port: 7000\nkeep_dock_icon: false\nlog_level: debug\ntun_stack: gvisor\nunknown: 1\n",
         )
         .unwrap();
         let (settings, notice, invalid) = Settings::load(&paths).unwrap();
@@ -489,6 +514,7 @@ mod tests {
                 mixed_port: 7000,
                 keep_dock_icon: false,
                 log_level: LogLevel::Debug,
+                tun_stack: TunStack::Gvisor,
                 ..Settings::default()
             }
         );
@@ -526,7 +552,7 @@ mod tests {
     fn an_invalid_value_takes_its_default_and_keeps_the_others() {
         let paths = temp_paths("settings-fields");
         let d = Settings::default();
-        let text = "theme: purple\nicon_set: bars\nmixed_port: 80\ncontroller_port: 7001\nallow_lan: yes please\nkeep_dock_icon: 3\nlog_level: loud\n";
+        let text = "theme: purple\nicon_set: bars\nmixed_port: 80\ncontroller_port: 7001\nallow_lan: yes please\nkeep_dock_icon: 3\nlog_level: loud\ntun_stack: mixed\n";
         fs::write(paths.settings(), text).unwrap();
         let (settings, notice, invalid) = Settings::load(&paths).unwrap();
         assert_eq!(
@@ -547,7 +573,8 @@ mod tests {
                 "keep_dock_icon",
                 "log_level",
                 "mixed_port",
-                "theme"
+                "theme",
+                "tun_stack"
             ]
         );
         // Each notice names only its own key, for the control that edits it.

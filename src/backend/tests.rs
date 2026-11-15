@@ -111,7 +111,7 @@ local_test!(start_control_stop, a, _rx, {
     a.handle(Cmd::Stop).await;
     assert_eq!(a.snap.phase, Phase::Stopped);
     assert!(a.core.is_none());
-    core::ensure_ports_free(&[a.settings.mixed_port, a.settings.controller_port])
+    core::ensure_ports_free(&[a.settings.mixed_port, a.settings.controller_port], false)
         .await
         .unwrap();
 });
@@ -406,7 +406,7 @@ local_test!(a_proxy_port_change_applies_by_reload, a, _rx, {
     }
     assert!(closed(first), "like Reload");
     let (_second, _far) = tunnel(&a).await;
-    core::ensure_ports_free(&[old]).await.unwrap();
+    core::ensure_ports_free(&[old], false).await.unwrap();
     a.handle(Cmd::Stop).await;
 });
 
@@ -820,7 +820,7 @@ async fn dev_profiles_validate_after_overrides() {
         let yaml = profiles::compose(
             &fs::read(&path).unwrap(),
             b"",
-            &profiles::Runtime::new(&Settings::default(), "x", None),
+            &profiles::Runtime::new(&Settings::default(), "x", None, false),
         )
         .unwrap_or_else(|_| panic!("composition failed"))
         .yaml;
@@ -1079,7 +1079,7 @@ async fn default_profile_passes_the_real_core() {
     let candidate = profiles::write_candidate(
         &paths,
         "default",
-        &profiles::Runtime::new(&Settings::default(), "x", None),
+        &profiles::Runtime::new(&Settings::default(), "x", None, false),
     )
     .unwrap();
     core::validate(&exe, &paths, &candidate.home, &paths.candidate(), "x")
@@ -1562,3 +1562,222 @@ local_test!(latency_tests_run_against_the_real_core, a, rx, {
     a.handle(Cmd::Stop).await;
     assert!(a.snap.nodes.is_empty());
 });
+
+/// Stands in for the administrator dialog: notes the request beside the file, then cancels.
+fn cancel_authorization(exe: &Path) -> Result<bool> {
+    fs::write(exe.with_file_name("asked"), "").unwrap();
+    Ok(false)
+}
+
+fn asked(a: &Actor, version: &str) -> bool {
+    a.paths.core_exe(version).with_file_name("asked").exists()
+}
+
+/// The `tun` the running core was started or reloaded with.
+fn composed_tun(a: &Actor) -> serde_json::Value {
+    let yaml: serde_json::Value =
+        yaml_serde::from_str(&fs::read_to_string(a.paths.config()).unwrap()).unwrap();
+    yaml["tun"].clone()
+}
+
+local_test!(only_user_actions_change_tun_on, a, _rx, {
+    a.app.tun_on = true;
+    a.app.save(&a.paths).unwrap();
+    a.authorize = cancel_authorization;
+    // Launch restore: no dialog, TUN off, the choice kept and the reason shown.
+    a.handle(Cmd::Restore).await;
+    assert_eq!(a.snap.phase, Phase::Running, "{:?}", a.snap.error());
+    assert!(!asked(&a, VERSION), "never a dialog at launch");
+    assert!(saved(&a).tun_on);
+    assert_eq!(composed_tun(&a), serde_json::json!({"enable": false}));
+    let reason = a.snap.message(Topic::Tun).unwrap();
+    assert!(reason.error && reason.text.contains("needs administrator authorization"));
+    assert_eq!(Topic::Tun.area(), Area::Core);
+    a.publish();
+    assert!(a.snap.tun_needs_auth && a.snap.tun_device.is_none());
+
+    // The core exits on its own: unchanged.
+    let pid = a.core.as_ref().unwrap().pid();
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    let status = a.core.as_mut().unwrap().wait().await;
+    a.on_core_exit(status).await;
+    assert!(saved(&a).tun_on);
+
+    // Start is a click, so it asks; cancelling turns the choice off and starts without TUN.
+    a.handle(Cmd::Start).await;
+    assert_eq!(a.snap.phase, Phase::Running, "{:?}", a.snap.error());
+    assert!(asked(&a, VERSION));
+    assert!(!saved(&a).tun_on);
+    let note = a.snap.message(Topic::Tun).unwrap();
+    assert!(!note.error && note.text.contains("cancelled"), "{note:?}");
+
+    // The switch, cancelled: nothing changes, the same process keeps running.
+    let pid = a.core.as_ref().unwrap().pid();
+    a.handle(Cmd::SetTun(true)).await;
+    assert!(!saved(&a).tun_on);
+    assert_eq!(a.core.as_ref().unwrap().pid(), pid);
+    assert_eq!(a.snap.tun_busy, None);
+
+    // System Proxy and Start leave it alone; Stop turns it off, and Quit leaves it.
+    a.app.tun_on = true;
+    a.handle(Cmd::Start).await;
+    assert!(saved(&a).tun_on, "Start on a running core changes nothing");
+    a.shutdown().await;
+    assert!(saved(&a).tun_on, "Quit");
+    a.handle(Cmd::Start).await;
+    a.handle(Cmd::Stop).await;
+    assert!(!saved(&a).tun_on);
+    assert_eq!(a.snap.message(Topic::Tun), None);
+});
+
+local_test!(turning_tun_off_reloads_without_a_restart, a, _rx, {
+    a.handle(Cmd::Start).await;
+    let pid = a.core.as_ref().unwrap().pid();
+    a.app.tun_on = true;
+    a.handle(Cmd::SetTun(false)).await;
+    assert_eq!(a.snap.message(Topic::Tun), None, "{:?}", a.snap.error());
+    assert_eq!(a.core.as_ref().unwrap().pid(), pid);
+    assert!(!saved(&a).tun_on);
+    assert_eq!(composed_tun(&a), serde_json::json!({"enable": false}));
+    a.handle(Cmd::Stop).await;
+    a.handle(Cmd::SetTun(true)).await;
+    assert!(message(&a, Topic::Tun).contains("not running"));
+});
+
+local_test!(an_old_core_explains_that_tun_needs_a_newer_one, a, _rx, {
+    let old = "v1.19.32";
+    fs::create_dir_all(a.paths.bin().join(old)).unwrap();
+    std::os::unix::fs::symlink(real_core().unwrap(), a.paths.core_exe(old)).unwrap();
+    a.app.core_version = Some(old.into());
+    a.authorize = cancel_authorization;
+    a.handle(Cmd::Start).await;
+    a.handle(Cmd::SetTun(true)).await;
+    assert!(message(&a, Topic::Tun).contains("needs core v1.19.33 or newer"));
+    assert!(!asked(&a, old), "no dialog for a core that cannot run TUN");
+    assert!(!saved(&a).tun_on);
+    a.handle(Cmd::Stop).await;
+});
+
+local_test!(a_version_change_asks_only_while_tun_is_on, a, _rx, {
+    let next = "v1.19.34";
+    fs::create_dir_all(a.paths.bin().join(next)).unwrap();
+    std::os::unix::fs::symlink(real_core().unwrap(), a.paths.core_exe(next)).unwrap();
+    a.authorize = cancel_authorization;
+    // Stopped, with TUN asked for: only recorded.
+    a.app.tun_on = true;
+    a.handle(Cmd::ActivateVersion(next.into())).await;
+    assert_eq!(a.snap.error(), None);
+    assert!(!asked(&a, next));
+    a.handle(Cmd::ActivateVersion(VERSION.into())).await;
+
+    // Running with TUN off: no dialog.
+    a.app.tun_on = false;
+    a.handle(Cmd::Start).await;
+    a.handle(Cmd::ActivateVersion(next.into())).await;
+    assert_eq!(a.snap.error(), None);
+    assert!(!asked(&a, next));
+    a.handle(Cmd::ActivateVersion(VERSION.into())).await;
+
+    // Running with TUN on: asked for the new file; cancelled, it still switches, without TUN.
+    a.app.tun_on = true;
+    a.handle(Cmd::ActivateVersion(next.into())).await;
+    assert!(asked(&a, next));
+    assert_eq!(a.app.core_version.as_deref(), Some(next));
+    assert_eq!(a.snap.phase, Phase::Running, "{:?}", a.snap.error());
+    assert!(!saved(&a).tun_on);
+    assert_eq!(composed_tun(&a), serde_json::json!({"enable": false}));
+    a.handle(Cmd::Stop).await;
+});
+
+/// Serves `/configs` as a core whose TUN failed: enabled, with no device.
+fn failed_tun_core() -> u16 {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let _ = stream.read(&mut [0u8; 4096]);
+            let body = r#"{"mode":"rule","tun":{"enable":true,"device":"","stack":"Mips"}}"#;
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    port
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_tun_that_did_not_come_up_is_reported() {
+    let mut a = idle("tun-check");
+    a.api = Api::new(failed_tun_core(), &a.secret).unwrap();
+    a.tun = true;
+    a.check_tun().await;
+    assert_eq!(a.snap.tun_device, None);
+    let m = a.snap.message(Topic::Tun).unwrap();
+    assert!(m.error && m.text.starts_with("TUN did not start"), "{m:?}");
+    // Off as asked: the reason stays until the user acts on TUN.
+    a.tun = false;
+    a.check_tun().await;
+    assert!(a.snap.message(Topic::Tun).is_some());
+    a.handle(Cmd::SetTun(true)).await;
+    assert!(
+        message(&a, Topic::Tun).contains("not running"),
+        "replaced by the click's own"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_tun_stack_change_is_only_saved_while_tun_is_off() {
+    let mut a = idle("tun-stack");
+    a.handle(Cmd::SetTunStack(TunStack::System)).await;
+    a.publish();
+    assert_eq!(a.snap.error(), None);
+    assert_eq!(a.snap.tun_stack, TunStack::System);
+    assert_eq!(saved_settings(&a).tun_stack, TunStack::System);
+}
+
+#[test]
+fn one_user_command_at_a_time_except_stop() {
+    let (handle, mut rx) = Handle::detached(Snapshot::default());
+    let sent =
+        |rx: &mut mpsc::UnboundedReceiver<Cmd>| std::iter::from_fn(|| rx.try_recv().ok()).count();
+    handle.send(Cmd::SetTun(true));
+    handle.send(Cmd::SetMode("global".into()));
+    handle.send(Cmd::TestGroup("PICK".into()));
+    assert_eq!(
+        sent(&mut rx),
+        1,
+        "later clicks are dropped while the first runs"
+    );
+    // Background commands and Stop always go through; Stop also interrupts a start.
+    handle.send(Cmd::WatchConnections(true));
+    handle.send(Cmd::Stop);
+    assert_eq!(sent(&mut rx), 2);
+    assert!(handle.cancel.load(Ordering::SeqCst));
+    handle.settle();
+    handle.send(Cmd::SetMode("rule".into()));
+    assert_eq!(sent(&mut rx), 1, "accepted once the backend is done");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn busy_is_published_before_a_user_command_runs_and_cleared_after() {
+    let paths = temp_paths("busy");
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let (mut a, snap_rx, ..) = Actor::new(paths, tx, Arc::new(AtomicBool::new(false))).unwrap();
+    a.busy.store(true, Ordering::SeqCst);
+    a.handle(Cmd::SetTheme(Theme::Dark)).await;
+    assert!(snap_rx.borrow().busy, "on screen while it ran");
+    assert!(!a.snap.busy && !a.busy.load(Ordering::SeqCst));
+    // Background work never marks the window busy.
+    a.busy.store(true, Ordering::SeqCst);
+    a.snap_tx
+        .send_modify(|s| *s = Arc::new(Snapshot::default()));
+    a.handle(Cmd::Refresh).await;
+    assert!(!snap_rx.borrow().busy);
+    assert!(
+        a.busy.load(Ordering::SeqCst),
+        "left to the user command that raised it"
+    );
+}

@@ -220,14 +220,24 @@ pub fn installed(paths: &Paths) -> Vec<String> {
     out
 }
 
-/// The newest installed version, comparing its numbers so v1.19.0 beats v1.9.0.
+/// A version's numbers, so v1.19.0 compares above v1.9.0.
+fn numbers(version: &str) -> Vec<u64> {
+    version
+        .trim_start_matches('v')
+        .split(|c: char| !c.is_ascii_digit())
+        .filter_map(|n| n.parse().ok())
+        .collect()
+}
+
+/// TUN needs v1.19.33 or newer: older cores ignore `dns-mode`.
+pub const TUN_MIN: &str = "v1.19.33";
+
+pub fn supports_tun(version: &str) -> bool {
+    numbers(version) >= numbers(TUN_MIN)
+}
+
+/// The newest installed version.
 pub fn newest_installed(paths: &Paths) -> Option<String> {
-    let numbers = |v: &str| -> Vec<u64> {
-        v[1..]
-            .split(|c: char| !c.is_ascii_digit())
-            .filter_map(|n| n.parse().ok())
-            .collect()
-    };
     installed(paths).into_iter().max_by_key(|v| numbers(v))
 }
 
@@ -263,6 +273,22 @@ mod tests {
         bytes.extend_from_slice(&0x0100_000c_u32.to_le_bytes());
         bytes.resize(8 + extra, 0);
         bytes
+    }
+
+    #[test]
+    fn tun_needs_v1_19_33_or_newer() {
+        for good in [
+            "v1.19.33",
+            "v1.19.34",
+            "v1.20.0",
+            "v2.0.0",
+            "v1.19.33-alpha",
+        ] {
+            assert!(supports_tun(good), "{good}");
+        }
+        for old in ["v1.19.32", "v1.9.40", "v1.18.99", "v0.99.0"] {
+            assert!(!supports_tun(old), "{old}");
+        }
     }
 
     #[test]
