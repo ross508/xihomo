@@ -1,13 +1,15 @@
 //! One actor on one Tokio thread owns the child, settings and system proxy, so lifecycle work is
 //! serialized. The UI only sends commands and observes coalescing `watch` snapshots.
-use crate::api::{Api, Connection, Group, LineSplitter, LogBuffer, LogLine, parse_log_line};
+use crate::api::{
+    Api, Connection, Group, Latency, LineSplitter, LogBuffer, LogLine, Node, parse_log_line,
+};
 use crate::core::{self, Core};
 use crate::profiles::{self, Profile};
 use crate::proxy;
 use crate::settings::{self, AppData, LogLevel, Paths, Settings, Theme, write_private};
 use crate::update::{self, Release};
 use anyhow::{Context, Result, anyhow, bail};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::future::pending;
 use std::net::Ipv4Addr;
@@ -27,6 +29,32 @@ const LOG_LINE_BYTES: usize = 64 * 1024;
 const MODES: [&str; 3] = ["rule", "global", "direct"];
 /// Built-in outbounds that are never a useful default for GLOBAL.
 const BUILTIN: [&str; 5] = ["DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE"];
+/// Adapter kinds a latency test means nothing for.
+const UNTESTED: [&str; 7] = [
+    "Reject",
+    "RejectDrop",
+    "Pass",
+    "PassRule",
+    "Compatible",
+    "Dns",
+    "Rematch",
+];
+/// Latency tests in flight at once.
+const TEST_LIMIT: usize = 32;
+
+/// What a card for `member` stands for: `now` followed through groups to a node. A group without
+/// `now`, a cycle or a name in no list stops the walk there.
+pub fn resolve(member: &str, groups: &[Group], nodes: &BTreeMap<String, Node>) -> String {
+    let mut seen = vec![member];
+    while let Some(group) = groups.iter().find(|g| g.name == *seen.last().unwrap()) {
+        let next = group.now.as_str();
+        if next.is_empty() || seen.contains(&next) || !nodes.contains_key(next) {
+            break;
+        }
+        seen.push(next);
+    }
+    seen.last().unwrap().to_string()
+}
 
 /// Mihomo lists a connection's chain from the node outward, so the entry before a group is the
 /// member it chose.
@@ -80,6 +108,72 @@ pub enum Area {
     Update,
 }
 
+/// What a message is about. A section shows one message per topic; a new one replaces only the
+/// message of its own topic, and a user command clears only its own topic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Topic {
+    Core,
+    /// Running the last-good configuration instead of the chosen profile.
+    LastGood,
+    SystemProxy,
+    /// The 30-second proxy guard and new-service sync.
+    ProxyCheck,
+    Profile,
+    Providers,
+    ProfileList,
+    Groups,
+    Icon,
+    Theme,
+    DockIcon,
+    /// `settings.yaml` or `app.json` was set aside.
+    SettingsFile,
+    ProxyPort,
+    /// The proxy port another tool set.
+    ExternalPort,
+    Lan,
+    ApiPort,
+    Secret,
+    CoreUpdate,
+    CoreVersion,
+    CoreReplaced,
+    LogLevel,
+    LatencyUrl,
+}
+
+impl Topic {
+    pub fn area(self) -> Area {
+        match self {
+            Self::Core | Self::LastGood => Area::Core,
+            Self::SystemProxy | Self::ProxyCheck => Area::Proxy,
+            Self::Profile | Self::Providers | Self::ProfileList => Area::Profiles,
+            Self::Groups => Area::Groups,
+            Self::Icon | Self::Theme | Self::DockIcon | Self::SettingsFile => Area::Files,
+            Self::ProxyPort | Self::ExternalPort | Self::Lan => Area::Listen,
+            Self::ApiPort | Self::Secret => Area::Api,
+            Self::CoreUpdate
+            | Self::CoreVersion
+            | Self::CoreReplaced
+            | Self::LogLevel
+            | Self::LatencyUrl => Area::Update,
+        }
+    }
+
+    /// The topic of the control that edits a `settings.yaml` key.
+    fn of_setting(key: &str) -> Self {
+        match key {
+            "mixed_port" => Self::ProxyPort,
+            "controller_port" => Self::ApiPort,
+            "allow_lan" => Self::Lan,
+            "icon_set" => Self::Icon,
+            "theme" => Self::Theme,
+            "keep_dock_icon" => Self::DockIcon,
+            "log_level" => Self::LogLevel,
+            "latency_url" => Self::LatencyUrl,
+            _ => Self::SettingsFile,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Message {
     pub text: String,
@@ -104,8 +198,8 @@ pub struct Snapshot {
     pub proxy_on: bool,
     /// A proxy write is running: `Some(true)` turning on, `Some(false)` turning off.
     pub proxy_busy: Option<bool>,
-    /// At most one message per area; a later user action in that area replaces it.
-    pub messages: BTreeMap<Area, Message>,
+    /// At most one message per topic; a later user command of that topic clears it.
+    pub messages: BTreeMap<Topic, Message>,
     pub icon_set: String,
     pub theme: Theme,
     pub keep_dock_icon: bool,
@@ -123,11 +217,53 @@ pub struct Snapshot {
     /// The running profile's providers are being updated.
     pub providers_busy: bool,
     pub config_dir: PathBuf,
+    pub latency_url: String,
+    /// Every entry of `/proxies` and the providers' nodes, with their latency for `latency_url`.
+    pub nodes: BTreeMap<String, Node>,
+    /// Nodes being tested.
+    pub testing: BTreeSet<String>,
+    /// The group whose test runs; only one at a time.
+    pub testing_group: Option<String>,
 }
 
 impl Snapshot {
-    pub fn message(&self, area: Area) -> Option<&Message> {
-        self.messages.get(&area)
+    pub fn message(&self, topic: Topic) -> Option<&Message> {
+        self.messages.get(&topic)
+    }
+
+    /// The messages shown beside `area`, newest first.
+    pub fn messages_in(&self, area: Area) -> Vec<&Message> {
+        let mut list: Vec<&Message> = self
+            .messages
+            .iter()
+            .filter(|(topic, _)| topic.area() == area)
+            .map(|(_, m)| m)
+            .collect();
+        list.sort_by_key(|m| std::cmp::Reverse(m.id));
+        list
+    }
+
+    /// The node a card for `member` shows and tests; `None` when it is never tested.
+    pub fn target(&self, member: &str) -> Option<String> {
+        let node = resolve(member, &self.groups, &self.nodes);
+        let kind = &self.nodes.get(&node)?.kind;
+        (!UNTESTED.contains(&kind.as_str())).then_some(node)
+    }
+
+    /// The members a group shows (GLOBAL without REJECT), as their cards' nodes, each once.
+    pub fn group_targets(&self, group: &str) -> Vec<String> {
+        let Some(group) = self.groups.iter().find(|g| g.name == group) else {
+            return Vec::new();
+        };
+        let mut targets = Vec::new();
+        for member in group.shown() {
+            if let Some(node) = self.target(member)
+                && !targets.contains(&node)
+            {
+                targets.push(node);
+            }
+        }
+        targets
     }
 
     #[cfg(test)]
@@ -162,6 +298,16 @@ pub enum Cmd {
     SetTheme(Theme),
     SetKeepDockIcon(bool),
     SetLogLevel(LogLevel),
+    /// As typed; empty means the default.
+    SetLatencyUrl(String),
+    /// Tests the node a member's card stands for.
+    TestNode(String),
+    TestGroup(String),
+    Tested {
+        epoch: u64,
+        node: String,
+        latency: Latency,
+    },
     /// Ports arrive as typed, up to five digits; the backend validates them.
     SetProxyPort(u32),
     SetAllowLan(bool),
@@ -185,30 +331,35 @@ pub enum Cmd {
 }
 
 impl Cmd {
-    fn area(&self) -> Area {
+    fn topic(&self) -> Topic {
         match self {
-            Cmd::SetProxy(_) | Cmd::GuardProxy => Area::Proxy,
-            Cmd::Select { .. } => Area::Groups,
+            Cmd::SetProxy(_) | Cmd::GuardProxy => Topic::SystemProxy,
+            Cmd::Select { .. } | Cmd::TestNode(_) | Cmd::TestGroup(_) | Cmd::Tested { .. } => {
+                Topic::Groups
+            }
             Cmd::Activate(_)
             | Cmd::Reload
             | Cmd::Refresh
             | Cmd::LinkProfile(_)
             | Cmd::ImportProfile(_)
-            | Cmd::RemoveProfile(_)
-            | Cmd::UpdateProviders
-            | Cmd::ProvidersUpdated(_)
-            | Cmd::CheckNow => Area::Profiles,
-            Cmd::CheckUpdate
-            | Cmd::Download
-            | Cmd::ActivateVersion(_)
-            | Cmd::DeleteVersion(_)
-            | Cmd::Checked(_)
-            | Cmd::Staged(_)
-            | Cmd::SetLogLevel(_) => Area::Update,
-            Cmd::SetIconSet(_) | Cmd::SetTheme(_) | Cmd::SetKeepDockIcon(_) => Area::Files,
-            Cmd::SetProxyPort(_) | Cmd::SetAllowLan(_) => Area::Listen,
-            Cmd::SetApiPort(_) | Cmd::RegenerateSecret => Area::Api,
-            _ => Area::Core,
+            | Cmd::RemoveProfile(_) => Topic::Profile,
+            Cmd::UpdateProviders | Cmd::ProvidersUpdated(_) => Topic::Providers,
+            // The checks it runs clear their own topics; the listing is the one it repeats.
+            Cmd::CheckNow => Topic::ProfileList,
+            Cmd::CheckUpdate | Cmd::Download | Cmd::Checked(_) | Cmd::Staged(_) => {
+                Topic::CoreUpdate
+            }
+            Cmd::ActivateVersion(_) | Cmd::DeleteVersion(_) => Topic::CoreVersion,
+            Cmd::SetLogLevel(_) => Topic::LogLevel,
+            Cmd::SetLatencyUrl(_) => Topic::LatencyUrl,
+            Cmd::SetIconSet(_) => Topic::Icon,
+            Cmd::SetTheme(_) => Topic::Theme,
+            Cmd::SetKeepDockIcon(_) => Topic::DockIcon,
+            Cmd::SetProxyPort(_) => Topic::ProxyPort,
+            Cmd::SetAllowLan(_) => Topic::Lan,
+            Cmd::SetApiPort(_) => Topic::ApiPort,
+            Cmd::RegenerateSecret => Topic::Secret,
+            _ => Topic::Core,
         }
     }
 
@@ -221,6 +372,7 @@ impl Cmd {
                 | Cmd::Checked(_)
                 | Cmd::Staged(_)
                 | Cmd::ProvidersUpdated(_)
+                | Cmd::Tested { .. }
                 | Cmd::Restore
                 | Cmd::GuardProxy
                 | Cmd::Shutdown(_)
@@ -329,6 +481,12 @@ struct Actor {
     /// The previous proxy port while the system proxy moves off it; it still counts as ours.
     switching_from: Option<u16>,
     next_message: u64,
+    /// Changes when the core stops, reloads or the Latency URL changes; older results are dropped.
+    epoch: u64,
+    /// The running group test's nodes, including ones a single test had already started.
+    group_nodes: Vec<String>,
+    /// Shared by every test, so at most `TEST_LIMIT` run at once.
+    test_slots: Arc<tokio::sync::Semaphore>,
 }
 
 type Parts = (
@@ -354,9 +512,9 @@ async fn wait_core(core: &mut Option<Core>) -> std::io::Result<std::process::Exi
 
 impl Actor {
     fn new(paths: Paths, tx: mpsc::UnboundedSender<Cmd>, cancel: Arc<AtomicBool>) -> Result<Parts> {
-        let (settings, settings_notice) = Settings::load(&paths)?;
+        let (settings, settings_notice, invalid) = Settings::load(&paths)?;
         let (app, app_notice) = AppData::load(&paths)?;
-        let notices: Vec<String> = settings_notice.into_iter().chain(app_notice).collect();
+        let set_aside: Vec<String> = settings_notice.into_iter().chain(app_notice).collect();
         // A first run has no dashboards to update.
         let first_run = !paths.app_data().exists();
         let (secret, regenerated) = paths.secret()?;
@@ -408,13 +566,20 @@ impl Actor {
             },
             switching_from: None,
             next_message: 0,
+            epoch: 0,
+            group_nodes: Vec::new(),
+            test_slots: Arc::new(tokio::sync::Semaphore::new(TEST_LIMIT)),
         };
-        if !notices.is_empty() {
-            actor.say(Area::Files, notices.join("; "), true);
+        // Information: its time starts once it is on screen, so it is still seen once.
+        if !set_aside.is_empty() {
+            actor.say(Topic::SettingsFile, set_aside.join(". "), false);
+        }
+        for (key, text) in invalid {
+            actor.say(Topic::of_setting(key), text, true);
         }
         if regenerated && !first_run {
-            let text = "Secret was regenerated; update your dashboards".to_owned();
-            actor.say(Area::Api, text, false);
+            let text = "Secret was regenerated. Update your dashboards".to_owned();
+            actor.say(Topic::Secret, text, false);
         }
         actor.publish();
         Ok((actor, snap_rx, conn_rx, log_rx, logs))
@@ -463,6 +628,7 @@ impl Actor {
         self.snap.controller_port = self.settings.controller_port;
         self.snap.allow_lan = self.settings.allow_lan;
         self.snap.secret.clone_from(&self.secret);
+        self.snap.latency_url.clone_from(&self.settings.latency_url);
         self.snap.installed = update::installed(&self.paths);
         if self.core.is_none() {
             self.snap.mode = self.app.mode.clone().unwrap_or_default();
@@ -481,10 +647,10 @@ impl Actor {
         match core::recover_orphan(&self.paths).await {
             Ok(true) => self.log(false, "Stopped a core left behind by a previous run"),
             Ok(false) => {}
-            Err(e) => self.say(Area::Core, format!("{e:#}"), true),
+            Err(e) => self.say(Topic::Core, format!("{e:#}"), true),
         }
         if let Err(e) = profiles::ensure_default(&self.paths) {
-            self.say(Area::Files, format!("{e:#}"), true);
+            self.say(Topic::Profile, format!("{e:#}"), true);
         }
         // A core placed in bin/ by hand is used, before the cleanup below would delete it.
         if self.app.core_version.is_none()
@@ -493,7 +659,7 @@ impl Actor {
             self.app.core_version = Some(version.clone());
             match self.app.save(&self.paths) {
                 Ok(()) => self.log(false, &format!("Using installed core {version}")),
-                Err(e) => self.say(Area::Core, format!("{e:#}"), true),
+                Err(e) => self.say(Topic::Core, format!("{e:#}"), true),
             }
         }
         self.refresh_profiles();
@@ -511,19 +677,25 @@ impl Actor {
         self.log_tx.send_replace(logs.generation);
     }
 
-    /// Shown next to `area` and kept in Logs.
-    fn say(&mut self, area: Area, text: String, error: bool) {
+    /// Shown next to its topic's section, replacing that topic's message, and kept in Logs.
+    fn say(&mut self, topic: Topic, text: String, error: bool) {
         self.log(error, &text);
         self.next_message += 1;
         let id = self.next_message;
-        self.snap.messages.insert(area, Message { text, error, id });
+        self.snap
+            .messages
+            .insert(topic, Message { text, error, id });
     }
 
     /// For a condition seen on every check: said again only once its message was replaced.
-    fn say_once(&mut self, area: Area, text: String, error: bool) {
-        if self.snap.message(area).is_none_or(|m| m.text != text) {
-            self.say(area, text, error);
+    fn say_once(&mut self, topic: Topic, text: String, error: bool) {
+        if self.snap.message(topic).is_none_or(|m| m.text != text) {
+            self.say(topic, text, error);
         }
+    }
+
+    fn clear(&mut self, topic: Topic) {
+        self.snap.messages.remove(&topic);
     }
 
     /// Only user choices are remembered; crashes, failed starts and Quit leave them alone.
@@ -534,16 +706,16 @@ impl Actor {
     }
 
     async fn handle(&mut self, cmd: Cmd) {
-        let area = cmd.area();
+        let topic = cmd.topic();
         if cmd.is_user_action() {
-            self.snap.messages.remove(&area);
+            self.clear(topic);
         }
         let applies = matches!(
             cmd,
             Cmd::SetProxyPort(_) | Cmd::SetAllowLan(_) | Cmd::SetApiPort(_) | Cmd::RegenerateSecret
         );
         if applies && self.core.is_some() {
-            self.snap.applying = Some(area);
+            self.snap.applying = Some(topic.area());
             self.publish();
         }
         let result = match cmd {
@@ -601,6 +773,31 @@ impl Actor {
             Cmd::SetTheme(theme) => Settings::write_key(&self.paths, "theme", theme)
                 .map(|()| self.settings.theme = theme),
             Cmd::SetLogLevel(level) => self.set_log_level(level).await,
+            Cmd::SetLatencyUrl(url) => self.set_latency_url(&url).await,
+            Cmd::TestNode(member) => self.test_node(&member),
+            Cmd::TestGroup(group) => self.test_group(&group),
+            Cmd::Tested {
+                epoch,
+                node,
+                latency,
+            } => {
+                if epoch == self.epoch {
+                    self.snap.testing.remove(&node);
+                    if let Some(n) = self.snap.nodes.get_mut(&node) {
+                        n.latency = Some(latency);
+                    }
+                    // Done once none of its nodes is under test, whichever test started them.
+                    if self
+                        .group_nodes
+                        .iter()
+                        .all(|n| !self.snap.testing.contains(n))
+                    {
+                        self.snap.testing_group = None;
+                        self.group_nodes.clear();
+                    }
+                }
+                Ok(())
+            }
             Cmd::SetKeepDockIcon(on) => Settings::write_key(&self.paths, "keep_dock_icon", on)
                 .map(|()| self.settings.keep_dock_icon = on),
             Cmd::SetProxyPort(port) => self.set_proxy_port(port).await,
@@ -634,7 +831,7 @@ impl Actor {
             if self.snap.phase == Phase::Failed(text.clone()) {
                 self.log(true, &text);
             } else {
-                self.say(area, text, true);
+                self.say(topic, text, true);
             }
         }
     }
@@ -704,6 +901,8 @@ impl Actor {
         self.app.save(&self.paths)?;
         self.fingerprint = Some(candidate.fingerprint);
         self.snap.edited = false;
+        // The chosen profile runs, not last-good.
+        self.clear(Topic::LastGood);
         if !candidate.ignored.is_empty() {
             let keys = candidate.ignored.join(", ");
             self.log(
@@ -712,7 +911,7 @@ impl Actor {
             );
         }
         if !candidate.notices.is_empty() {
-            self.say(Area::Profiles, candidate.notices.join("; "), false);
+            self.say(Topic::Profile, candidate.notices.join(". "), false);
         }
         Ok(())
     }
@@ -760,6 +959,8 @@ impl Actor {
                 self.spawn_log_task();
                 self.reconcile_connection_task();
                 self.snap.phase = Phase::Running;
+                // "The core is not running" no longer holds.
+                self.clear(Topic::Groups);
                 Ok(())
             }
             Err(e) => {
@@ -783,18 +984,19 @@ impl Actor {
     /// A port in use stops a launch; the error names the setting, also shown in its section
     /// until the port is free again.
     async fn ports_free(&mut self) -> Result<()> {
-        for (port, area, section) in [
-            (self.settings.mixed_port, Area::Listen, "PROXY"),
-            (self.settings.controller_port, Area::Api, "API"),
+        for (port, topic, section) in [
+            (self.settings.mixed_port, Topic::ProxyPort, "PROXY"),
+            (self.settings.controller_port, Topic::ApiPort, "API"),
         ] {
-            let in_use = format!("Port {port} is in use; change it here");
             if core::ensure_ports_free(&[port]).await.is_err() {
-                self.say(area, in_use, true);
-                bail!("Port {port} is in use; change it in Settings → {section}");
+                self.say(
+                    topic,
+                    format!("Port {port} is in use. Change it here"),
+                    true,
+                );
+                bail!("Port {port} is in use. Change it in Settings → {section}");
             }
-            if self.snap.message(area).is_some_and(|m| m.text == in_use) {
-                self.snap.messages.remove(&area);
-            }
+            self.clear(topic);
         }
         Ok(())
     }
@@ -856,13 +1058,13 @@ impl Actor {
         self.launch(&exe, &home, &last_good)
             .await
             .map_err(|recovery| {
-                anyhow!("{error:#}; last-good recovery also failed: {recovery:#}")
+                anyhow!("{error:#}. Last-good recovery also failed: {recovery:#}")
             })?;
         self.fingerprint = None;
         self.snap.edited = true;
         // An error, so it stays: the profile you picked is not the one running.
         self.say(
-            Area::Core,
+            Topic::LastGood,
             format!("Running the last-good configuration because: {error:#}"),
             true,
         );
@@ -875,6 +1077,7 @@ impl Actor {
             return Ok(());
         }
         self.snap.phase = Phase::Stopping;
+        self.clear(Topic::LastGood);
         self.publish();
         let proxy_result = self.release_proxy().await;
         let stop_result = self.stop_child().await;
@@ -902,8 +1105,10 @@ impl Actor {
     }
 
     fn clear_runtime(&mut self) {
+        self.new_epoch();
         self.snap.mode.clear();
         self.snap.groups.clear();
+        self.snap.nodes.clear();
         self.snap.edited = false;
         self.fingerprint = None;
     }
@@ -1038,17 +1243,27 @@ impl Actor {
         result
     }
 
+    /// A reload replaces the proxies, and with them Mihomo's results.
+    fn new_epoch(&mut self) {
+        self.epoch += 1;
+        self.snap.testing.clear();
+        self.snap.testing_group = None;
+        self.group_nodes.clear();
+    }
+
     async fn reload_running(&mut self) -> Result<()> {
+        self.new_epoch();
         self.api.reload(&self.paths.candidate()).await?;
         self.confirm_ports().await
     }
 
     /// After a failed reload: back to the last committed configuration.
     async fn reload_last_good(&mut self, e: anyhow::Error) -> anyhow::Error {
+        self.new_epoch();
         let recovery = self.api.reload(&self.paths.last_good()).await;
         let _ = self.refresh_with_global_default().await;
         match recovery {
-            Ok(()) => e.context("reload failed; the last-good configuration was reloaded"),
+            Ok(()) => e.context("reload failed, so the last-good configuration was reloaded"),
             Err(r) => e.context(format!(
                 "reload failed and last-good did not reload ({r:#})"
             )),
@@ -1090,7 +1305,7 @@ impl Actor {
             Ok(c) if self.core.as_ref().is_some_and(|core| core.home == c.home) => c,
             Ok(_) => {
                 self.settings = previous;
-                bail!("The core runs the last-good configuration; reload the profile first");
+                bail!("The core runs the last-good configuration. Reload the profile first");
             }
             Err(e) => {
                 self.settings = previous;
@@ -1114,7 +1329,7 @@ impl Actor {
         } else if let Err(e) = self.apply_proxy(true).await {
             let off = self.apply_proxy(false).await;
             Err(e.context(match off {
-                Ok(()) => "moving the system proxy failed; it was turned off",
+                Ok(()) => "moving the system proxy failed, so it was turned off",
                 Err(_) => "moving the system proxy failed, and so did turning it off",
             }))
         } else {
@@ -1135,7 +1350,11 @@ impl Actor {
         if self.core.is_none() {
             Settings::write_key(&self.paths, "mixed_port", port)?;
             self.settings = next;
-            self.say(Area::Listen, "Saved; applies at next start".into(), false);
+            self.say(
+                Topic::ProxyPort,
+                "Saved. Applies at next start".into(),
+                false,
+            );
             return Ok(());
         }
         let old = self.settings.mixed_port;
@@ -1148,11 +1367,11 @@ impl Actor {
         self.api.close_all().await?;
         saved?;
         let text = if moved? {
-            format!("Applied; system proxy moved to {port}")
+            format!("Applied. System proxy moved to {port}")
         } else {
             "Applied".to_owned()
         };
-        self.say(Area::Listen, text, false);
+        self.say(Topic::ProxyPort, text, false);
         Ok(())
     }
 
@@ -1166,8 +1385,9 @@ impl Actor {
     /// Reload applies allow-lan and rebuilds the listeners; open connections stay.
     /// Live, without a reload: the core's level and the Logs tab's stream both follow.
     async fn set_log_level(&mut self, level: LogLevel) -> Result<()> {
+        // Chosen again: writes it, so a bad value read at launch is fixed in the file too.
         if level == self.settings.log_level {
-            return Ok(());
+            return Settings::write_key(&self.paths, "log_level", level);
         }
         Settings::write_key(&self.paths, "log_level", level)?;
         self.settings.log_level = level;
@@ -1180,16 +1400,94 @@ impl Actor {
         Ok(())
     }
 
-    async fn set_allow_lan(&mut self, on: bool) -> Result<()> {
-        if on == self.settings.allow_lan {
+    /// No reload: the next test uses it, and the cards show what Mihomo has for it already.
+    async fn set_latency_url(&mut self, text: &str) -> Result<()> {
+        let url = match text.trim() {
+            "" => settings::DEFAULT_LATENCY_URL.to_owned(),
+            text => settings::latency_url(text).context("Use an http or https URL")?,
+        };
+        if url == self.settings.latency_url {
             return Ok(());
+        }
+        Settings::write_key(&self.paths, "latency_url", &url)?;
+        self.settings.latency_url = url;
+        self.new_epoch();
+        if self.core.is_some() {
+            self.refresh_runtime().await?;
+        }
+        Ok(())
+    }
+
+    fn test_node(&mut self, member: &str) -> Result<()> {
+        self.running_or_err()?;
+        // Its card is disabled meanwhile; a group test covers it or leaves it alone.
+        if self.snap.testing_group.is_some() {
+            return Ok(());
+        }
+        if let Some(node) = self.snap.target(member)
+            && !self.snap.testing.contains(&node)
+        {
+            self.spawn_tests(vec![node]);
+        }
+        Ok(())
+    }
+
+    fn test_group(&mut self, group: &str) -> Result<()> {
+        self.running_or_err()?;
+        if self.snap.testing_group.is_some() {
+            return Ok(());
+        }
+        let targets = self.snap.group_targets(group);
+        if !targets.is_empty() {
+            // A node a single test already runs is adopted, not tested twice.
+            let new = targets
+                .iter()
+                .filter(|n| !self.snap.testing.contains(*n))
+                .cloned()
+                .collect();
+            self.snap.testing_group = Some(group.to_owned());
+            self.group_nodes = targets;
+            self.spawn_tests(new);
+        }
+        Ok(())
+    }
+
+    /// Beside the actor, like a providers update; each result is sent back as it arrives.
+    fn spawn_tests(&mut self, nodes: Vec<String>) {
+        let epoch = self.epoch;
+        let url: Arc<str> = self.settings.latency_url.as_str().into();
+        for node in nodes {
+            let provider = self.snap.nodes.get(&node).and_then(|n| n.provider.clone());
+            self.snap.testing.insert(node.clone());
+            let (api, tx, url, limit) = (
+                self.api.clone(),
+                self.tx.clone(),
+                url.clone(),
+                self.test_slots.clone(),
+            );
+            tokio::task::spawn_local(async move {
+                let _permit = limit.acquire_owned().await;
+                let latency = api.test(&node, provider.as_deref(), &url).await;
+                let _ = tx.send(Cmd::Tested {
+                    epoch,
+                    node,
+                    latency,
+                });
+            });
+        }
+    }
+
+    async fn set_allow_lan(&mut self, on: bool) -> Result<()> {
+        // Chosen again: writes it, so a bad value read at launch is fixed in the file too.
+        if on == self.settings.allow_lan {
+            return Settings::write_key(&self.paths, "allow_lan", on);
         }
         let mut next = self.settings.clone();
         next.allow_lan = on;
         if self.core.is_none() {
             Settings::write_key(&self.paths, "allow_lan", on)?;
             self.settings = next;
-            self.say(Area::Listen, "Saved; applies at next start".into(), false);
+            self.say(Topic::Lan, "Saved. Applies at next start".into(), false);
             return Ok(());
         }
         let (name, candidate) = self.reload_with(next).await?;
@@ -1203,7 +1501,7 @@ impl Actor {
         } else {
             "Only this device can use the proxy".to_owned()
         };
-        self.say(Area::Listen, text, false);
+        self.say(Topic::Lan, text, false);
         Ok(())
     }
 
@@ -1218,12 +1516,12 @@ impl Actor {
             Settings::write_key(&self.paths, "controller_port", port)?;
             self.settings = next;
             self.rebuild_api()?;
-            self.say(Area::Api, "Saved; applies at next start".into(), false);
+            self.say(Topic::ApiPort, "Saved. Applies at next start".into(), false);
             return Ok(());
         }
         self.restart_with(next, self.secret.clone()).await?;
         Settings::write_key(&self.paths, "controller_port", port)?;
-        self.say(Area::Api, "Applied".into(), false);
+        self.say(Topic::ApiPort, "Applied".into(), false);
         Ok(())
     }
 
@@ -1237,8 +1535,8 @@ impl Actor {
             self.restart_with(self.settings.clone(), secret).await?;
             self.paths.save_secret(&self.secret)?;
         }
-        let text = "Regenerated; update your dashboards".to_owned();
-        self.say(Area::Api, text, false);
+        let text = "Regenerated. Update your dashboards".to_owned();
+        self.say(Topic::Secret, text, false);
         Ok(())
     }
 
@@ -1296,9 +1594,9 @@ impl Actor {
             .context("no last-good home")?;
         let last_good = self.paths.last_good();
         match self.launch(exe, &home, &last_good).await {
-            Ok(()) => Err(error.context("activation failed; running the last-good configuration")),
+            Ok(()) => Err(error.context("activation failed, so the last-good configuration runs")),
             Err(recovery) => {
-                let message = format!("{error:#}; last-good recovery also failed: {recovery:#}");
+                let message = format!("{error:#}. Last-good recovery also failed: {recovery:#}");
                 self.snap.phase = Phase::Failed(message.clone());
                 Err(anyhow!(message))
             }
@@ -1311,7 +1609,7 @@ impl Actor {
         }
         let _ = self.refresh_with_global_default().await;
         if proxy_was_on && let Err(e) = self.apply_proxy(true).await {
-            self.say(Area::Proxy, format!("{e:#}"), true);
+            self.say(Topic::SystemProxy, format!("{e:#}"), true);
         }
     }
 
@@ -1358,7 +1656,7 @@ impl Actor {
 
     async fn refresh_runtime(&mut self) -> Result<()> {
         self.snap.mode = self.api.runtime().await?.mode;
-        self.snap.groups = self.api.groups().await?;
+        (self.snap.groups, self.snap.nodes) = self.api.proxies(&self.settings.latency_url).await?;
         Ok(())
     }
 
@@ -1387,18 +1685,19 @@ impl Actor {
     fn refresh_profiles(&mut self) -> bool {
         match profiles::list(&self.paths) {
             Ok(mut list) => {
+                self.clear(Topic::ProfileList);
                 let order = profiles::arrange(&mut list, &self.app.profile_order);
                 self.snap.profiles = list;
                 if order != self.app.profile_order {
                     self.app.profile_order = order;
                     if let Err(e) = self.app.save(&self.paths) {
-                        self.say(Area::Profiles, format!("{e:#}"), true);
+                        self.say(Topic::ProfileList, format!("{e:#}"), true);
                     }
                 }
                 true
             }
             Err(e) => {
-                self.say(Area::Profiles, format!("{e:#}"), true);
+                self.say(Topic::ProfileList, format!("{e:#}"), true);
                 false
             }
         }
@@ -1415,7 +1714,7 @@ impl Actor {
 
     fn remove_profile(&mut self, name: &str) -> Result<()> {
         if self.app.active_profile.as_deref() == Some(name) {
-            bail!("{name} is the active profile; switch to another one first");
+            bail!("{name} is the active profile. Switch to another one first");
         }
         let result = profiles::remove(&self.paths, name, &self.protected_homes());
         self.refresh_profiles();
@@ -1462,8 +1761,9 @@ impl Actor {
             Ok(()) => self.sync_new_services().await,
             Err(e) => Err(e),
         };
-        if let Err(e) = proxy {
-            self.say(Area::Proxy, format!("{e:#}"), true);
+        match proxy {
+            Ok(()) => self.clear(Topic::ProxyCheck),
+            Err(e) => self.say(Topic::ProxyCheck, format!("{e:#}"), true),
         }
         self.snap.lan_ip = proxy::lan_ip();
         // Logged only: a slow controller must not leave a message on every tick.
@@ -1496,29 +1796,22 @@ impl Actor {
             );
         }
         let (port, saved) = (core.mixed_port, self.settings.mixed_port);
-        const UNSERVED: &str = "Another tool set port";
-        if port == saved
-            && self
-                .snap
-                .message(Area::Listen)
-                .is_some_and(|m| m.text.starts_with(UNSERVED))
-        {
-            self.snap.messages.remove(&Area::Listen);
-        }
-        if port != saved {
+        if port == saved {
+            self.clear(Topic::ExternalPort);
+        } else {
             if port != 0 && listening(port) {
                 Settings::write_key(&self.paths, "mixed_port", port)?;
                 self.settings.mixed_port = port;
                 let moved = self.move_proxy(saved).await;
                 self.say(
-                    Area::Listen,
+                    Topic::ExternalPort,
                     format!("Changed to {port} by another tool"),
                     false,
                 );
                 moved?;
             } else {
-                let text = format!("{UNSERVED} {port}; Reload restores {saved}");
-                self.say_once(Area::Listen, text, true);
+                let text = format!("Another tool set port {port}. Reload restores {saved}");
+                self.say_once(Topic::ExternalPort, text, true);
             }
         }
         if core.allow_lan != self.settings.allow_lan {
@@ -1526,12 +1819,12 @@ impl Actor {
             self.settings.allow_lan = core.allow_lan;
             let state = if core.allow_lan { "on" } else { "off" };
             let text = format!("LAN access turned {state} by another tool");
-            self.say(Area::Listen, text, false);
+            self.say(Topic::Lan, text, false);
         }
         // `/upgrade` swaps the executable in place, bypassing xihomo's checks.
         if self.api.version().await.ok() != self.app.core_version {
             let text = "The core was replaced by another tool".to_owned();
-            self.say_once(Area::Update, text, false);
+            self.say_once(Topic::CoreReplaced, text, false);
         }
         self.refresh_runtime().await
     }
@@ -1606,14 +1899,14 @@ impl Actor {
             self.refresh_runtime().await?;
         }
         if !failed.is_empty() {
-            bail!("Updated {updated} providers; failed: {}", failed.join(", "));
+            bail!("Updated {updated} providers. Failed: {}", failed.join(", "));
         }
         let text = match updated {
             0 => "This profile has no providers".to_owned(),
             1 => "Updated 1 provider".to_owned(),
             n => format!("Updated {n} providers"),
         };
-        self.say(Area::Profiles, text, false);
+        self.say(Topic::Providers, text, false);
         Ok(())
     }
 
@@ -1637,7 +1930,7 @@ impl Actor {
         self.snap.update_busy = None;
         let release = result.map_err(|e| anyhow!("Update check failed: {e}"))?;
         if self.app.core_version.as_deref() == Some(&release.version) {
-            self.say(Area::Update, "Up to date".to_owned(), false);
+            self.say(Topic::CoreUpdate, "Up to date".to_owned(), false);
         }
         self.snap.latest = Some(release);
         Ok(())
@@ -1734,11 +2027,11 @@ impl Actor {
             self.cancel.store(false, Ordering::SeqCst);
             if let Err(e) = self.launch(&exe, &home, &last_good).await {
                 let result = match self.launch(&old_exe, &home, &last_good).await {
-                    Ok(()) => {
-                        Err(e.context(format!("{target} failed to start; back on {old_version}")))
-                    }
+                    Ok(()) => Err(e.context(format!(
+                        "{target} failed to start, so {old_version} runs again"
+                    ))),
                     Err(recovery) => {
-                        let message = format!("{e:#}; {old_version} also failed: {recovery:#}");
+                        let message = format!("{e:#}. {old_version} also failed: {recovery:#}");
                         self.snap.phase = Phase::Failed(message.clone());
                         Err(anyhow!(message))
                     }

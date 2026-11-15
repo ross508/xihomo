@@ -401,6 +401,10 @@ pub fn compose(source: &[u8], overrides: &[u8], rt: &Runtime) -> Result<Composed
             refused.join(", ")
         ));
     }
+    // A default, not an owned key: latency tests time one round trip on an open connection,
+    // as other Mihomo GUIs report it, unless the profile or overrides.yaml says otherwise.
+    map.entry("unified-delay".into())
+        .or_insert(Value::Bool(true));
     let had_tun = matches!(map.get("listeners"), Some(Value::Sequence(l))
         if l.iter().any(|l| l.get("type").and_then(Value::as_str) == Some("tun")));
     let ignored = own(&mut map, rt);
@@ -544,6 +548,23 @@ mod tests {
         assert_eq!(
             mode("mode: rule\n", "mode: direct\n", &global).as_deref(),
             Some("global")
+        );
+    }
+
+    #[test]
+    fn unified_delay_is_on_unless_the_profile_or_overrides_set_it() {
+        let unified = |source: &[u8], overrides: &[u8]| {
+            parsed(&compose(source, overrides, &RT).unwrap().yaml)["unified-delay"].as_bool()
+        };
+        assert_eq!(unified(b"a: 1\n", b""), Some(true));
+        assert_eq!(unified(b"unified-delay: false\n", b""), Some(false));
+        assert_eq!(
+            unified(b"unified-delay: true\n", b"unified-delay: false\n"),
+            Some(false)
+        );
+        assert_eq!(
+            unified(b"unified-delay: false\n", b"unified-delay: true\n"),
+            Some(true)
         );
     }
 

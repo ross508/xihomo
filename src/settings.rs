@@ -187,7 +187,7 @@ fn load_or_set_aside<T: Default>(
             Ok((
                 T::default(),
                 Some(format!(
-                    "{name} was invalid ({e:#}); moved to {}",
+                    "{name} was invalid ({e:#}) and was moved to {}",
                     Path::new(&aside).display()
                 )),
             ))
@@ -240,6 +240,20 @@ pub struct Settings {
     /// The Dock icon stays while no window is open.
     pub keep_dock_icon: bool,
     pub log_level: LogLevel,
+    /// What every latency test xihomo runs requests, kept as typed: Mihomo keys results by it.
+    pub latency_url: String,
+}
+
+pub const DEFAULT_LATENCY_URL: &str = "https://cp.cloudflare.com/generate_204";
+
+/// The trimmed text when it is an http or https URL with a host, at most 2048 bytes.
+pub fn latency_url(text: &str) -> Option<String> {
+    let text = text.trim();
+    let url = reqwest::Url::parse(text)
+        .ok()
+        .filter(|_| text.len() <= 2048)?;
+    let web = matches!(url.scheme(), "http" | "https");
+    (web && url.host_str().is_some_and(|h| !h.is_empty())).then(|| text.to_owned())
 }
 
 impl Default for Settings {
@@ -257,6 +271,7 @@ impl Default for Settings {
             theme: Theme::Auto,
             keep_dock_icon: true,
             log_level: LogLevel::Info,
+            latency_url: DEFAULT_LATENCY_URL.into(),
         }
     }
 }
@@ -266,17 +281,27 @@ pub fn valid_port(port: u16) -> bool {
     port >= 1024
 }
 
-/// One key's value, or its default when it is absent; an invalid one is named in `invalid`.
+/// An invalid key and what to tell about it.
+pub type Invalid = (&'static str, String);
+
+fn invalid_key(key: &'static str) -> Invalid {
+    (
+        key,
+        format!("settings.yaml: invalid {key}. Using the default"),
+    )
+}
+
+/// One key's value, or its default when it is absent; an invalid one is reported in `invalid`.
 fn field<T: DeserializeOwned>(
     map: &Mapping,
-    key: &str,
+    key: &'static str,
     default: T,
-    invalid: &mut Vec<String>,
+    invalid: &mut Vec<Invalid>,
 ) -> T {
     match map.get(key) {
         None => default,
         Some(value) => yaml_serde::from_value(value.clone()).unwrap_or_else(|_| {
-            invalid.push(key.to_owned());
+            invalid.push(invalid_key(key));
             default
         }),
     }
@@ -290,9 +315,10 @@ fn write_target(path: &Path) -> PathBuf {
 }
 
 impl Settings {
-    /// Field by field: an invalid value takes its default and is reported, the others are kept.
-    /// Only a file that is not YAML, or not a mapping, is set aside.
-    pub fn load(paths: &Paths) -> Result<(Self, Option<String>)> {
+    /// Field by field: an invalid value takes its default and is reported by key, so it can be
+    /// shown beside the control that edits it; the others are kept. Only a file that is not YAML,
+    /// or not a mapping, is set aside, which the middle part reports.
+    pub fn load(paths: &Paths) -> Result<(Self, Option<String>, Vec<Invalid>)> {
         let mut invalid = Vec::new();
         let (settings, notice) = load_or_set_aside(&paths.settings(), |bytes| {
             // An empty or comment-only file is a valid "all defaults".
@@ -310,29 +336,32 @@ impl Settings {
                 theme: field(&map, "theme", d.theme, &mut invalid),
                 keep_dock_icon: field(&map, "keep_dock_icon", d.keep_dock_icon, &mut invalid),
                 log_level: field(&map, "log_level", d.log_level, &mut invalid),
+                latency_url: d.latency_url.clone(),
             };
+            if let Some(value) = map.get("latency_url") {
+                match value.as_str().and_then(latency_url) {
+                    Some(url) => s.latency_url = url,
+                    None => invalid.push(invalid_key("latency_url")),
+                }
+            }
             for (key, port, default) in [
                 ("mixed_port", &mut s.mixed_port, d.mixed_port),
                 ("controller_port", &mut s.controller_port, d.controller_port),
             ] {
                 if !valid_port(*port) {
-                    invalid.push(key.to_owned());
+                    invalid.push(invalid_key(key));
                     *port = default;
                 }
             }
             if s.mixed_port == s.controller_port {
-                invalid.push("controller_port (same as mixed_port)".to_owned());
+                let text =
+                    "settings.yaml: controller_port is the same as mixed_port. Using the defaults";
+                invalid.push(("controller_port", text.to_owned()));
                 (s.mixed_port, s.controller_port) = (d.mixed_port, d.controller_port);
             }
             Ok(s)
         })?;
-        let invalid = (!invalid.is_empty()).then(|| {
-            format!(
-                "settings.yaml: invalid {}; using the default",
-                invalid.join(", ")
-            )
-        });
-        Ok((settings, notice.or(invalid)))
+        Ok((settings, notice, invalid))
     }
 
     /// Re-reads the file and changes only `key`, so edits made since launch are kept.
@@ -342,7 +371,7 @@ impl Settings {
             Ok(bytes) => match yaml_serde::from_slice::<Value>(&bytes) {
                 Ok(Value::Mapping(map)) => map,
                 Ok(Value::Null) => Mapping::new(),
-                _ => bail!("settings.yaml cannot be parsed; fix it before changing settings here"),
+                _ => bail!("settings.yaml cannot be parsed. Fix it before changing settings here"),
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Mapping::new(),
             Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
@@ -440,7 +469,10 @@ mod tests {
     #[test]
     fn missing_keys_and_empty_files_take_defaults() {
         let paths = temp_paths("settings-defaults");
-        assert_eq!(Settings::load(&paths).unwrap(), (Settings::default(), None));
+        assert_eq!(
+            Settings::load(&paths).unwrap(),
+            (Settings::default(), None, Vec::new())
+        );
         fs::write(paths.settings(), "# only a comment\n").unwrap();
         assert_eq!(Settings::load(&paths).unwrap().0, Settings::default());
         fs::write(
@@ -448,8 +480,8 @@ mod tests {
             "theme: dark\nmixed_port: 7000\nkeep_dock_icon: false\nlog_level: debug\nunknown: 1\n",
         )
         .unwrap();
-        let (settings, notice) = Settings::load(&paths).unwrap();
-        assert_eq!(notice, None);
+        let (settings, notice, invalid) = Settings::load(&paths).unwrap();
+        assert_eq!((notice, invalid), (None, Vec::new()));
         assert_eq!(
             settings,
             Settings {
@@ -475,7 +507,7 @@ mod tests {
         ] {
             fs::write(&path, bad).unwrap();
             let notice = if path == paths.settings() {
-                let (settings, notice) = Settings::load(&paths).unwrap();
+                let (settings, notice, _) = Settings::load(&paths).unwrap();
                 assert_eq!(settings, Settings::default());
                 notice
             } else {
@@ -496,7 +528,7 @@ mod tests {
         let d = Settings::default();
         let text = "theme: purple\nicon_set: bars\nmixed_port: 80\ncontroller_port: 7001\nallow_lan: yes please\nkeep_dock_icon: 3\nlog_level: loud\n";
         fs::write(paths.settings(), text).unwrap();
-        let (settings, notice) = Settings::load(&paths).unwrap();
+        let (settings, notice, invalid) = Settings::load(&paths).unwrap();
         assert_eq!(
             settings,
             Settings {
@@ -505,17 +537,26 @@ mod tests {
                 ..d.clone()
             }
         );
-        let notice = notice.unwrap();
-        for key in [
-            "theme",
-            "mixed_port",
-            "allow_lan",
-            "keep_dock_icon",
-            "log_level",
-        ] {
-            assert!(notice.contains(key), "{notice}");
+        assert_eq!(notice, None, "the file itself is fine");
+        let mut keys: Vec<&str> = invalid.iter().map(|(key, _)| *key).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "allow_lan",
+                "keep_dock_icon",
+                "log_level",
+                "mixed_port",
+                "theme"
+            ]
+        );
+        // Each notice names only its own key, for the control that edits it.
+        for (key, text) in &invalid {
+            assert_eq!(
+                *text,
+                format!("settings.yaml: invalid {key}. Using the default")
+            );
         }
-        assert!(!notice.contains("icon_set"), "{notice}");
         assert_eq!(fs::read_to_string(paths.settings()).unwrap(), text, "kept");
 
         fs::write(
@@ -523,12 +564,52 @@ mod tests {
             "mixed_port: 7000\ncontroller_port: 7000\n",
         )
         .unwrap();
-        let (settings, notice) = Settings::load(&paths).unwrap();
+        let (settings, _, invalid) = Settings::load(&paths).unwrap();
         assert_eq!(
             (settings.mixed_port, settings.controller_port),
             (d.mixed_port, d.controller_port)
         );
-        assert!(notice.unwrap().contains("same as"));
+        assert!(matches!(&invalid[..], [("controller_port", t)] if t.contains("same as")));
+    }
+
+    #[test]
+    fn latency_url_is_kept_as_typed_or_falls_back_to_the_default() {
+        assert_eq!(Settings::default().latency_url, DEFAULT_LATENCY_URL);
+        for good in [
+            "http://127.0.0.1:8080/x?a=1",
+            " https://www.gstatic.com/generate_204 ",
+        ] {
+            assert_eq!(latency_url(good).as_deref(), Some(good.trim()));
+        }
+        let long = format!("https://example.com/{}", "a".repeat(2048));
+        for bad in [
+            "",
+            "example.com",
+            "ftp://example.com/",
+            "file:///tmp/x",
+            "https://",
+            &long,
+        ] {
+            assert_eq!(latency_url(bad), None, "{bad}");
+        }
+
+        let paths = temp_paths("settings-latency-url");
+        fs::write(
+            paths.settings(),
+            "latency_url: \"  http://Example.com/a%20b  \"\n",
+        )
+        .unwrap();
+        let (settings, notice, invalid) = Settings::load(&paths).unwrap();
+        // Not normalized: Mihomo keys results by the exact string.
+        assert_eq!(settings.latency_url, "http://Example.com/a%20b");
+        assert_eq!((notice, invalid), (None, Vec::new()));
+        fs::write(paths.settings(), "theme: dark\nlatency_url: [1]\n").unwrap();
+        let (settings, _, invalid) = Settings::load(&paths).unwrap();
+        assert_eq!(
+            (settings.theme, settings.latency_url.as_str()),
+            (Theme::Dark, DEFAULT_LATENCY_URL)
+        );
+        assert_eq!(invalid, [invalid_key("latency_url")]);
     }
 
     #[test]
@@ -546,7 +627,7 @@ mod tests {
         std::os::unix::fs::symlink(&target, paths.settings()).unwrap();
         Settings::write_key(&paths, "allow_lan", true).unwrap();
         assert!(fs::symlink_metadata(paths.settings()).unwrap().is_symlink());
-        let (settings, notice) = Settings::load(&paths).unwrap();
+        let (settings, notice, _) = Settings::load(&paths).unwrap();
         assert_eq!(
             (settings.mixed_port, settings.allow_lan, notice),
             (7000, true, None)

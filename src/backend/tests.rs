@@ -69,9 +69,9 @@ fn saved_settings(a: &Actor) -> Settings {
     Settings::load(&a.paths).unwrap().0
 }
 
-fn message(a: &Actor, area: Area) -> String {
+fn message(a: &Actor, topic: Topic) -> String {
     a.snap
-        .message(area)
+        .message(topic)
         .map(|m| m.text.clone())
         .unwrap_or_default()
 }
@@ -145,9 +145,9 @@ local_test!(
         assert_eq!(level(&a).await, "info");
         a.handle(Cmd::SetLogLevel(LogLevel::Debug)).await;
         assert!(
-            a.snap.message(Area::Update).is_none(),
+            a.snap.message(Topic::LogLevel).is_none(),
             "{}",
-            message(&a, Area::Update)
+            message(&a, Topic::LogLevel)
         );
         assert_eq!(level(&a).await, "debug");
         assert_eq!(a.core.as_ref().unwrap().pid(), pid, "the same process");
@@ -324,13 +324,23 @@ local_test!(start_recovers_with_last_good_once, a, _rx, {
     assert_eq!(a.snap.phase, Phase::Running);
     assert!(
         a.snap
-            .message(Area::Core)
+            .message(Topic::LastGood)
             .unwrap()
             .text
             .contains("last-good")
     );
     assert!(a.snap.edited);
+    // Once the chosen profile runs again, the notice goes.
+    fs::write(a.paths.profiles().join("good.yaml"), GOOD).unwrap();
+    a.handle(Cmd::Reload).await;
+    assert_eq!(
+        a.snap.message(Topic::LastGood),
+        None,
+        "{:?}",
+        a.snap.error()
+    );
     a.handle(Cmd::Stop).await;
+    fs::remove_file(a.paths.profiles().join("good.yaml")).unwrap();
 
     // Nothing to fall back on: fail once and stay failed.
     fs::remove_file(a.paths.last_good()).unwrap();
@@ -349,14 +359,14 @@ local_test!(occupied_port_refuses_start, a, _rx, {
     }
     let port = a.settings.controller_port;
     assert_eq!(
-        message(&a, Area::Api),
-        format!("Port {port} is in use; change it here")
+        message(&a, Topic::ApiPort),
+        format!("Port {port} is in use. Change it here")
     );
     assert!(squatter.local_addr().is_ok());
     drop(squatter);
     a.handle(Cmd::Start).await;
     assert_eq!(a.snap.phase, Phase::Running);
-    assert_eq!(a.snap.message(Area::Api), None, "resolved");
+    assert_eq!(a.snap.message(Topic::ApiPort), None, "resolved");
     a.handle(Cmd::Stop).await;
 });
 
@@ -376,13 +386,13 @@ local_test!(a_proxy_port_change_applies_by_reload, a, _rx, {
         (u32::from(spare(&a, 2)), "in use".to_owned()),
     ] {
         a.handle(Cmd::SetProxyPort(port)).await;
-        assert!(message(&a, Area::Listen).contains(&why), "{port}");
+        assert!(message(&a, Topic::ProxyPort).contains(&why), "{port}");
         assert_eq!(a.settings.mixed_port, old);
     }
     drop(squatter);
 
     a.handle(Cmd::SetProxyPort(u32::from(new))).await;
-    assert_eq!(message(&a, Area::Listen), "Applied");
+    assert_eq!(message(&a, Topic::ProxyPort), "Applied");
     assert_eq!(a.snap.applying, None);
     assert_eq!(a.core.as_ref().unwrap().pid(), pid, "no restart");
     assert_eq!(a.api.runtime().await.unwrap().mixed_port, new);
@@ -415,7 +425,7 @@ local_test!(
         a.handle(Cmd::SetAllowLan(false)).await;
         assert!(!a.api.runtime().await.unwrap().allow_lan);
         assert_eq!(
-            message(&a, Area::Listen),
+            message(&a, Topic::Lan),
             "Only this device can use the proxy"
         );
         a.handle(Cmd::Stop).await;
@@ -428,10 +438,15 @@ local_test!(api_changes_restart_the_core_with_the_new_values, a, _rx, {
     let (old_port, new_port) = (a.settings.controller_port, spare(&a, 1));
     a.handle(Cmd::SetApiPort(u32::from(a.settings.mixed_port)))
         .await;
-    assert!(message(&a, Area::Api).contains("proxy port"));
+    assert!(message(&a, Topic::ApiPort).contains("proxy port"));
 
     a.handle(Cmd::SetApiPort(u32::from(new_port))).await;
-    assert_eq!(message(&a, Area::Api), "Applied", "{:?}", a.snap.error());
+    assert_eq!(
+        message(&a, Topic::ApiPort),
+        "Applied",
+        "{:?}",
+        a.snap.error()
+    );
     assert_eq!(a.snap.phase, Phase::Running);
     assert_ne!(a.core.as_ref().unwrap().pid(), pid, "a new process");
     assert_eq!(saved_settings(&a).controller_port, new_port);
@@ -446,7 +461,7 @@ local_test!(api_changes_restart_the_core_with_the_new_values, a, _rx, {
 
     let old_secret = a.secret.clone();
     a.handle(Cmd::RegenerateSecret).await;
-    assert!(message(&a, Area::Api).starts_with("Regenerated"));
+    assert!(message(&a, Topic::Secret).starts_with("Regenerated"));
     assert_ne!(a.secret, old_secret);
     assert_eq!(a.paths.secret().unwrap(), (a.secret.clone(), false));
     assert!(
@@ -485,9 +500,12 @@ local_test!(
     {
         let (proxy, api) = (spare(&a, 1), spare(&a, 2));
         a.handle(Cmd::SetProxyPort(u32::from(proxy))).await;
-        assert_eq!(message(&a, Area::Listen), "Saved; applies at next start");
+        assert_eq!(
+            message(&a, Topic::ProxyPort),
+            "Saved. Applies at next start"
+        );
         a.handle(Cmd::SetApiPort(u32::from(api))).await;
-        assert_eq!(message(&a, Area::Api), "Saved; applies at next start");
+        assert_eq!(message(&a, Topic::ApiPort), "Saved. Applies at next start");
         a.handle(Cmd::RegenerateSecret).await;
         let s = saved_settings(&a);
         assert_eq!((s.mixed_port, s.controller_port), (proxy, api));
@@ -512,9 +530,9 @@ local_test!(
         fs::remove_file(a.paths.profiles().join("good.yaml")).unwrap();
         a.handle(Cmd::Start).await;
         assert_eq!(a.snap.phase, Phase::Running, "{:?}", a.snap.phase);
-        assert!(message(&a, Area::Core).contains("last-good"));
+        assert!(message(&a, Topic::LastGood).contains("last-good"));
         assert!(
-            a.snap.message(Area::Core).unwrap().error,
+            a.snap.message(Topic::LastGood).unwrap().error,
             "stays until resolved"
         );
         assert_eq!(a.api.runtime().await.unwrap().mixed_port, proxy);
@@ -568,14 +586,14 @@ local_test!(
             .unwrap();
         a.periodic().await;
         assert_eq!(
-            message(&a, Area::Listen),
-            format!("Another tool set port 0; Reload restores {kept}")
+            message(&a, Topic::ExternalPort),
+            format!("Another tool set port 0. Reload restores {kept}")
         );
         assert_eq!(saved_settings(&a).mixed_port, kept);
         a.handle(Cmd::Reload).await;
         assert_eq!(a.api.runtime().await.unwrap().mixed_port, kept);
         a.periodic().await;
-        assert_eq!(a.snap.message(Area::Listen), None, "resolved");
+        assert_eq!(a.snap.message(Topic::ExternalPort), None, "resolved");
 
         dashboard
             .patch(serde_json::json!({"mixed-port": moved, "allow-lan": true}))
@@ -588,7 +606,7 @@ local_test!(
             (moved, moved, true)
         );
         assert_eq!(
-            message(&a, Area::Listen),
+            message(&a, Topic::Lan),
             "LAN access turned on by another tool"
         );
         a.publish();
@@ -603,7 +621,7 @@ local_test!(
         a.app.core_version = Some("v0.0.1".into());
         a.periodic().await;
         assert_eq!(
-            message(&a, Area::Update),
+            message(&a, Topic::CoreReplaced),
             "The core was replaced by another tool"
         );
         a.app.core_version = Some(VERSION.into());
@@ -619,10 +637,13 @@ local_test!(update_refreshes_the_running_profiles_providers, a, rx, {
     assert!(a.snap.providers_busy);
     // A reload in between would race the downloads.
     a.handle(Cmd::Reload).await;
-    assert!(message(&a, Area::Profiles).starts_with("Reload waits"));
+    assert!(message(&a, Topic::Profile).starts_with("Reload waits"));
     let done = rx.recv().await.unwrap();
     a.handle(done).await;
-    assert_eq!(message(&a, Area::Profiles), "This profile has no providers");
+    assert_eq!(
+        message(&a, Topic::Providers),
+        "This profile has no providers"
+    );
 
     // File providers are re-read from the profile's home, all of them at once.
     fs::write(
@@ -649,7 +670,7 @@ local_test!(update_refreshes_the_running_profiles_providers, a, rx, {
     let done = rx.recv().await.unwrap();
     a.handle(done).await;
     assert!(!a.snap.providers_busy);
-    assert_eq!(message(&a, Area::Profiles), "Updated 2 providers");
+    assert_eq!(message(&a, Topic::Providers), "Updated 2 providers");
     a.handle(Cmd::Stop).await;
 });
 
@@ -660,13 +681,13 @@ async fn a_lost_secret_is_reported_except_on_a_first_run() {
     let a = Actor::new(paths.clone(), tx.clone(), Arc::new(AtomicBool::new(false)))
         .unwrap()
         .0;
-    assert_eq!(a.snap.message(Area::Api), None, "first run");
+    assert_eq!(a.snap.message(Topic::Secret), None, "first run");
     AppData::default().save(&paths).unwrap();
     fs::write(paths.state().join("secret"), "short").unwrap();
     let a = Actor::new(paths, tx, Arc::new(AtomicBool::new(false)))
         .unwrap()
         .0;
-    assert!(message(&a, Area::Api).contains("update your dashboards"));
+    assert!(message(&a, Topic::Secret).contains("Update your dashboards"));
 }
 
 local_test!(unexpected_exit_fails_without_restart, a, rx, {
@@ -714,7 +735,7 @@ local_test!(broken_core_update_rolls_back_to_running_version, a, _rx, {
     a.handle(Cmd::ActivateVersion("v9.9.9".into())).await;
     let error = a.snap.error().clone().unwrap();
     assert!(
-        error.contains("back on") && error.contains("boom"),
+        error.contains("runs again") && error.contains("boom"),
         "{error}"
     );
     assert_eq!(a.snap.phase, Phase::Running);
@@ -813,15 +834,15 @@ async fn dev_profiles_validate_after_overrides() {
     }
 }
 
-/// No core needed: an unread message survives background work, a user action in its area
-/// replaces it, and actions in other areas leave it alone.
+/// No core needed: an unread message survives background work, a user command of its topic
+/// replaces it, and other commands, even in its section, leave it alone.
 #[tokio::test(flavor = "current_thread")]
-async fn messages_stay_next_to_their_area() {
+async fn messages_stay_until_their_own_topic_changes() {
     let paths = temp_paths("messages");
     let (tx, _rx) = mpsc::unbounded_channel();
     let (mut a, ..) = Actor::new(paths, tx, Arc::new(AtomicBool::new(false))).unwrap();
     a.handle(Cmd::Activate("missing".into())).await;
-    let error = a.snap.message(Area::Profiles).unwrap().clone();
+    let error = a.snap.message(Topic::Profile).unwrap().clone();
     assert!(
         error.error && error.text.contains("No Mihomo core"),
         "{error:?}"
@@ -840,10 +861,74 @@ async fn messages_stay_next_to_their_area() {
         Cmd::SetIconSet("bars".into()),
     ] {
         a.handle(cmd).await;
-        assert_eq!(a.snap.message(Area::Profiles), Some(&error));
+        assert_eq!(a.snap.message(Topic::Profile), Some(&error));
     }
+    // Another topic of the same section joins it, newest first.
+    a.handle(Cmd::UpdateProviders).await;
+    let texts = |a: &Actor| -> Vec<String> {
+        a.snap
+            .messages_in(Area::Profiles)
+            .iter()
+            .map(|m| m.text.clone())
+            .collect()
+    };
+    assert_eq!(texts(&a), ["The core is not running", &error.text]);
     a.handle(Cmd::CheckNow).await;
-    assert_eq!(a.snap.message(Area::Profiles), None);
+    assert_eq!(texts(&a).len(), 2, "Check now clears neither");
+    a.handle(Cmd::RemoveProfile("missing".into())).await;
+    let replaced = a.snap.message(Topic::Profile).unwrap();
+    assert_ne!(replaced.id, error.id, "replaced by its own topic");
+    assert!(
+        a.snap.message(Topic::Providers).is_some(),
+        "the other stays"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_bad_setting_is_reported_beside_its_control_until_it_is_changed() {
+    let paths = temp_paths("setting-notices");
+    fs::write(paths.settings(), "theme: purple\nlatency_url: nope\n").unwrap();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut a = Actor::new(paths, tx.clone(), Arc::new(AtomicBool::new(false)))
+        .unwrap()
+        .0;
+    assert_eq!(
+        message(&a, Topic::Theme),
+        "settings.yaml: invalid theme. Using the default"
+    );
+    assert_eq!(
+        message(&a, Topic::LatencyUrl),
+        "settings.yaml: invalid latency_url. Using the default"
+    );
+    assert_eq!(Topic::Theme.area(), Area::Files);
+    assert_eq!(Topic::LatencyUrl.area(), Area::Update);
+    a.handle(Cmd::SetTheme(Theme::Dark)).await;
+    assert_eq!(a.snap.message(Topic::Theme), None);
+    assert!(a.snap.message(Topic::LatencyUrl).is_some(), "untouched");
+
+    // Choosing the level already in use clears its notice and fixes the file.
+    fs::write(a.paths.settings(), "log_level: loud\n").unwrap();
+    let (tx2, _rx2) = mpsc::unbounded_channel();
+    let mut b = Actor::new(a.paths.clone(), tx2, Arc::new(AtomicBool::new(false)))
+        .unwrap()
+        .0;
+    assert!(b.snap.message(Topic::LogLevel).is_some());
+    b.handle(Cmd::SetLogLevel(LogLevel::Info)).await;
+    assert_eq!(b.snap.message(Topic::LogLevel), None);
+    assert_eq!(
+        Settings::load(&b.paths).unwrap().2,
+        Vec::new(),
+        "fixed on disk"
+    );
+
+    // A file that cannot be read at all is information: it is seen once, then expires.
+    let paths = temp_paths("setting-set-aside");
+    fs::write(paths.settings(), "a: [").unwrap();
+    let a = Actor::new(paths, tx, Arc::new(AtomicBool::new(false)))
+        .unwrap()
+        .0;
+    let notice = a.snap.message(Topic::SettingsFile).unwrap();
+    assert!(!notice.error && notice.text.contains("moved to"));
 }
 
 /// An actor with no core, for the file-handling paths.
@@ -872,7 +957,7 @@ async fn theme_and_dock_choices_are_stored_in_settings_yaml() {
     a.handle(Cmd::SetKeepDockIcon(true)).await;
     a.publish();
     assert_eq!((a.snap.theme, a.snap.keep_dock_icon), (Theme::Dark, true));
-    let (settings, _) = Settings::load(&a.paths).unwrap();
+    let (settings, ..) = Settings::load(&a.paths).unwrap();
     assert_eq!(
         (settings.theme, settings.keep_dock_icon),
         (Theme::Dark, true)
@@ -1020,9 +1105,8 @@ async fn a_downloaded_core_is_used_right_away() {
     assert_eq!(a.app.core_version.as_deref(), Some("v2.0.0"));
     assert_eq!(a.app.previous_core_version.as_deref(), Some("v1.0.0"));
     assert_eq!(update::installed(&a.paths), ["v1.0.0", "v2.0.0"]);
-    assert_eq!(
-        a.snap.message(Area::Update),
-        None,
+    assert!(
+        a.snap.messages_in(Area::Update).is_empty(),
         "success is not announced"
     );
 }
@@ -1088,7 +1172,7 @@ local_test!(failed_start_shows_its_reason_once, a, _rx, {
     fs::write(a.paths.profiles().join("good.yaml"), "a: [").unwrap();
     a.handle(Cmd::Start).await;
     assert!(matches!(a.snap.phase, Phase::Failed(_)));
-    assert_eq!(a.snap.message(Area::Core), None, "the phase carries it");
+    assert_eq!(a.snap.message(Topic::Core), None, "the phase carries it");
     assert!(saved(&a).core_on, "a failed start keeps the choice");
 });
 
@@ -1242,3 +1326,239 @@ async fn proxy_state_is_read_until_it_settles() {
     assert!(a.snap.proxy_on);
     assert!(started.elapsed() >= PROXY_SETTLE);
 }
+
+fn node(kind: &str) -> Node {
+    Node {
+        kind: kind.into(),
+        provider: None,
+        latency: None,
+    }
+}
+
+fn group(name: &str, kind: &str, now: &str, all: &[&str]) -> Group {
+    Group {
+        name: name.into(),
+        kind: kind.into(),
+        now: now.into(),
+        all: all.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+/// Main → My-Proxies → Auto → jp1; Balance has no `now`; Loop and Back select each other.
+fn latency_snapshot() -> Snapshot {
+    let groups = vec![
+        group(
+            "GLOBAL",
+            "Selector",
+            "Main",
+            &["DIRECT", "REJECT", "Main", "jp1"],
+        ),
+        group(
+            "Main",
+            "Selector",
+            "My-Proxies",
+            &[
+                "My-Proxies",
+                "DIRECT",
+                "REJECT",
+                "jp1",
+                "Balance",
+                "Loop",
+                "ghost",
+            ],
+        ),
+        group("My-Proxies", "Selector", "Auto", &["Auto", "jp1"]),
+        group("Auto", "URLTest", "jp1", &["jp1", "sg1"]),
+        group("Balance", "LoadBalance", "", &["jp1", "sg1"]),
+        group("Loop", "Selector", "Back", &["Back"]),
+        group("Back", "Selector", "Loop", &["Loop"]),
+        group("Lost", "Selector", "gone", &["gone"]),
+    ];
+    let mut nodes: BTreeMap<String, Node> = [
+        ("DIRECT", "Direct"),
+        ("REJECT", "Reject"),
+        ("jp1", "Vless"),
+        ("sg1", "Shadowsocks"),
+    ]
+    .into_iter()
+    .map(|(n, k)| (n.to_owned(), node(k)))
+    .collect();
+    for g in &groups {
+        nodes.insert(g.name.clone(), node(&g.kind));
+    }
+    Snapshot {
+        groups,
+        nodes,
+        ..Snapshot::default()
+    }
+}
+
+#[test]
+fn a_card_resolves_through_now_to_a_node() {
+    let s = latency_snapshot();
+    let r = |member: &str| resolve(member, &s.groups, &s.nodes);
+    assert_eq!(r("My-Proxies"), "jp1", "a chain of groups");
+    assert_eq!(r("DIRECT"), "DIRECT");
+    assert_eq!(r("Balance"), "Balance", "no `now`: the group itself");
+    assert_eq!(r("Loop"), "Back", "a cycle stops before repeating");
+    assert_eq!(r("Lost"), "Lost", "`now` names nothing known");
+    assert_eq!(
+        s.target("DIRECT").as_deref(),
+        Some("DIRECT"),
+        "Direct is tested"
+    );
+    assert_eq!(s.target("REJECT"), None);
+    assert_eq!(s.target("ghost"), None, "a name in no list");
+    assert_eq!(s.target("Balance").as_deref(), Some("Balance"));
+}
+
+#[test]
+fn a_group_test_covers_each_shown_node_once() {
+    let mut s = latency_snapshot();
+    assert_eq!(
+        s.group_targets("Main"),
+        ["jp1", "DIRECT", "Balance", "Back"],
+        "My-Proxies and jp1 are one node; REJECT and ghost are dropped"
+    );
+    assert_eq!(s.group_targets("GLOBAL"), ["DIRECT", "jp1"]);
+    s.testing.insert("jp1".into());
+    assert_eq!(
+        s.group_targets("Auto"),
+        ["jp1", "sg1"],
+        "a node under test is adopted, not left out"
+    );
+    assert!(s.group_targets("nope").is_empty());
+}
+
+/// Answers every request with 204, as a Latency URL does, on a loopback port.
+fn no_content_server() -> u16 {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let _ = stream.read(&mut [0u8; 4096]);
+            let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n");
+        }
+    });
+    port
+}
+
+fn latency_of(a: &Actor, name: &str) -> Option<Latency> {
+    a.snap.nodes.get(name).and_then(|n| n.latency)
+}
+
+/// Handles the results the tests send back until the group test ends; returns how many came.
+async fn finish_group_test(a: &mut Actor, rx: &mut mpsc::UnboundedReceiver<Cmd>) -> usize {
+    let mut results = 0;
+    while a.snap.testing_group.is_some() {
+        let cmd = tokio::time::timeout(Duration::from_secs(15), rx.recv())
+            .await
+            .expect("tests finish")
+            .unwrap();
+        results += usize::from(matches!(cmd, Cmd::Tested { .. }));
+        a.handle(cmd).await;
+    }
+    results
+}
+
+local_test!(latency_tests_run_against_the_real_core, a, rx, {
+    let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let closed = dead.local_addr().unwrap().port();
+    drop(dead);
+    fs::create_dir_all(a.paths.home("good")).unwrap();
+    fs::write(
+        a.paths.home("good").join("nodes.yaml"),
+        "proxies:\n  - {name: via-provider, type: direct}\n",
+    )
+    .unwrap();
+    fs::write(
+        a.paths.profiles().join("good.yaml"),
+        format!(
+            "mode: rule\nproxies:\n  - {{name: dead, type: socks5, server: 127.0.0.1, port: {closed}}}\n  - {{name: outside, type: direct}}\nproxy-providers:\n  nodes: {{type: file, path: ./nodes.yaml}}\nproxy-groups:\n  - {{name: PICK, type: select, proxies: [DIRECT, REJECT, dead], use: [nodes]}}\nrules:\n  - MATCH,PICK\n"
+        ),
+    )
+    .unwrap();
+    a.handle(Cmd::TestNode("DIRECT".into())).await;
+    assert_eq!(message(&a, Topic::Groups), "The core is not running");
+    a.handle(Cmd::Start).await;
+    assert_eq!(a.snap.phase, Phase::Running, "{:?}", a.snap.error());
+    let url = format!("http://127.0.0.1:{}/generate_204", no_content_server());
+    a.handle(Cmd::SetLatencyUrl("ftp://x/".into())).await;
+    assert_eq!(message(&a, Topic::LatencyUrl), "Use an http or https URL");
+    a.handle(Cmd::SetLatencyUrl(format!(" {url} "))).await;
+    assert_eq!(saved_settings(&a).latency_url, url);
+    assert_eq!(
+        a.snap.nodes["via-provider"].provider.as_deref(),
+        Some("nodes")
+    );
+
+    // A single test already running is adopted by the group test, not run twice.
+    a.handle(Cmd::TestNode("DIRECT".into())).await;
+    a.handle(Cmd::TestGroup("PICK".into())).await;
+    assert_eq!(a.snap.testing_group.as_deref(), Some("PICK"));
+    let targets: Vec<&str> = a.snap.testing.iter().map(String::as_str).collect();
+    assert_eq!(
+        targets,
+        ["DIRECT", "dead", "via-provider"],
+        "REJECT is skipped"
+    );
+    a.handle(Cmd::TestNode("outside".into())).await;
+    a.handle(Cmd::TestGroup("GLOBAL".into())).await;
+    assert_eq!(
+        a.snap.testing_group.as_deref(),
+        Some("PICK"),
+        "one group test at a time"
+    );
+    assert_eq!(
+        finish_group_test(&mut a, &mut rx).await,
+        3,
+        "DIRECT once, and the single test of outside refused"
+    );
+    assert_eq!(latency_of(&a, "outside"), None);
+    assert!(a.snap.testing.is_empty() && a.snap.testing_group.is_none());
+    assert!(matches!(latency_of(&a, "DIRECT"), Some(Latency::Ms(_))));
+    assert!(matches!(
+        latency_of(&a, "via-provider"),
+        Some(Latency::Ms(_))
+    ));
+    assert_eq!(latency_of(&a, "dead"), Some(Latency::Failed));
+    assert_eq!(latency_of(&a, "REJECT"), None);
+    assert_eq!(a.snap.message(Topic::Groups), None);
+    // Mihomo keeps them; a refresh reads the same back, provider nodes included.
+    let before = a.snap.nodes.clone();
+    a.handle(Cmd::Refresh).await;
+    assert_eq!(a.snap.nodes, before);
+
+    // A result from before a reload is dropped; the reload cleared Mihomo's too.
+    a.handle(Cmd::TestNode("DIRECT".into())).await;
+    assert!(a.snap.testing.contains("DIRECT"));
+    a.handle(Cmd::Reload).await;
+    assert!(a.snap.testing.is_empty());
+    let stale = rx.recv().await.unwrap();
+    assert!(matches!(stale, Cmd::Tested { .. }));
+    a.handle(stale).await;
+    assert_eq!(latency_of(&a, "DIRECT"), None);
+
+    // And one from before a URL change: the cards show what Mihomo has for the new URL.
+    a.handle(Cmd::TestGroup("PICK".into())).await;
+    finish_group_test(&mut a, &mut rx).await;
+    a.handle(Cmd::TestNode("dead".into())).await;
+    a.handle(Cmd::SetLatencyUrl(format!("{url}?again"))).await;
+    assert!(a.snap.testing.is_empty());
+    assert_eq!(
+        latency_of(&a, "DIRECT"),
+        None,
+        "nothing for the new URL yet"
+    );
+    let stale = rx.recv().await.unwrap();
+    a.handle(stale).await;
+    assert_eq!(latency_of(&a, "dead"), None);
+    a.handle(Cmd::SetLatencyUrl(String::new())).await;
+    assert_eq!(
+        saved_settings(&a).latency_url,
+        settings::DEFAULT_LATENCY_URL
+    );
+    a.handle(Cmd::Stop).await;
+    assert!(a.snap.nodes.is_empty());
+});

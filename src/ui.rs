@@ -1,5 +1,5 @@
-use crate::api::{Connection, LogLine};
-use crate::backend::{Area, Cmd, Handle, Message, Phase, Snapshot};
+use crate::api::{Connection, Latency, LogLine};
+use crate::backend::{Area, Cmd, Handle, Message, Phase, Snapshot, Topic};
 use crate::icons;
 use crate::input::{Cancelled, Changed, Submitted, TextInput};
 use crate::placement::{self, Placement};
@@ -7,10 +7,11 @@ use crate::settings::{self, Theme};
 use crate::tray::phase_label;
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, ClickEvent, ClipboardItem, Context, ElementId, Entity, FocusHandle,
-    FontWeight, Hsla, MouseButton, PathBuilder, PathPromptOptions, Pixels, Point, ScrollStrategy,
-    SharedString, Stateful, Task, UniformListScrollHandle, Window, WindowAppearance, WindowHandle,
-    actions, anchored, canvas, deferred, div, point, px, rgb, uniform_list,
+    Animation, AnimationExt, AnyElement, App, ClickEvent, ClipboardItem, Context, ElementId,
+    Entity, FocusHandle, FontWeight, Hsla, MouseButton, PathBuilder, PathPromptOptions, Pixels,
+    Point, ScrollStrategy, SharedString, Stateful, Task, TextRun, UniformListScrollHandle, Window,
+    WindowAppearance, WindowHandle, WindowTextSystem, actions, anchored, canvas, deferred, div,
+    point, pulsating_between, px, rgb, uniform_list,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -128,6 +129,7 @@ pub struct AppState {
     placement_save: Option<(Placement, Task<()>)>,
     proxy_port: PortField,
     api_port: PortField,
+    latency_url: PortField,
     /// The secret is shown in full; hidden again on a tab change or when the window closes.
     secret_shown: bool,
     /// The button waiting for its confirming click, and the timer token that may disarm it.
@@ -137,6 +139,10 @@ pub struct AppState {
     timers: u64,
     /// Messages that have been on screen, by id; `true` once one that is not an error timed out.
     shown: HashMap<u64, bool>,
+    /// Measures what fits beside a title; set at each frame with the window's font.
+    measure: Option<(Arc<WindowTextSystem>, gpui::Font)>,
+    /// The width inside the window's padding, at the last frame.
+    content_width: Pixels,
     /// The palette of the last frame, so tests can see what was drawn.
     #[cfg(test)]
     palette: Option<Palette>,
@@ -149,7 +155,8 @@ enum Port {
     Api,
 }
 
-/// A port input and whether the user has typed in it since it last showed the saved value.
+/// A port or Latency URL input and whether the user has typed in it since it last showed the
+/// saved value.
 struct PortField {
     input: Entity<TextInput>,
     edited: bool,
@@ -182,6 +189,8 @@ struct Palette {
     on_accent: Hsla,
     /// Text that acts as a button: the accent's hue, with more contrast than the accent fill.
     link: Hsla,
+    /// A fast latency.
+    good: Hsla,
     warning: Hsla,
     danger: Hsla,
 }
@@ -209,6 +218,7 @@ fn palette(theme: Theme, appearance: WindowAppearance) -> Palette {
             accent: c(0x66778D),
             on_accent: c(0xFFFFFF),
             link: c(0x9DB0C8),
+            good: c(0x8CCB8A),
             warning: c(0xE3C37A),
             danger: c(0xF08178),
         }
@@ -223,6 +233,7 @@ fn palette(theme: Theme, appearance: WindowAppearance) -> Palette {
             accent: c(0x5F6F84),
             on_accent: c(0xFFFFFF),
             link: c(0x34465E),
+            good: c(0x2D6A2F),
             warning: c(0x795300),
             danger: c(0xB52F2B),
         }
@@ -258,6 +269,51 @@ fn card_grid(width: f32, min: f32) -> (u16, f32) {
     let columns = (((width + CARD_GAP) / (min + CARD_GAP)).floor() as u16).max(2);
     let card = ((width - (columns - 1) as f32 * CARD_GAP) / columns as f32).floor();
     (columns, card)
+}
+
+/// What a card's latency slot shows.
+#[derive(Clone, Debug, PartialEq)]
+enum Slot {
+    /// Never tested: no ⚡.
+    Empty,
+    Bolt {
+        pulsing: bool,
+    },
+    Text(String, Hsla),
+}
+
+/// The slot for `member` and whether a click on it tests. On a selected card the accent's text
+/// color replaces the latency colors.
+fn slot(s: &Snapshot, member: &str, selected: bool, p: Palette) -> (Slot, bool) {
+    let Some(node) = s.target(member) else {
+        return (Slot::Empty, false);
+    };
+    let testing = s.testing.contains(&node);
+    let usable = !testing && s.testing_group.is_none();
+    let color = |c: Hsla| if selected { p.on_accent } else { c };
+    let slot = match s.nodes.get(&node).and_then(|n| n.latency) {
+        _ if testing => Slot::Bolt { pulsing: true },
+        None => Slot::Bolt { pulsing: false },
+        Some(Latency::Ms(ms)) => Slot::Text(
+            format!("{ms} ms"),
+            color(if ms < 600 { p.good } else { p.warning }),
+        ),
+        Some(Latency::Failed) => Slot::Text("Timeout".into(), color(p.danger)),
+    };
+    (slot, usable)
+}
+
+/// Fades `element` in and out while `on`, for a test that is running.
+fn pulse<E: IntoElement + Styled + 'static>(id: String, element: E, on: bool) -> AnyElement {
+    if !on {
+        return element.into_any_element();
+    }
+    let animation = Animation::new(Duration::from_millis(1200))
+        .repeat()
+        .with_easing(pulsating_between(0.3, 1.));
+    element
+        .with_animation(ElementId::Name(id.into()), animation, |e, t| e.opacity(t))
+        .into_any_element()
 }
 
 /// Beside Control's phase: core, ports and whether the proxy is shared.
@@ -348,9 +404,13 @@ enum Icon {
     Hide,
     /// A destructive button waiting for its second click.
     Confirm,
+    /// A lightning bolt: test the latency.
+    Bolt,
+    /// An `i` in a ring: more about the line it ends.
+    Info,
 }
 
-fn symbol(icon: Icon, color: Hsla) -> impl IntoElement {
+fn symbol(icon: Icon, color: Hsla) -> gpui::Canvas<()> {
     canvas(
         |_, _, _| {},
         move |bounds, _, window, _| {
@@ -485,11 +545,37 @@ fn symbol(icon: Icon, color: Hsla) -> impl IntoElement {
                         strokes.push(line(&[(2.4, 1.6), (11.6, 12.4)]));
                     }
                 }
+                Icon::Bolt => {}
+                Icon::Info => {
+                    let r = unit * 5.6;
+                    let mut ring = PathBuilder::stroke(unit * 1.4);
+                    ring.move_to(at(1.4, 7.));
+                    ring.arc_to(point(r, r), px(0.), false, true, at(12.6, 7.));
+                    ring.arc_to(point(r, r), px(0.), false, true, at(1.4, 7.));
+                    strokes.push(ring);
+                    fills.push(disc(7., 4.2, 1.));
+                    strokes.push(line(&[(7., 6.4), (7., 10.4)]));
+                }
                 Icon::Confirm => {
                     let mut check = PathBuilder::stroke(unit * 1.8);
                     check.add_polygon(&[at(2.8, 7.4), at(5.8, 10.4), at(11.4, 3.8)], false);
                     strokes.push(check);
                 }
+            }
+            if icon == Icon::Bolt {
+                let mut bolt = PathBuilder::fill();
+                bolt.add_polygon(
+                    &[
+                        at(8.4, 1.),
+                        at(2.8, 8.),
+                        at(6.4, 8.),
+                        at(5.4, 13.),
+                        at(11.2, 5.8),
+                        at(7.6, 5.8),
+                    ],
+                    true,
+                );
+                fills.push(bolt);
             }
             for path in strokes.into_iter().chain(fills) {
                 if let Ok(path) = path.build() {
@@ -701,24 +787,53 @@ fn field(
         }))
 }
 
-/// A message on its title's line, so it never adds one: cut short, and shown whole on hover.
-fn beside_title(selector: String, text: String, color: Hsla, p: Palette) -> Stateful<gpui::Div> {
-    let tip = SharedString::from(text.clone());
-    // A new element for each text, so a tooltip already waiting never shows the previous one.
-    div()
-        .id(ElementId::Name(format!("{selector}:{text}").into()))
-        .debug_selector(|| selector)
-        .mb(px(2.))
-        .min_w_0()
-        .truncate()
-        .text_size(px(10.))
-        .italic()
-        .text_color(color)
-        .tooltip(move |_, cx| {
-            let text = tip.clone();
-            cx.new(|_| Tip { text, p }).into()
-        })
-        .child(text)
+/// Between messages on a title's line.
+const SEPARATOR: &str = " · ";
+/// Between the last message shown and `+N`.
+const MORE_GAP: f32 = 6.;
+
+/// How many of the messages, `widths` wide, fit whole in `room` with `sep` between them and,
+/// when some are left over, `more(left)` after them.
+fn fitting(widths: &[f32], sep: f32, more: impl Fn(usize) -> f32, room: f32) -> usize {
+    let mut used = 0.;
+    for (i, width) in widths.iter().enumerate() {
+        used += width + if i > 0 { sep } else { 0. };
+        let left = widths.len() - i - 1;
+        let tail = if left > 0 { MORE_GAP + more(left) } else { 0. };
+        if used + tail > room {
+            return i;
+        }
+    }
+    widths.len()
+}
+
+/// A hover label listing every message beside a title in full, newest first.
+struct Tips {
+    items: Vec<(String, Hsla)>,
+    p: Palette,
+}
+
+impl Render for Tips {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .max_w(px(360.))
+            .px_2()
+            .py_1()
+            .rounded(px(5.))
+            .border_1()
+            .border_color(self.p.border)
+            .bg(self.p.panel)
+            .shadow_md()
+            .text_size(px(11.))
+            .children(
+                self.items
+                    .iter()
+                    .map(|(text, color)| div().text_color(*color).child(text.clone())),
+            )
+    }
 }
 
 /// A hairline between groups of sections, fainter than control borders, across the content.
@@ -754,6 +869,7 @@ impl AppState {
         let defaults = settings::Settings::default();
         let proxy_port = Self::port_field(Port::Proxy, defaults.mixed_port, cx);
         let api_port = Self::port_field(Port::Api, defaults.controller_port, cx);
+        let latency_url = Self::latency_field(cx);
         Self {
             handle,
             snap,
@@ -775,11 +891,14 @@ impl AppState {
             placement_save: None,
             proxy_port,
             api_port,
+            latency_url,
             secret_shown: false,
             confirm: None,
             copied: None,
             timers: 0,
             shown: HashMap::new(),
+            measure: None,
+            content_width: px(0.),
             #[cfg(test)]
             palette: None,
         }
@@ -807,6 +926,67 @@ impl AppState {
             input,
             edited: false,
         }
+    }
+
+    fn latency_field(cx: &mut Context<Self>) -> PortField {
+        let input = cx.new(|cx| TextInput::setting(settings::DEFAULT_LATENCY_URL, cx));
+        cx.subscribe(&input, |this, _, _: &Changed, cx| {
+            this.latency_url.edited = true;
+            cx.notify();
+        })
+        .detach();
+        cx.subscribe(&input, |this, _, _: &Submitted, cx| {
+            this.apply_latency_url(cx)
+        })
+        .detach();
+        cx.subscribe(&input, |this, input, _: &Cancelled, cx| {
+            let saved = this.snap.latency_url.clone();
+            input.update(cx, |i, cx| i.set_text(&saved, cx));
+            this.latency_url.edited = false;
+            cx.notify();
+        })
+        .detach();
+        PortField {
+            input,
+            edited: false,
+        }
+    }
+
+    /// The URL the field stands for; empty means the default.
+    fn latency_draft(&self, cx: &App) -> String {
+        match self.latency_url.input.read(cx).text().trim() {
+            "" => settings::DEFAULT_LATENCY_URL.to_owned(),
+            text => text.to_owned(),
+        }
+    }
+
+    fn apply_latency_url(&mut self, cx: &mut Context<Self>) {
+        let draft = self.latency_draft(cx);
+        if draft == self.snap.latency_url {
+            return self.settle_latency_url(cx);
+        }
+        let input = self.latency_url.input.clone();
+        if input.read(cx).text().trim().is_empty() {
+            input.update(cx, |i, cx| i.set_text(&draft, cx));
+        }
+        self.handle.send(Cmd::SetLatencyUrl(draft));
+        cx.notify();
+    }
+
+    /// Like a port field: a field that stands for the saved URL shows it again, and a message
+    /// an earlier draft left goes.
+    fn settle_latency_url(&mut self, cx: &mut Context<Self>) {
+        let saved = self.snap.latency_url.clone();
+        if self.latency_draft(cx) != saved {
+            return;
+        }
+        self.latency_url.edited = false;
+        let input = self.latency_url.input.clone();
+        input.update(cx, |i, cx| i.set_text(&saved, cx));
+        if self.snap.message(Topic::LatencyUrl).is_some() {
+            self.handle.send(Cmd::SetLatencyUrl(saved));
+        }
+        cx.notify();
     }
 
     fn field(&mut self, port: Port) -> &mut PortField {
@@ -865,7 +1045,7 @@ impl AppState {
     }
 
     /// A field that stands for the saved port, even empty, shows it again; a message an earlier
-    /// draft left beside the section goes, as the backend clears it on a port it already has.
+    /// draft left goes, as the backend clears its topic on a port it already has.
     fn settle_port(&mut self, port: Port, cx: &mut Context<Self>) {
         let saved = self.saved_port(port);
         if self.draft(port, cx) != u32::from(saved) {
@@ -875,11 +1055,11 @@ impl AppState {
         field.edited = false;
         let input = field.input.clone();
         input.update(cx, |i, cx| i.set_text(&saved.to_string(), cx));
-        let (area, cmd) = match port {
-            Port::Proxy => (Area::Listen, Cmd::SetProxyPort(saved.into())),
-            Port::Api => (Area::Api, Cmd::SetApiPort(saved.into())),
+        let (topic, cmd) = match port {
+            Port::Proxy => (Topic::ProxyPort, Cmd::SetProxyPort(saved.into())),
+            Port::Api => (Topic::ApiPort, Cmd::SetApiPort(saved.into())),
         };
-        if self.snap.message(area).is_some() && !self.busy() {
+        if self.snap.message(topic).is_some() && !self.busy() {
             self.handle.send(cmd);
         }
         cx.notify();
@@ -894,6 +1074,9 @@ impl AppState {
             })
             .detach();
         }
+        let focus = self.latency_url.input.read(cx).focus.clone();
+        cx.on_focus_out(&focus, window, |this, _, _, cx| this.settle_latency_url(cx))
+            .detach();
     }
 
     /// An unedited field follows the saved value; an edited one keeps the draft until it matches.
@@ -988,21 +1171,132 @@ impl AppState {
         }
     }
 
-    /// The area's message, unless it is a success or information message that has had its time.
-    fn current(&mut self, area: Area, cx: &mut Context<Self>) -> Option<Message> {
-        let message = self.snap.message(area)?.clone();
+    /// Whether a message is still shown: errors always, information until it has had its time.
+    fn visible(&mut self, message: &Message, cx: &mut Context<Self>) -> bool {
         let id = message.id;
         if message.error {
             // Seen, which clears its dot on the other tabs; it never times out.
             self.shown.entry(id).or_insert(false);
-            return Some(message);
+            return true;
         }
         if !self.shown.contains_key(&id) {
             self.timer(MESSAGE_SHOWN, cx, move |this, _| {
                 this.shown.insert(id, true);
             });
         }
-        (!*self.shown.entry(id).or_insert(false)).then_some(message)
+        !*self.shown.entry(id).or_insert(false)
+    }
+
+    /// The area's messages still shown, newest first.
+    fn current(&mut self, area: Area, cx: &mut Context<Self>) -> Vec<Message> {
+        let snap = self.snap.clone();
+        snap.messages_in(area)
+            .into_iter()
+            .filter(|m| self.visible(m, cx))
+            .cloned()
+            .collect()
+    }
+
+    fn colored(messages: Vec<Message>, p: Palette) -> Vec<(String, Hsla)> {
+        messages
+            .into_iter()
+            .map(|m| (m.text, if m.error { p.danger } else { p.accent }))
+            .collect()
+    }
+
+    /// How wide `text` is drawn, in the window's font.
+    fn width(&self, text: &str, size: f32, weight: FontWeight, italic: bool) -> f32 {
+        let Some((system, font)) = &self.measure else {
+            return 0.;
+        };
+        let mut font = font.clone();
+        font.weight = weight;
+        if italic {
+            font.style = gpui::FontStyle::Italic;
+        }
+        let run = TextRun {
+            len: text.len(),
+            font,
+            color: gpui::black(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let line = system.shape_line(text.to_owned().into(), px(size), &[run], None);
+        f32::from(line.width)
+    }
+
+    /// The messages on a title's line in `room`: newest first, ` · ` between them, as many as
+    /// fit whole and then `+N`; the newest alone is cut short. A hover lists them all.
+    fn message_line(
+        &self,
+        selector: &str,
+        items: Vec<(String, Hsla)>,
+        room: f32,
+        p: Palette,
+    ) -> Option<Stateful<gpui::Div>> {
+        if items.is_empty() {
+            return None;
+        }
+        let measure = |text: &str| self.width(text, 10., FontWeight::NORMAL, true);
+        let widths: Vec<f32> = items.iter().map(|(text, _)| measure(text)).collect();
+        // A little slack, so rounding never pushes the last one out of the line.
+        let fit = fitting(
+            &widths,
+            measure(SEPARATOR),
+            |left| measure(&format!("+{left}")),
+            room - 1.,
+        );
+        let shown = fit.max(1);
+        let id = format!(
+            "{selector}:{}",
+            items
+                .iter()
+                .map(|(t, _)| t.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let name = selector.to_owned();
+        let tips = items.clone();
+        let mut line = div()
+            .id(ElementId::Name(id.into()))
+            .debug_selector(move || name)
+            .flex()
+            .min_w_0()
+            .overflow_hidden()
+            .mb(px(2.))
+            .text_size(px(10.))
+            .italic()
+            .whitespace_nowrap()
+            .tooltip(move |_, cx| {
+                let items = tips.clone();
+                cx.new(|_| Tips { items, p }).into()
+            });
+        for (i, (text, color)) in items.iter().take(shown).enumerate() {
+            if i > 0 {
+                line = line.child(div().flex_none().text_color(p.dim).child(SEPARATOR));
+            }
+            let item = div()
+                .debug_selector(|| format!("{selector}-{i}"))
+                .text_color(*color)
+                .child(text.clone());
+            line = line.child(if fit == 0 {
+                item.min_w_0().truncate()
+            } else {
+                item.flex_none()
+            });
+        }
+        if items.len() > shown {
+            line = line.child(
+                div()
+                    .debug_selector(|| format!("{selector}-more"))
+                    .flex_none()
+                    .ml(px(MORE_GAP))
+                    .text_color(p.dim)
+                    .child(format!("+{}", items.len() - shown)),
+            );
+        }
+        Some(line)
     }
 
     /// Reload, in Control and on the active profile in Settings. Always there, so an edit on disk
@@ -1031,48 +1325,55 @@ impl AppState {
     fn unseen_error(&self, tab: Tab) -> bool {
         tab.areas()
             .iter()
-            .filter_map(|&area| self.snap.message(area))
+            .flat_map(|&area| self.snap.messages_in(area))
             .any(|m| m.error && !self.shown.contains_key(&m.id))
     }
 
-    /// Beside Control's phase, Core and the system proxy share one message: the newest that is
-    /// still current, or else a failure's reason. `true` marks an error.
-    fn status_message(&mut self, cx: &mut Context<Self>) -> Option<(String, bool)> {
-        [Area::Core, Area::Proxy]
+    /// Beside Control's phase, Core's and the system proxy's messages, newest first, then a
+    /// failure's reason. `true` marks an error.
+    fn status_messages(&mut self, cx: &mut Context<Self>) -> Vec<(String, bool)> {
+        let mut list: Vec<Message> = [Area::Core, Area::Proxy]
             .into_iter()
-            .filter_map(|area| self.current(area, cx))
-            .max_by_key(|m| m.id)
-            .map(|m| (m.text, m.error))
-            .or_else(|| match &self.snap.phase {
-                Phase::Failed(reason) => Some((reason.clone(), true)),
-                _ => None,
-            })
+            .flat_map(|area| self.current(area, cx))
+            .collect();
+        list.sort_by_key(|m| std::cmp::Reverse(m.id));
+        let mut list: Vec<(String, bool)> = list.into_iter().map(|m| (m.text, m.error)).collect();
+        if let Phase::Failed(reason) = &self.snap.phase {
+            list.push((reason.clone(), true));
+        }
+        list
     }
 
-    /// A group's title with its message to the right.
+    /// A group's title with its messages to the right; `beside` is the width of what the row
+    /// holds after them.
     fn titled(
         &mut self,
         title: &'static str,
         area: Area,
         busy: Option<String>,
+        beside: f32,
         p: Palette,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let copied = matches!(self.copied, Some((a, _)) if a == area);
-        let message = match busy {
-            Some(text) => Some((text, p.accent)),
-            None if copied => Some(("Copied".to_owned(), p.accent)),
-            None => self
-                .current(area, cx)
-                .map(|m| (m.text, if m.error { p.danger } else { p.accent })),
-        };
+        let mut items: Vec<(String, Hsla)> = busy
+            .into_iter()
+            .chain(copied.then(|| "Copied".to_owned()))
+            .map(|text| (text, p.accent))
+            .collect();
+        let current = self.current(area, cx);
+        items.extend(Self::colored(current, p));
+        let room = f32::from(self.content_width)
+            - self.width(title, 14., FontWeight::SEMIBOLD, false)
+            - 6.
+            - beside;
         let selector = format!("{}-message", title.to_lowercase());
         div()
             .flex()
             .items_end()
             .gap(px(6.))
             .child(heading(title))
-            .children(message.map(|(text, color)| beside_title(selector, text, color, p)))
+            .children(self.message_line(&selector, items, room, p))
     }
 
     /// The window closed: what it showed is reset for the next time.
@@ -1195,14 +1496,28 @@ impl AppState {
         };
         // The phase is the heading.
         let failed = matches!(s.phase, Phase::Failed(_));
-        let message = self.status_message(cx);
+        let items: Vec<(String, Hsla)> = self
+            .status_messages(cx)
+            .into_iter()
+            .map(|(text, error)| (text, if error { p.danger } else { p.accent }))
+            .collect();
         let details = status_text(&s);
+        let phase = phase_label(&s.phase);
+        let room = f32::from(self.content_width)
+            - self.width(phase, 14., FontWeight::SEMIBOLD, false)
+            - if details.is_empty() {
+                0.
+            } else {
+                self.width(&details, 12., FontWeight::NORMAL, false) + 6.
+            }
+            - 6.;
+        let message = self.message_line("status-message", items, room, p);
         let status = div()
             .flex()
             .items_end()
             .gap(px(6.))
             .child(
-                heading(phase_label(&s.phase))
+                heading(phase)
                     .debug_selector(|| "status".to_owned())
                     .text_color(if failed { p.danger } else { p.text }),
             )
@@ -1215,10 +1530,7 @@ impl AppState {
                         .child(details),
                 )
             })
-            .children(message.map(|(text, error)| {
-                let color = if error { p.danger } else { p.accent };
-                beside_title("status-message".to_owned(), text, color, p)
-            }));
+            .children(message);
 
         // A list gets a heading, a setting a label beside it, as in Settings. Messages go beside
         // the headings, so none of them adds a line.
@@ -1272,7 +1584,8 @@ impl AppState {
                 .items_center()
                 .gap_2()
                 .child(
-                    self.titled("Profiles", Area::Profiles, busy, p, cx)
+                    // Reload and the gap before it.
+                    self.titled("Profiles", Area::Profiles, busy, 36., p, cx)
                         .debug_selector(|| "profiles".to_owned())
                         .flex_1()
                         .min_w_0(),
@@ -1322,7 +1635,7 @@ impl AppState {
         // A profile without groups, like the default direct one, gets no empty heading.
         if !groups.is_empty() {
             column = column.child(separator(p)).child(
-                self.titled("Groups", Area::Groups, None, p, cx)
+                self.titled("Groups", Area::Groups, None, 0., p, cx)
                     .debug_selector(|| "groups".to_owned())
                     // The first name sits as far below as a Settings row's label does.
                     .mb(px(3.)),
@@ -1331,6 +1644,7 @@ impl AppState {
                 let name = group.name.clone();
                 let expanded = self.expanded.contains(&name);
                 let toggle = name.clone();
+                let bolt = self.group_bolt(&name, expanded, p);
                 let header = div()
                     .id(SharedString::from(format!("group-{name}")))
                     .debug_selector(|| format!("group-{name}"))
@@ -1354,22 +1668,27 @@ impl AppState {
                             .text_color(p.text)
                             .child(format!("{} {name}", if expanded { "▾" } else { "▸" })),
                     )
-                    .child(div().text_color(p.dim).truncate().child(group.now.clone()));
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .min_w_0()
+                            .child(div().text_color(p.dim).truncate().child(group.now.clone()))
+                            .child(bolt),
+                    );
                 column = column.child(header);
                 if expanded {
                     let mut options = div().grid().grid_cols(columns).gap_1().px_2().pb_2();
-                    // Display only: REJECT as the whole machine's route is never wanted.
-                    for proxy in group
-                        .all
-                        .iter()
-                        .filter(|proxy| !(name == "GLOBAL" && *proxy == "REJECT"))
-                    {
+                    for proxy in group.shown() {
                         let (g, pick) = (name.clone(), proxy.clone());
                         let id = SharedString::from(format!("pick-{name}-{proxy}"));
+                        let selected = *proxy == group.now;
+                        let kind = s.nodes.get(proxy).map(|n| n.kind.clone());
                         let card = chip(
                             id,
                             p,
-                            *proxy == group.now,
+                            selected,
                             group.selectable(),
                             self.cmd(move || Cmd::Select {
                                 group: g.clone(),
@@ -1377,9 +1696,24 @@ impl AppState {
                             }),
                         );
                         // A long name ends in an ellipsis instead of widening its column.
+                        let details = div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(11.))
+                                    .text_color(if selected { p.on_accent } else { p.dim })
+                                    .children(kind),
+                            )
+                            .child(self.latency_slot(&name, proxy, selected, p));
                         options = options.child(
                             card.w(px(card_width))
-                                .child(div().truncate().child(proxy.clone())),
+                                .child(div().truncate().child(proxy.clone()))
+                                .child(details),
                         );
                     }
                     column = column.child(options);
@@ -1392,6 +1726,96 @@ impl AppState {
             .overflow_y_scroll()
             .child(column)
             .into_any_element()
+    }
+
+    /// A card's latency slot. It reaches into the card's padding at the right and bottom, so it is
+    /// easy to hit, and its clicks never reach the card.
+    fn latency_slot(&self, group: &str, member: &str, selected: bool, p: Palette) -> AnyElement {
+        let (content, usable) = slot(&self.snap, member, selected, p);
+        let id = format!("latency-{group}-{member}");
+        let selector = id.clone();
+        let handle = self.handle.clone();
+        let member = member.to_owned();
+        let frame = div()
+            .id(ElementId::Name(id.clone().into()))
+            .debug_selector(move || selector)
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_end()
+            .min_w(px(28.))
+            // The row's line plus the card's bottom padding, which it reaches into.
+            .h(CONTROL_HEIGHT - px(5.))
+            .mr(px(-8.))
+            .mb(px(-3.))
+            .pl_1()
+            .pr(px(8.))
+            .pb(px(3.))
+            .text_size(px(11.))
+            .on_click(move |_, _, cx| {
+                cx.stop_propagation();
+                if usable {
+                    handle.send(Cmd::TestNode(member.clone()));
+                }
+            })
+            .when(usable, |frame| frame.cursor_pointer());
+        let bolt = if selected { p.on_accent } else { p.link };
+        match content {
+            Slot::Empty => frame.into_any_element(),
+            Slot::Text(text, color) => frame.text_color(color).child(text).into_any_element(),
+            Slot::Bolt { pulsing } => frame
+                .child(pulse(
+                    format!("pulse-{id}"),
+                    div().child(symbol(Icon::Bolt, bolt)),
+                    pulsing,
+                ))
+                .into_any_element(),
+        }
+    }
+
+    /// Tests every member of an expanded group; collapsed, it only says so. Its clicks never
+    /// expand or collapse the group.
+    fn group_bolt(&self, group: &str, expanded: bool, p: Palette) -> AnyElement {
+        let s = &self.snap;
+        let usable = expanded && s.testing_group.is_none() && !s.group_targets(group).is_empty();
+        let id = format!("test-group-{group}");
+        let selector = id.clone();
+        let handle = self.handle.clone();
+        let target = group.to_owned();
+        let testing = s.testing_group.as_deref() == Some(group);
+        // Its own test running keeps the active color, so the pulse shows.
+        let color = if usable || testing {
+            p.link
+        } else {
+            p.dim.opacity(0.6)
+        };
+        let bolt = div()
+            .id(ElementId::Name(id.clone().into()))
+            .debug_selector(move || selector)
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(20.))
+            .h(px(16.))
+            .rounded(px(4.))
+            .on_click(move |_, _, cx| {
+                cx.stop_propagation();
+                if usable {
+                    handle.send(Cmd::TestGroup(target.clone()));
+                }
+            })
+            .when(usable, |b| {
+                b.cursor_pointer().hover(move |st| st.bg(p.panel))
+            })
+            .when(!expanded, |b| {
+                b.tooltip(move |_, cx| {
+                    let text = "Expand to test".into();
+                    cx.new(|_| Tip { text, p }).into()
+                })
+            })
+            .child(symbol(Icon::Bolt, color));
+        pulse(format!("pulse-{id}"), bolt, testing)
     }
 
     fn render_connections(&mut self, p: Palette, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -1619,6 +2043,9 @@ impl AppState {
                 self.cmd(move || Cmd::SetTheme(theme)),
             ));
         }
+        // A bad value read at launch is fixed by choosing again, even the option already shown.
+        let has_error = |topic| s.message(topic).is_some_and(|m| m.error);
+        let dock_error = has_error(Topic::DockIcon);
         let mut dock = div().flex().gap_1();
         for (keep, id, label) in [
             (true, "dock-always", "Always"),
@@ -1629,12 +2056,12 @@ impl AppState {
                 label,
                 p,
                 s.keep_dock_icon == keep,
-                s.keep_dock_icon != keep,
+                s.keep_dock_icon != keep || dock_error,
                 self.cmd(move || Cmd::SetKeepDockIcon(keep)),
             ));
         }
         column = column
-            .child(self.titled("Appearance", Area::Files, None, p, cx))
+            .child(self.titled("Appearance", Area::Files, None, 0., p, cx))
             .child(field("Icon", sets, None, p))
             .child(field("Dock Icon", dock, None, p))
             .child(field("Theme", themes, None, p))
@@ -1688,12 +2115,13 @@ impl AppState {
                 self.cmd(|| Cmd::CheckUpdate),
             ),
         };
+        let level_error = has_error(Topic::LogLevel);
         let mut levels = div().flex().flex_wrap().gap_1();
         for (level, label) in [
-            (settings::LogLevel::Silent, "Silent"),
-            (settings::LogLevel::Error, "Error"),
-            (settings::LogLevel::Warning, "Warning"),
             (settings::LogLevel::Info, "Info"),
+            (settings::LogLevel::Warning, "Warning"),
+            (settings::LogLevel::Error, "Error"),
+            (settings::LogLevel::Silent, "Silent"),
             (settings::LogLevel::Debug, "Debug"),
         ] {
             levels = levels.child(button(
@@ -1701,12 +2129,13 @@ impl AppState {
                 label,
                 p,
                 s.log_level == level,
-                s.log_level != level,
+                s.log_level != level || level_error,
                 self.cmd(move || Cmd::SetLogLevel(level)),
             ));
         }
         column = column
-            .child(self.titled("Runtime", Area::Update, s.update_busy.clone(), p, cx))
+            .child(self.titled("Runtime", Area::Update, s.update_busy.clone(), 0., p, cx))
+            .child(field("Latency URL", self.latency_controls(p, cx), None, p))
             .child(field("Log Level", levels, None, p))
             .child(field("Core", versions, Some(action.into_any_element()), p));
         div()
@@ -1736,7 +2165,7 @@ impl AppState {
     ) -> gpui::Div {
         let s = self.snap.clone();
         let busy = s.providers_busy.then(|| "Updating providers…".to_owned());
-        column = column.child(self.titled("Profiles", Area::Profiles, busy, p, cx));
+        column = column.child(self.titled("Profiles", Area::Profiles, busy, 0., p, cx));
         // The list and, below it, a toolbar for the whole list: new actions join the toolbar.
         let mut list = div().flex().flex_col();
         for profile in s.profiles.iter() {
@@ -1888,21 +2317,32 @@ impl AppState {
                 p,
                 move |_, _, cx| cx.open_with_system(&config_dir),
             ));
-        column
-            .child(list)
-            .child(toolbar)
-            .child(hint(
+        column.child(list).child(toolbar).child(
+            hint(
                 "overrides.yaml in the config folder applies to every profile.".to_owned(),
                 p,
-            ))
-            .child(
-                hint(
-                    "Ports, API, LAN access and TUN come from xihomo; profiles cannot change them."
-                        .to_owned(),
-                    p,
-                )
-                .mt_0(),
             )
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(
+                div()
+                    .id("profiles-info")
+                    .debug_selector(|| "profiles-info".to_owned())
+                    // The hover area reaches 6px past the 11px icon; the margins keep the line
+                    // laid out as if it held the icon alone.
+                    .size(px(23.))
+                    .p(px(6.))
+                    .m(px(-6.))
+                    .tooltip(move |_, cx| {
+                        let text = "Ports, API, LAN access and TUN come from xihomo. \
+                                        Profiles cannot change them."
+                            .into();
+                        cx.new(|_| Tip { text, p }).into()
+                    })
+                    .child(symbol(Icon::Info, p.dim.opacity(0.8)).size_full()),
+            ),
+        )
     }
 }
 
@@ -1940,6 +2380,52 @@ impl AppState {
         (input, apply)
     }
 
+    /// The field across the row, and Apply while it stands for another URL than the saved one.
+    fn latency_controls(&mut self, p: Palette, cx: &mut Context<Self>) -> gpui::Div {
+        let saved = self.snap.latency_url.clone();
+        let field = &mut self.latency_url;
+        let text = field.input.read(cx).text();
+        if field.edited && text == saved {
+            field.edited = false;
+        }
+        if !field.edited && text != saved {
+            field.input.update(cx, |i, cx| i.set_text(&saved, cx));
+        }
+        let changed = self.latency_draft(cx) != saved;
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            // The row's width, so the field gives way to Apply in a narrow window.
+            .w_full()
+            .child(
+                div()
+                    .debug_selector(|| "latency-url-input".to_owned())
+                    // Room for the default URL; a longer one scrolls.
+                    .w(px(300.))
+                    .flex_shrink()
+                    .min_w_0()
+                    .rounded(px(5.))
+                    .bg(p.panel)
+                    .border_1()
+                    .border_color(p.border)
+                    .font_family("Menlo")
+                    .text_color(p.text)
+                    .overflow_hidden()
+                    .child(self.latency_url.input.clone()),
+            )
+            .children(changed.then(|| {
+                button(
+                    "latency-url-apply",
+                    "Apply",
+                    p,
+                    false,
+                    true,
+                    cx.listener(|this, _, _, cx| this.apply_latency_url(cx)),
+                )
+            }))
+    }
+
     fn render_proxy_api(
         &mut self,
         mut column: gpui::Div,
@@ -1954,10 +2440,10 @@ impl AppState {
         }
 
         let busy = (s.applying == Some(Area::Listen)).then(|| "Applying…".to_owned());
-        column = column.child(self.titled("Proxy", Area::Listen, busy, p, cx));
+        column = column.child(self.titled("Proxy", Area::Listen, busy, 0., p, cx));
         let (input, apply) = self.port_controls(Port::Proxy, "proxy-port", p, cx);
         column = column.child(field(
-            "Port",
+            "Mixed Port",
             div()
                 .flex()
                 .flex_wrap()
@@ -1969,6 +2455,8 @@ impl AppState {
             p,
         ));
         let lan = s.allow_lan;
+        // A bad value read at launch is fixed by choosing again, even the option already shown.
+        let lan_error = s.message(Topic::Lan).is_some_and(|m| m.error);
         // The address sits on the same row, so choosing This network adds no line.
         let mut choice = div()
             .flex()
@@ -1980,7 +2468,7 @@ impl AppState {
                 "This device",
                 p,
                 !lan,
-                enabled && lan,
+                enabled && (lan || lan_error),
                 self.cmd(|| Cmd::SetAllowLan(false)),
             ))
             .child(button(
@@ -1988,7 +2476,7 @@ impl AppState {
                 "This network",
                 p,
                 lan,
-                enabled && !lan,
+                enabled && (!lan || lan_error),
                 self.cmd(|| Cmd::SetAllowLan(true)),
             ));
         if lan {
@@ -1997,18 +2485,12 @@ impl AppState {
                 None => choice.child(div().ml_2().text_color(p.dim).child("No network")),
             };
         }
-        let warning = if lan {
-            " Anyone on this network can use it."
-        } else {
-            ""
-        };
         column = column
             .child(field("Available To", choice, None, p))
-            .child(hint(format!("HTTP and SOCKS5.{warning}"), p))
             .child(separator(p));
 
         let busy = (s.applying == Some(Area::Api)).then(|| "Restarting core…".to_owned());
-        column = column.child(self.titled("API", Area::Api, busy, p, cx));
+        column = column.child(self.titled("API", Area::Api, busy, 0., p, cx));
         let (input, apply) = self.port_controls(Port::Api, "api-port", p, cx);
         column = column.child(field(
             "Address",
@@ -2082,19 +2564,16 @@ impl AppState {
             ),
             p,
         ));
-        column
-            .child(hint(
-                "For dashboards and scripts. Changes restart the running core automatically."
-                    .to_owned(),
-                p,
-            ))
-            .child(separator(p))
+        column.child(separator(p))
     }
 }
 
 impl Render for AppState {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(self.snap.theme, window.appearance());
+        self.measure = Some((window.text_system().clone(), window.text_style().font()));
+        // Less the window's padding.
+        self.content_width = window.viewport_size().width - px(24.);
         // Typing filters right away on Logs and Connections; elsewhere focus returns to the root,
         // so a hidden input never swallows the tab and window shortcuts.
         let wanted = match self.tab {
@@ -2720,12 +3199,12 @@ mod gpui_tests {
         busy.edited = true;
         busy.messages.extend([
             (
-                Area::Core,
+                Topic::LastGood,
                 message("Running the last-good configuration", true, 1),
             ),
-            (Area::Proxy, message("networksetup failed", true, 2)),
-            (Area::Profiles, message("Updated 3 providers", false, 3)),
-            (Area::Groups, message("PICK has no member B", true, 4)),
+            (Topic::SystemProxy, message("networksetup failed", true, 2)),
+            (Topic::Providers, message("Updated 3 providers", false, 3)),
+            (Topic::Groups, message("PICK has no member B", true, 4)),
         ]);
         let mut ui = open(cx, busy);
         for id in ["status-message", "profiles-message", "groups-message"] {
@@ -2737,7 +3216,7 @@ mod gpui_tests {
     #[gpui::test]
     fn the_status_line_shows_the_newest_message_then_an_older_error(cx: &mut TestAppContext) {
         let mut ui = open(cx, running());
-        let shown = |ui: &mut Ui| ui.view.update(ui.cx, |this, cx| this.status_message(cx));
+        let shown = |ui: &mut Ui| ui.view.update(ui.cx, |this, cx| this.status_messages(cx));
         let message = |text: &str, error, id| Message {
             text: text.into(),
             error,
@@ -2745,23 +3224,30 @@ mod gpui_tests {
         };
         ui.snap(|s| {
             s.messages
-                .insert(Area::Core, message("Mode failed", true, 1));
+                .insert(Topic::Core, message("Mode failed", true, 1));
             s.messages
-                .insert(Area::Proxy, message("Proxy note", false, 2));
+                .insert(Topic::SystemProxy, message("Proxy note", false, 2));
         });
-        assert_eq!(shown(&mut ui), Some(("Proxy note".into(), false)));
+        assert_eq!(
+            shown(&mut ui),
+            [("Proxy note".into(), false), ("Mode failed".into(), true)],
+            "both, newest first"
+        );
         ui.wait(MESSAGE_SHOWN + Duration::from_millis(10));
         assert_eq!(
             shown(&mut ui),
-            Some(("Mode failed".into(), true)),
+            [("Mode failed".into(), true)],
             "errors stay"
         );
-        // A failed start says why on the heading's line, without a message of its own.
-        ui.snap(|s| {
-            s.messages.clear();
-            s.phase = Phase::Failed("port 20999 is in use".into());
-        });
-        assert_eq!(shown(&mut ui), Some(("port 20999 is in use".into(), true)));
+        // A failed start says why on the heading's line, as the last, oldest item.
+        ui.snap(|s| s.phase = Phase::Failed("port 20999 is in use".into()));
+        assert_eq!(
+            shown(&mut ui),
+            [
+                ("Mode failed".into(), true),
+                ("port 20999 is in use".into(), true)
+            ]
+        );
     }
 
     #[gpui::test]
@@ -2777,7 +3263,7 @@ mod gpui_tests {
         // An error for Settings while Control is on screen.
         ui.snap(|s| {
             s.messages
-                .insert(Area::Api, message("Port 21000 is in use", true, 1));
+                .insert(Topic::ApiPort, message("Port 21000 is in use", true, 1));
         });
         assert_eq!(dots(&mut ui), [false, true]);
         assert!(ui.cx.debug_bounds("tab-settings-dot").is_some());
@@ -2790,14 +3276,14 @@ mod gpui_tests {
         // A profile error seen here is not new to Control, which shows it too.
         ui.snap(|s| {
             s.messages
-                .insert(Area::Profiles, message("Import failed", true, 2));
+                .insert(Topic::Profile, message("Import failed", true, 2));
         });
         assert_eq!(dots(&mut ui), [false, false]);
         // Seen on neither until one of them shows it.
         ui.click("tab-logs");
         ui.snap(|s| {
             s.messages
-                .insert(Area::Profiles, message("Activation failed", true, 3));
+                .insert(Topic::Profile, message("Activation failed", true, 3));
         });
         assert_eq!(dots(&mut ui), [true, true]);
         ui.click("tab-control");
@@ -2805,7 +3291,7 @@ mod gpui_tests {
         // Information gets no dot.
         ui.snap(|s| {
             s.messages
-                .insert(Area::Update, message("Up to date", false, 4));
+                .insert(Topic::CoreUpdate, message("Up to date", false, 4));
         });
         assert_eq!(dots(&mut ui), [false, false]);
     }
@@ -3082,6 +3568,15 @@ mod gpui_tests {
         let mut ui = settings_tab(cx);
         let top = |ui: &mut Ui, id| ui.cx.debug_bounds(id).unwrap().top();
         assert!(top(&mut ui, "label-Log Level") < top(&mut ui, "label-Core"));
+        let left = |ui: &mut Ui, id| ui.cx.debug_bounds(id).unwrap().left();
+        let order = ["info", "warning", "error", "silent", "debug"].map(|l| {
+            let id: &'static str = Box::leak(format!("log-level-{l}").into_boxed_str());
+            left(&mut ui, id)
+        });
+        assert!(
+            order.windows(2).all(|w| w[0] < w[1]),
+            "Info, Warning, Error, Silent, Debug"
+        );
         ui.click("log-level-info");
         assert!(ui.sent().is_empty(), "already Info");
         ui.click("log-level-debug");
@@ -3334,7 +3829,7 @@ mod gpui_tests {
         ui.keys("enter");
         assert!(matches!(ui.sent()[..], [Cmd::SetProxyPort(80)]));
         ui.snap(|s| {
-            s.messages.insert(Area::Listen, error());
+            s.messages.insert(Topic::ProxyPort, error());
         });
         // Emptied, it stands for the saved default: Return refills it and clears the message.
         ui.keys("cmd-a backspace enter");
@@ -3344,7 +3839,7 @@ mod gpui_tests {
         // Leaving the field does the same.
         ui.snap(|s| {
             s.messages.clear();
-            s.messages.insert(Area::Api, error());
+            s.messages.insert(Topic::ApiPort, error());
         });
         ui.click("api-port-input");
         ui.keys("cmd-a backspace");
@@ -3500,13 +3995,14 @@ mod gpui_tests {
         };
         ui.snap(|s| {
             s.messages
-                .insert(Area::Listen, message("Applied", false, 1));
+                .insert(Topic::ProxyPort, message("Applied", false, 1));
             s.messages
-                .insert(Area::Api, message("Port 21000 is in use", true, 2));
+                .insert(Topic::ApiPort, message("Port 21000 is in use", true, 2));
         });
         let current = |ui: &mut Ui, area| {
-            ui.view
-                .update(ui.cx, |this, cx| this.current(area, cx).map(|m| m.text))
+            ui.view.update(ui.cx, |this, cx| {
+                this.current(area, cx).first().map(|m| m.text.clone())
+            })
         };
         assert_eq!(current(&mut ui, Area::Listen).as_deref(), Some("Applied"));
         ui.wait(MESSAGE_SHOWN + Duration::from_millis(10));
@@ -3515,7 +4011,7 @@ mod gpui_tests {
         // The same text again is a new message.
         ui.snap(|s| {
             s.messages
-                .insert(Area::Listen, message("Applied", false, 3));
+                .insert(Topic::ProxyPort, message("Applied", false, 3));
         });
         assert_eq!(current(&mut ui, Area::Listen).as_deref(), Some("Applied"));
     }
@@ -3585,6 +4081,367 @@ mod gpui_tests {
                 assert!(offset < px(1.), "{id} is off its label by {offset:?}");
             }
         }
+    }
+
+    /// `running()` with each name's kind; PICK selects DIRECT, AUTO picked A.
+    fn with_nodes() -> Snapshot {
+        let node = |kind: &str, latency| crate::api::Node {
+            kind: kind.into(),
+            provider: None,
+            latency,
+        };
+        let mut snap = running();
+        snap.nodes = [
+            ("DIRECT", node("Direct", None)),
+            ("REJECT", node("Reject", None)),
+            ("A", node("Vless", Some(Latency::Ms(123)))),
+            ("B", node("Vless", Some(Latency::Failed))),
+            ("PICK", node("Selector", None)),
+            ("AUTO", node("URLTest", None)),
+        ]
+        .into_iter()
+        .map(|(n, node)| (n.to_owned(), node))
+        .collect();
+        snap.latency_url = settings::DEFAULT_LATENCY_URL.into();
+        snap
+    }
+
+    #[test]
+    fn the_slot_shows_the_state_of_the_cards_node() {
+        let mut s = with_nodes();
+        let p = palette(Theme::Light, WindowAppearance::Light);
+        let text = |t: &str, c| (Slot::Text(t.into(), c), true);
+        assert_eq!(slot(&s, "A", false, p), text("123 ms", p.good));
+        assert_eq!(slot(&s, "B", false, p), text("Timeout", p.danger));
+        assert_eq!(
+            slot(&s, "DIRECT", false, p),
+            (Slot::Bolt { pulsing: false }, true)
+        );
+        assert_eq!(slot(&s, "REJECT", false, p), (Slot::Empty, false));
+        assert_eq!(
+            slot(&s, "AUTO", false, p),
+            text("123 ms", p.good),
+            "AUTO's pick"
+        );
+        assert_eq!(
+            slot(&s, "A", true, p),
+            text("123 ms", p.on_accent),
+            "on the accent"
+        );
+        s.nodes.get_mut("A").unwrap().latency = Some(Latency::Ms(600));
+        assert_eq!(slot(&s, "A", false, p), text("600 ms", p.warning));
+        s.testing.insert("A".into());
+        assert_eq!(
+            slot(&s, "A", false, p),
+            (Slot::Bolt { pulsing: true }, false)
+        );
+        s.testing.clear();
+        s.testing_group = Some("PICK".into());
+        assert!(!slot(&s, "B", false, p).1, "not during a group test");
+        let dark = palette(Theme::Dark, WindowAppearance::Dark);
+        assert_ne!(p.good, dark.good, "a green for each theme");
+    }
+
+    #[gpui::test]
+    fn a_click_on_the_slot_tests_and_never_selects(cx: &mut TestAppContext) {
+        let mut ui = open(cx, with_nodes());
+        ui.click("group-PICK");
+        ui.click("group-AUTO");
+        ui.drain();
+        let card = ui.cx.debug_bounds("pick-PICK-DIRECT").unwrap();
+        let slot = ui.cx.debug_bounds("latency-PICK-DIRECT").unwrap();
+        // Out to the card's right and bottom edges, inside its border.
+        assert!(card.right() - slot.right() <= px(1.) && card.bottom() - slot.bottom() <= px(1.));
+        assert!(slot.size.width >= px(28.) && slot.size.height >= px(20.));
+        assert!(slot.top() > ui.cx.debug_bounds("pick-PICK-REJECT").unwrap().top());
+        ui.click("latency-PICK-DIRECT");
+        assert!(matches!(&ui.sent()[..], [Cmd::TestNode(m)] if m == "DIRECT"));
+        ui.click("latency-PICK-REJECT");
+        assert!(
+            ui.sent().is_empty(),
+            "REJECT is never tested, nor selected by its slot"
+        );
+        // A URLTest card does nothing itself; its slot still tests.
+        ui.click("latency-AUTO-B");
+        assert!(matches!(&ui.sent()[..], [Cmd::TestNode(m)] if m == "B"));
+        ui.click("pick-PICK-REJECT");
+        assert!(
+            matches!(&ui.sent()[..], [Cmd::Select { .. }]),
+            "the card still selects"
+        );
+
+        ui.snap(|s| s.testing_group = Some("AUTO".into()));
+        ui.click("latency-PICK-DIRECT");
+        ui.click("test-group-PICK");
+        assert!(ui.sent().is_empty(), "everything waits for the group test");
+    }
+
+    #[gpui::test]
+    fn the_group_bolt_tests_only_an_expanded_group_and_never_toggles(cx: &mut TestAppContext) {
+        let mut ui = open(cx, with_nodes());
+        let row = ui.cx.debug_bounds("group-PICK").unwrap();
+        let bolt = ui.cx.debug_bounds("test-group-PICK").unwrap();
+        assert!(
+            row.right() - bolt.right() < px(12.),
+            "at the end of the row"
+        );
+        ui.click("test-group-PICK");
+        assert!(ui.sent().is_empty());
+        assert!(
+            ui.cx.debug_bounds("pick-PICK-DIRECT").is_none(),
+            "still collapsed"
+        );
+        ui.click("group-PICK");
+        ui.click("test-group-PICK");
+        assert!(matches!(&ui.sent()[..], [Cmd::TestGroup(g)] if g == "PICK"));
+        assert!(ui.read(|s| s.expanded.contains("PICK")), "still expanded");
+    }
+
+    #[gpui::test]
+    fn the_latency_url_applies_on_return_and_reverts_on_escape(cx: &mut TestAppContext) {
+        let snapshot = Snapshot {
+            secret: SECRET.into(),
+            ..with_nodes()
+        };
+        let mut ui = open(cx, snapshot);
+        ui.keys("cmd-4");
+        ui.drain();
+        let text = |ui: &mut Ui| {
+            ui.view
+                .update(ui.cx, |this, cx| this.latency_url.input.read(cx).text())
+        };
+        assert_eq!(text(&mut ui), settings::DEFAULT_LATENCY_URL);
+        let label = ui.cx.debug_bounds("label-Latency URL").unwrap();
+        assert!(label.top() < ui.cx.debug_bounds("label-Log Level").unwrap().top());
+        let field = ui.cx.debug_bounds("latency-url-input").unwrap();
+        assert_eq!(
+            field.size.width,
+            px(300.),
+            "room for the default, not the whole row"
+        );
+        assert!(ui.cx.debug_bounds("latency-url-apply").is_none());
+        ui.click("latency-url-input");
+        ui.keys("cmd-a");
+        ui.cx.simulate_input("http://127.0.0.1:8080/204");
+        assert!(ui.cx.debug_bounds("latency-url-apply").is_some());
+        ui.keys("escape");
+        assert_eq!(
+            text(&mut ui),
+            settings::DEFAULT_LATENCY_URL,
+            "back to the saved one"
+        );
+        // Drawn elements stay in the test's map, so Apply's absence is read from the state.
+        let apply_shown = |ui: &mut Ui| {
+            ui.view.update(ui.cx, |this, cx| {
+                this.latency_draft(cx) != this.snap.latency_url
+            })
+        };
+        assert!(!apply_shown(&mut ui));
+
+        ui.keys("cmd-a");
+        ui.cx.simulate_input("not a url");
+        ui.keys("enter");
+        assert!(matches!(&ui.sent()[..], [Cmd::SetLatencyUrl(u)] if u == "not a url"));
+        // Refused: the error stays beside Runtime and so does the draft.
+        ui.snap(|s| {
+            s.messages.insert(
+                Topic::LatencyUrl,
+                Message {
+                    text: "Use an http or https URL".into(),
+                    error: true,
+                    id: 1,
+                },
+            );
+        });
+        assert_eq!(text(&mut ui), "not a url");
+        // Emptied, it stands for the saved default: Return refills it and clears the error.
+        ui.keys("cmd-a backspace enter");
+        assert_eq!(text(&mut ui), settings::DEFAULT_LATENCY_URL);
+        assert!(
+            matches!(&ui.sent()[..], [Cmd::SetLatencyUrl(u)] if u == settings::DEFAULT_LATENCY_URL)
+        );
+        ui.keys("cmd-a");
+        ui.cx.simulate_input("https://example.com/x");
+        ui.click("latency-url-apply");
+        assert!(matches!(&ui.sent()[..], [Cmd::SetLatencyUrl(u)] if u == "https://example.com/x"));
+        ui.snap(|s| s.latency_url = "https://example.com/x".into());
+        assert_eq!(text(&mut ui), "https://example.com/x");
+        assert!(!apply_shown(&mut ui));
+    }
+
+    #[test]
+    fn as_many_whole_messages_fit_as_leave_room_for_the_count() {
+        let more = |_| 15.;
+        let widths = [50., 50., 50.];
+        assert_eq!(fitting(&widths, 10., more, 170.), 3, "all, no count");
+        assert_eq!(fitting(&widths, 10., more, 169.), 2, "two, then +1");
+        assert_eq!(
+            fitting(&widths, 10., more, 130.),
+            1,
+            "two would leave no room for +1"
+        );
+        assert_eq!(
+            fitting(&widths, 10., more, 70.),
+            0,
+            "the newest is cut short"
+        );
+        assert_eq!(
+            fitting(&[50.], 10., more, 50.),
+            1,
+            "alone, it needs no count"
+        );
+    }
+
+    /// Settings → Proxy with three topics: two errors and the newest, information.
+    fn three_proxy_messages() -> Snapshot {
+        let (mixed_port, controller_port) = defaults();
+        let message = |text: &str, error, id| Message {
+            text: text.into(),
+            error,
+            id,
+        };
+        let mut snap = Snapshot {
+            mixed_port,
+            controller_port,
+            secret: SECRET.into(),
+            ..running()
+        };
+        snap.messages.extend([
+            (Topic::ProxyPort, message("Port 7890 is in use", true, 1)),
+            (
+                Topic::ExternalPort,
+                message("Another tool set port 0. Reload restores 20999", true, 2),
+            ),
+            (
+                Topic::Lan,
+                message("Other devices can use 192.168.1.23:20999", false, 3),
+            ),
+        ]);
+        snap
+    }
+
+    #[gpui::test]
+    fn messages_share_the_title_line_and_count_what_does_not_fit(cx: &mut TestAppContext) {
+        let tops = |ui: &mut Ui| {
+            ["label-Mixed Port", "lan-off", "label-Secret"]
+                .map(|id| ui.cx.debug_bounds(id).unwrap().top())
+        };
+        let narrow = |ui: &mut Ui| {
+            ui.cx.simulate_resize(gpui::size(px(480.), px(900.)));
+            ui.keys("cmd-4");
+        };
+        let quiet = {
+            let mut ui = settings_tab(cx);
+            narrow(&mut ui);
+            tops(&mut ui)
+        };
+        // Wide: all three, newest first, in one line.
+        {
+            let mut ui = open(cx, three_proxy_messages());
+            ui.cx.simulate_resize(gpui::size(px(1400.), px(900.)));
+            ui.keys("cmd-4");
+            let at = |ui: &mut Ui, i: usize| {
+                let id: &'static str = ["proxy-message-0", "proxy-message-1", "proxy-message-2"][i];
+                ui.cx.debug_bounds(id).unwrap()
+            };
+            let (first, second, third) = (at(&mut ui, 0), at(&mut ui, 1), at(&mut ui, 2));
+            assert!(first.right() < second.left() && second.right() < third.left());
+            assert_eq!(first.top(), third.top(), "one line");
+            assert!(ui.cx.debug_bounds("proxy-message-more").is_none());
+            // The newest is the information message, shown before it expires.
+            let items = ui
+                .view
+                .update(ui.cx, |this, cx| this.current(Area::Listen, cx));
+            assert_eq!(items[0].text, "Other devices can use 192.168.1.23:20999");
+        }
+        // At 480 points: what fits, then the count; nothing moves down.
+        let mut ui = open(cx, three_proxy_messages());
+        narrow(&mut ui);
+        let line = ui.cx.debug_bounds("proxy-message").unwrap();
+        let more = ui.cx.debug_bounds("proxy-message-more").unwrap();
+        assert!(
+            more.right() <= line.right() + px(0.5),
+            "the count stays inside"
+        );
+        assert!(
+            line.right() <= px(480. - 12.) + px(0.5),
+            "the line never overflows"
+        );
+        assert!(ui.cx.debug_bounds("proxy-message-2").is_none());
+        assert_eq!(tops(&mut ui), quiet, "the title line keeps its height");
+    }
+
+    #[gpui::test]
+    fn the_newest_alone_is_cut_short_before_the_count(cx: &mut TestAppContext) {
+        let mut snap = three_proxy_messages();
+        snap.messages.get_mut(&Topic::Lan).unwrap().text = "x".repeat(300);
+        let mut ui = open(cx, snap);
+        ui.cx.simulate_resize(gpui::size(px(480.), px(900.)));
+        ui.keys("cmd-4");
+        let line = ui.cx.debug_bounds("proxy-message").unwrap();
+        let newest = ui.cx.debug_bounds("proxy-message-0").unwrap();
+        assert!(newest.right() < ui.cx.debug_bounds("proxy-message-more").unwrap().left());
+        assert!(line.right() <= px(480. - 12.) + px(0.5));
+        assert!(ui.cx.debug_bounds("proxy-message-1").is_none());
+    }
+
+    #[gpui::test]
+    fn a_settled_field_clears_only_its_own_topic(cx: &mut TestAppContext) {
+        let mut ui = open(cx, three_proxy_messages());
+        ui.keys("cmd-4");
+        ui.drain();
+        ui.snap(|s| {
+            s.messages.remove(&Topic::ProxyPort);
+        });
+        // Another topic in the section is no reason to send anything.
+        ui.click("proxy-port-input");
+        ui.keys("enter");
+        assert!(ui.sent().is_empty());
+        ui.snap(|s| {
+            s.messages.insert(
+                Topic::ProxyPort,
+                Message {
+                    text: "Port 7890 is in use".into(),
+                    error: true,
+                    id: 9,
+                },
+            );
+        });
+        ui.keys("enter");
+        assert!(matches!(ui.sent()[..], [Cmd::SetProxyPort(_)]));
+    }
+
+    #[gpui::test]
+    fn a_bad_value_is_fixed_by_choosing_the_shown_option_again(cx: &mut TestAppContext) {
+        let mut ui = settings_tab(cx);
+        ui.snap(|s| s.keep_dock_icon = true);
+        for id in ["dock-always", "log-level-info", "lan-off"] {
+            ui.click(id);
+        }
+        assert!(ui.sent().is_empty(), "already chosen");
+        ui.snap(|s| {
+            for topic in [Topic::DockIcon, Topic::LogLevel, Topic::Lan] {
+                s.messages.insert(
+                    topic,
+                    Message {
+                        text: "settings.yaml: invalid theme. Using the default".into(),
+                        error: true,
+                        id: topic as u64 + 1,
+                    },
+                );
+            }
+        });
+        for id in ["dock-always", "log-level-info", "lan-off"] {
+            ui.click(id);
+        }
+        assert!(matches!(
+            ui.sent()[..],
+            [
+                Cmd::SetKeepDockIcon(true),
+                Cmd::SetLogLevel(settings::LogLevel::Info),
+                Cmd::SetAllowLan(false)
+            ]
+        ));
     }
 
     #[gpui::test]

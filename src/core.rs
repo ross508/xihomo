@@ -28,7 +28,7 @@ pub async fn ensure_ports_free(ports: &[u16]) -> Result<()> {
                 attempt += 1;
                 if attempt == 6 {
                     bail!(
-                        "port {port} is in use by another process ({e}); xihomo will not control it"
+                        "port {port} is in use by another process ({e}), so xihomo will not control it"
                     );
                 }
                 tokio::time::sleep(Duration::from_millis(60)).await;
@@ -97,7 +97,7 @@ fn rejection_reason(output: &str) -> String {
         let lines: Vec<&str> = output.lines().collect();
         return lines[lines.len().saturating_sub(3)..].join(" ");
     }
-    errors.join("; ")
+    errors.join(". ")
 }
 
 #[derive(Serialize, Deserialize)]

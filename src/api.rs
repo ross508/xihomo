@@ -2,13 +2,16 @@ use anyhow::{Context, Result, bail};
 use reqwest::{Client, Method, Response, Url};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 /// A large rule list over a slow link can take this long to fetch.
 const PROVIDER_TIMEOUT: Duration = Duration::from_secs(60);
+/// What Mihomo waits for a latency test, and a little more for the request around it.
+const TEST_TIMEOUT_MS: u32 = 5000;
+const TEST_REQUEST_TIMEOUT: Duration = Duration::from_secs(7);
 
 #[derive(Clone)]
 pub struct Api {
@@ -37,6 +40,65 @@ impl Group {
     pub fn selectable(&self) -> bool {
         self.kind == "Selector"
     }
+
+    /// The members Control shows: REJECT as the whole machine's route is never wanted.
+    pub fn shown(&self) -> impl Iterator<Item = &String> {
+        self.all
+            .iter()
+            .filter(|m| !(self.name == "GLOBAL" && *m == "REJECT"))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Latency {
+    Ms(u32),
+    Failed,
+}
+
+/// An entry of `/proxies` (a node, a group or a built-in) or a provider's node.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Node {
+    /// Mihomo's adapter type, as it spells it: `Vless`, `Selector`, `Direct`.
+    pub kind: String,
+    /// Set for a node that only a proxy provider lists, which is tested through it.
+    pub provider: Option<String>,
+    /// The last result Mihomo keeps for the Latency URL; `None` when never tested with it.
+    pub latency: Option<Latency>,
+}
+
+fn parse_node(p: &Value, provider: Option<&str>, url: &str) -> Node {
+    let latency = p["extra"][url]["history"]
+        .as_array()
+        .and_then(|h| h.last())
+        .map(|entry| match entry["delay"].as_u64() {
+            Some(ms) if ms > 0 => Latency::Ms(ms as u32),
+            _ => Latency::Failed,
+        });
+    Node {
+        kind: p["type"].as_str().unwrap_or_default().to_owned(),
+        provider: provider.map(str::to_owned),
+        latency,
+    }
+}
+
+/// Everything `/proxies` lists, plus the nodes of `/providers/proxies` it does not. Compatible
+/// providers hold groups' inline members, which `/proxies` already has.
+pub fn parse_nodes(proxies: &Value, providers: &Value, url: &str) -> BTreeMap<String, Node> {
+    let mut nodes = BTreeMap::new();
+    for (name, provider) in providers["providers"].as_object().into_iter().flatten() {
+        if provider["vehicleType"] == "Compatible" {
+            continue;
+        }
+        for p in provider["proxies"].as_array().into_iter().flatten() {
+            if let Some(node) = p["name"].as_str() {
+                nodes.insert(node.to_owned(), parse_node(p, Some(name), url));
+            }
+        }
+    }
+    for (name, p) in proxies["proxies"].as_object().into_iter().flatten() {
+        nodes.insert(name.clone(), parse_node(p, None, url));
+    }
+    nodes
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
@@ -222,13 +284,59 @@ impl Api {
         Ok(())
     }
 
-    pub async fn groups(&self) -> Result<Vec<Group>> {
-        let body: Value = self
-            .send(Method::GET, self.url(&["proxies"]), None)
-            .await?
-            .json()
-            .await?;
-        Ok(parse_groups(&body))
+    /// The groups, and every node with its last result for `latency_url`.
+    pub async fn proxies(&self, latency_url: &str) -> Result<(Vec<Group>, BTreeMap<String, Node>)> {
+        let mut bodies = Vec::new();
+        for path in [&["proxies"][..], &["providers", "proxies"]] {
+            let body: Value = self
+                .send(Method::GET, self.url(path), None)
+                .await?
+                .json()
+                .await?;
+            bodies.push(body);
+        }
+        Ok((
+            parse_groups(&bodies[0]),
+            parse_nodes(&bodies[0], &bodies[1], latency_url),
+        ))
+    }
+
+    /// A provider's node is not in `/proxies`, so it is tested through its provider.
+    fn test_url(&self, name: &str, provider: Option<&str>, latency_url: &str) -> Url {
+        let mut url = match provider {
+            Some(p) => self.url(&["providers", "proxies", p, name, "healthcheck"]),
+            None => self.url(&["proxies", name, "delay"]),
+        };
+        url.query_pairs_mut()
+            .append_pair("url", latency_url)
+            .append_pair("timeout", &TEST_TIMEOUT_MS.to_string());
+        url
+    }
+
+    /// One latency test. Any answer but 200, or none, is `Failed`.
+    pub async fn test(&self, name: &str, provider: Option<&str>, latency_url: &str) -> Latency {
+        let reply = self
+            .client
+            .get(self.test_url(name, provider, latency_url))
+            .bearer_auth(&*self.secret)
+            .timeout(TEST_REQUEST_TIMEOUT)
+            .send()
+            .await;
+        let Ok(reply) = reply.map_err(drop).and_then(|r| match r.status() {
+            reqwest::StatusCode::OK => Ok(r),
+            _ => Err(()),
+        }) else {
+            return Latency::Failed;
+        };
+        match reply
+            .json::<Value>()
+            .await
+            .ok()
+            .and_then(|v| v["delay"].as_u64())
+        {
+            Some(ms) if ms > 0 => Latency::Ms(ms as u32),
+            _ => Latency::Failed,
+        }
     }
 
     pub async fn select(&self, group: &str, proxy: &str) -> Result<()> {
@@ -487,6 +595,86 @@ mod tests {
             api.url(&["proxies", "Auto/🇯🇵 x"]).path(),
             "/proxies/Auto%2F%F0%9F%87%AF%F0%9F%87%B5%20x"
         );
+    }
+
+    const URL: &str = "https://cp.cloudflare.com/generate_204";
+
+    #[test]
+    fn nodes_carry_kind_provider_and_the_last_result_for_the_url() {
+        let history = |delays: &[u64]| {
+            json!({ URL: {"alive": true, "history": delays.iter().map(|d| json!({"time": "t", "delay": d})).collect::<Vec<_>>()},
+                    "http://other/": {"history": [{"delay": 99}]} })
+        };
+        let proxies = json!({"proxies": {
+            "DIRECT": {"type": "Direct", "extra": history(&[12])},
+            "jp1": {"type": "Vless", "extra": history(&[300, 0])},
+            "sg1": {"type": "Shadowsocks", "extra": {"http://other/": {"history": [{"delay": 5}]}}},
+            "Main": {"type": "Selector", "now": "jp1", "all": ["jp1"], "extra": history(&[40])},
+            "both": {"type": "Trojan"},
+        }});
+        let providers = json!({"providers": {
+            "kitty": {"vehicleType": "HTTP", "proxies": [
+                {"name": "kitty/🇯🇵 1", "type": "Hysteria2", "extra": history(&[80])},
+                {"name": "both", "type": "Vmess", "extra": history(&[1])},
+            ]},
+            "Main": {"vehicleType": "Compatible", "proxies": [{"name": "inline", "type": "Http"}]},
+        }});
+        let nodes = parse_nodes(&proxies, &providers, URL);
+        let get = |name: &str| nodes.get(name).cloned();
+        assert_eq!(get("DIRECT").unwrap().latency, Some(Latency::Ms(12)));
+        assert_eq!(
+            get("jp1").unwrap().latency,
+            Some(Latency::Failed),
+            "the last entry"
+        );
+        assert_eq!(
+            get("sg1").unwrap().latency,
+            None,
+            "another URL's results are ignored"
+        );
+        assert_eq!(get("Main").unwrap().kind, "Selector");
+        let kitty = get("kitty/🇯🇵 1").unwrap();
+        assert_eq!(
+            (
+                kitty.kind.as_str(),
+                kitty.provider.as_deref(),
+                kitty.latency
+            ),
+            ("Hysteria2", Some("kitty"), Some(Latency::Ms(80)))
+        );
+        let both = get("both").unwrap();
+        assert_eq!(
+            (both.kind.as_str(), both.provider, both.latency),
+            ("Trojan", None, None)
+        );
+        assert_eq!(get("inline"), None, "Compatible providers are skipped");
+    }
+
+    #[test]
+    fn a_test_goes_to_the_node_or_through_its_provider() {
+        let api = Api::new(1, "s").unwrap();
+        let url = "https://example.com/a?b=1&c=d e";
+        let direct = api.test_url("Auto/🇯🇵 x", None, url);
+        assert_eq!(
+            direct.path(),
+            "/proxies/Auto%2F%F0%9F%87%AF%F0%9F%87%B5%20x/delay"
+        );
+        let query: Vec<(String, String)> = direct.query_pairs().into_owned().collect();
+        assert_eq!(
+            query,
+            [
+                ("url".into(), url.into()),
+                ("timeout".into(), "5000".into())
+            ]
+        );
+        assert!(
+            direct
+                .query()
+                .unwrap()
+                .starts_with("url=https%3A%2F%2Fexample.com%2Fa%3Fb%3D1%26c%3Dd+e&")
+        );
+        let via = api.test_url("a/b", Some("kitty 1"), url);
+        assert_eq!(via.path(), "/providers/proxies/kitty%201/a%2Fb/healthcheck");
     }
 
     #[test]

@@ -2,8 +2,8 @@
 //! through `EntityInputHandler`, selection by keyboard and mouse, and the clipboard. The cursor
 //! moves by `char`, not by grapheme cluster, to avoid a dependency for a filter field.
 use gpui::{
-    App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, EventEmitter, FocusHandle, GlobalElementId, KeyBinding, LayoutId,
+    App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, ElementId, ElementInputHandler,
+    Entity, EntityInputHandler, EventEmitter, FocusHandle, GlobalElementId, KeyBinding, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
     ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div,
     fill, point, prelude::*, px, relative, size,
@@ -60,7 +60,7 @@ pub fn bindings() -> Vec<KeyBinding> {
 pub struct Changed;
 /// Return was pressed.
 pub struct Submitted;
-/// Esc was pressed in a digits field, which keeps its text for the owner to restore.
+/// Esc was pressed in a settings field, which keeps its text for the owner to restore.
 pub struct Cancelled;
 
 pub struct TextInput {
@@ -81,6 +81,10 @@ pub struct TextInput {
     painted_focused: bool,
     /// Accepts only ASCII digits, at most this many.
     max_digits: Option<usize>,
+    /// Esc reports `Cancelled` instead of clearing.
+    cancels: bool,
+    /// How far the line is shifted left, so the cursor stays in view.
+    scroll: Pixels,
 }
 
 impl EventEmitter<Changed> for TextInput {}
@@ -96,6 +100,14 @@ impl TextInput {
     ) -> Self {
         Self {
             max_digits: Some(max),
+            ..Self::setting(placeholder, cx)
+        }
+    }
+
+    /// A field that edits a saved value: Esc reports `Cancelled` instead of clearing.
+    pub fn setting(placeholder: impl Into<SharedString>, cx: &mut Context<Self>) -> Self {
+        Self {
+            cancels: true,
             ..Self::new(placeholder, cx)
         }
     }
@@ -116,6 +128,8 @@ impl TextInput {
             blinking: false,
             painted_focused: false,
             max_digits: None,
+            cancels: false,
+            scroll: px(0.),
         }
     }
 
@@ -238,7 +252,7 @@ impl TextInput {
     }
 
     fn clear(&mut self, _: &Clear, window: &mut Window, cx: &mut Context<Self>) {
-        if self.max_digits.is_some() {
+        if self.cancels {
             cx.emit(Cancelled);
             return;
         }
@@ -309,7 +323,7 @@ impl TextInput {
         if self.content.is_empty() {
             return 0;
         }
-        line.closest_index_for_x(position.x - bounds.left())
+        line.closest_index_for_x(position.x - bounds.left() + self.scroll)
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -487,11 +501,11 @@ impl EntityInputHandler for TextInput {
         let range = self.range_from_utf16(&range_utf16);
         Some(Bounds::from_corners(
             point(
-                bounds.left() + layout.x_for_index(range.start),
+                bounds.left() - self.scroll + layout.x_for_index(range.start),
                 bounds.top(),
             ),
             point(
-                bounds.left() + layout.x_for_index(range.end),
+                bounds.left() - self.scroll + layout.x_for_index(range.end),
                 bounds.bottom(),
             ),
         ))
@@ -504,7 +518,10 @@ impl EntityInputHandler for TextInput {
         _: &mut Context<Self>,
     ) -> Option<usize> {
         let local = self.last_bounds?.localize(&point)?;
-        let index = self.last_layout.as_ref()?.index_for_x(local.x)?;
+        let index = self
+            .last_layout
+            .as_ref()?
+            .index_for_x(local.x + self.scroll)?;
         Some(self.offset_to_utf16(index))
     }
 }
@@ -516,6 +533,7 @@ struct TextElement {
 
 struct PrepaintState {
     line: Option<ShapedLine>,
+    scroll: Pixels,
     cursor: Option<PaintQuad>,
     selection: Option<PaintQuad>,
 }
@@ -608,7 +626,17 @@ impl Element for TextElement {
             .text_system()
             .shape_line(text, font_size, &runs, None);
 
-        let x = |index| bounds.left() + line.x_for_index(index);
+        let scroll = if input.content.is_empty() {
+            px(0.)
+        } else {
+            scroll_for(
+                input.scroll,
+                line.x_for_index(input.cursor_offset()),
+                line.width,
+                bounds.size.width,
+            )
+        };
+        let x = |index| bounds.left() - scroll + line.x_for_index(index);
         let range = input.selected_range.clone();
         let (selection, cursor) = if range.is_empty() {
             // A little shorter than the line, like AppKit's insertion point.
@@ -627,6 +655,7 @@ impl Element for TextElement {
         };
         PrepaintState {
             line: Some(line),
+            scroll,
             cursor,
             selection,
         }
@@ -648,30 +677,44 @@ impl Element for TextElement {
             ElementInputHandler::new(bounds, self.input.clone()),
             cx,
         );
-        if let Some(selection) = prepaint.selection.take() {
-            window.paint_quad(selection)
-        }
         let Some(line) = prepaint.line.take() else {
             return;
         };
-        let _ = line.paint(bounds.origin, window.line_height(), window, cx);
         // Like AppKit, the cursor shows only in the key window.
         let focused = focus.is_focused(window) && window.is_window_active();
-        if focused
-            && self.input.read(cx).cursor_visible
-            && let Some(cursor) = prepaint.cursor.take()
-        {
-            window.paint_quad(cursor);
-        }
+        let scroll = prepaint.scroll;
+        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+            if let Some(selection) = prepaint.selection.take() {
+                window.paint_quad(selection)
+            }
+            let origin = point(bounds.left() - scroll, bounds.top());
+            let _ = line.paint(origin, window.line_height(), window, cx);
+            if focused
+                && self.input.read(cx).cursor_visible
+                && let Some(cursor) = prepaint.cursor.take()
+            {
+                window.paint_quad(cursor);
+            }
+        });
         self.input.update(cx, |input, cx| {
             input.last_layout = Some(line);
             input.last_bounds = Some(bounds);
+            input.scroll = scroll;
             input.painted_focused = focused;
             if focused && !input.blinking {
                 input.start_blinking(cx);
             }
         });
     }
+}
+
+/// The shift that keeps the cursor at `cursor` in a `width` wide view, moving no more than it must,
+/// and leaving no empty room after the end of a `line` wide text.
+fn scroll_for(scroll: Pixels, cursor: Pixels, line: Pixels, width: Pixels) -> Pixels {
+    // Room for the cursor itself at the right edge.
+    let width = width - px(2.);
+    let scroll = scroll.min(cursor).max(cursor - width);
+    scroll.min((line - width).max(px(0.))).max(px(0.))
 }
 
 impl Render for TextInput {
@@ -833,6 +876,81 @@ mod tests {
                 ("7".into(), 1..1)
             );
         });
+    }
+
+    #[test]
+    fn the_view_moves_only_as_far_as_the_cursor_needs() {
+        let s = |scroll: f32, cursor: f32, line: f32| {
+            f32::from(scroll_for(px(scroll), px(cursor), px(line), px(102.)))
+        };
+        assert_eq!(s(0., 50., 300.), 0., "in view");
+        assert_eq!(s(0., 250., 300.), 150., "the cursor at the right edge");
+        assert_eq!(s(150., 200., 300.), 150., "still in view: no move");
+        assert_eq!(s(150., 120., 300.), 120., "the cursor at the left edge");
+        assert_eq!(s(150., 300., 300.), 200., "the end of the text");
+        assert_eq!(s(200., 80., 80.), 0., "a shorter text leaves no gap");
+    }
+
+    /// An input narrower than its text.
+    struct Narrow(Entity<TextInput>);
+    impl Render for Narrow {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().w(px(80.)).child(self.0.clone())
+        }
+    }
+
+    #[gpui::test]
+    fn a_long_line_scrolls_to_keep_the_cursor_in_view(cx: &mut TestAppContext) {
+        let input = cx.new(|cx| TextInput::setting("x", cx));
+        let cancelled = std::rc::Rc::new(std::cell::Cell::new(false));
+        let seen = cancelled.clone();
+        cx.update(|cx| {
+            cx.subscribe(&input, move |_, _: &Cancelled, _| seen.set(true))
+                .detach()
+        });
+        let shown = input.clone();
+        let (_, cx) = cx.add_window_view(|_, _| Narrow(shown));
+        let draw = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| window.draw(cx).clear());
+            cx.run_until_parked();
+        };
+        let state = |cx: &mut VisualTestContext| {
+            input.read_with(cx, |i, _| {
+                let bounds = i.last_bounds.unwrap();
+                let x = bounds.left() - i.scroll
+                    + i.last_layout
+                        .as_ref()
+                        .unwrap()
+                        .x_for_index(i.cursor_offset());
+                (i.scroll, bounds.left() <= x && x <= bounds.right())
+            })
+        };
+        input.update_in(cx, |i, window, cx| {
+            i.replace_text_in_range(None, "https://cp.cloudflare.com/generate_204", window, cx)
+        });
+        draw(cx);
+        let (scroll, visible) = state(cx);
+        assert!(scroll > px(0.) && visible, "{scroll:?}");
+        input.update_in(cx, |i, window, cx| i.home(&Home, window, cx));
+        draw(cx);
+        assert_eq!(state(cx), (px(0.), true));
+        // A click lands on the character under the pointer, wherever the line is shifted.
+        input.update_in(cx, |i, window, cx| i.end(&End, window, cx));
+        draw(cx);
+        let (end, at) = input.read_with(cx, |i, _| {
+            (i.content.len(), i.last_bounds.unwrap().right() - px(1.))
+        });
+        assert_eq!(
+            input.read_with(cx, |i, _| i.index_for_mouse_position(point(at, px(0.)))),
+            end
+        );
+
+        input.update_in(cx, |i, window, cx| i.clear(&Clear, window, cx));
+        assert!(
+            cancelled.get(),
+            "Esc in a setting reports instead of clearing"
+        );
+        assert_eq!(input.read_with(cx, |i, _| i.text().len()), end);
     }
 
     #[gpui::test]
