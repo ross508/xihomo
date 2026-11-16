@@ -185,4 +185,4 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Casks/xihomo.rb
           git commit -m "xihomo $version"
-          git push origin HEAD:main
+          git push origin HEAD:master
