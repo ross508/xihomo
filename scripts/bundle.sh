@@ -24,14 +24,23 @@ case $digest in
   *[!0-9a-f]* | "") fail "mihomo-version holds no SHA-256: $digest" ;;
 esac
 [ ${#digest} -eq 64 ] || fail "mihomo-version holds no SHA-256: $digest"
+# Downloads $1 to $2 unless $2 already has the SHA-256 $3, and fails unless it does after.
+fetch() {
+  if [ ! -s "$2" ] || [ "$(shasum -a 256 "$2" | cut -d ' ' -f 1)" != "$3" ]; then
+    curl -fsSL -o "$2.tmp" "$1"
+    [ "$(shasum -a 256 "$2.tmp" | cut -d ' ' -f 1)" = "$3" ] || fail "$1 failed its SHA-256 check"
+    mv "$2.tmp" "$2"
+  fi
+}
+mkdir -p target
 asset=mihomo-darwin-arm64-$core_version.gz
 gz=target/$asset
-mkdir -p target
-if [ ! -s "$gz" ] || [ "$(shasum -a 256 "$gz" | cut -d ' ' -f 1)" != "$digest" ]; then
-  curl -fsSL -o "$gz.tmp" "https://github.com/MetaCubeX/mihomo/releases/download/$core_version/$asset"
-  [ "$(shasum -a 256 "$gz.tmp" | cut -d ' ' -f 1)" = "$digest" ] || fail "$asset failed its SHA-256 check"
-  mv "$gz.tmp" "$gz"
-fi
+fetch "https://github.com/MetaCubeX/mihomo/releases/download/$core_version/$asset" "$gz" "$digest"
+# GPL-3.0 asks for its text to travel with the core: Mihomo's own LICENSE at that tag, checked
+# against the GPL-3.0 text's digest, which does not change between versions.
+gpl=target/mihomo-LICENSE
+fetch "https://raw.githubusercontent.com/MetaCubeX/mihomo/$core_version/LICENSE" "$gpl" \
+  3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986
 id=io.github.ross508.xihomo
 if [ "${1:-}" = "--dev" ]; then
   mise exec -- cargo build
@@ -48,7 +57,7 @@ rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 # xihomo is MPL-2.0. The bundled Mihomo core is a separate program under GPL-3.0.
 cp LICENSE "$app/Contents/Resources/LICENSE"
-cp mihomo-LICENSE "$app/Contents/Resources/mihomo-LICENSE"
+cp "$gpl" "$app/Contents/Resources/mihomo-LICENSE"
 cp "target/$profile/xihomo" "$app/Contents/MacOS/xihomo"
 core=$app/Contents/MacOS/mihomo
 gunzip -c "$gz" > "$core"
