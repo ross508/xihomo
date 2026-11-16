@@ -1,0 +1,188 @@
+# Pushing a v* tag builds, checks and publishes a release, then points the Homebrew tap at it.
+# Nothing reaches users before the install check passes: the release stays a draft until then,
+# and the tap changes only after the release is published.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+
+env:
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_INSTALL_CLEANUP: "1"
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: macos-26
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
+
+      - name: Check the tag against Cargo.toml
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      # Checks the core's digest and version, the signature, and that no local path or signing
+      # identity is inside.
+      - name: Build xihomo.app
+        run: scripts/bundle.sh
+
+      - name: Package the DMG
+        run: |
+          dmg=xihomo-$VERSION.dmg
+          mkdir dist stage
+          ditto target/release/xihomo.app stage/xihomo.app
+          ln -s /Applications stage/Applications
+          hdiutil create -volname xihomo -srcfolder stage -format UDZO "dist/$dmg"
+          (cd dist && shasum -a 256 "$dmg" > "$dmg.sha256")
+          cat "dist/$dmg.sha256"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A rerun replaces its own earlier draft, never a published release.
+          if [ "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft 2>/dev/null)" = true ]; then
+            gh release delete "$GITHUB_REF_NAME" --yes
+          fi
+          core=$(head -n 1 mihomo-version)
+          sha=$(cut -d ' ' -f 1 "dist/xihomo-$VERSION.dmg.sha256")
+          cat > notes.md <<NOTES
+          Install with Homebrew:
+
+          \`\`\`sh
+          brew install --cask ross508/tap/xihomo
+          \`\`\`
+
+          Or download the DMG below. xihomo is ad-hoc signed and not notarized, so macOS blocks its first launch: allow it in System Settings → Privacy & Security → Open Anyway. See the README's Security section.
+
+          - Version: $VERSION
+          - Built-in Mihomo core: $core, the official release binary, unmodified, licensed under GPL-3.0. Source: https://github.com/MetaCubeX/mihomo/tree/$core
+          - SHA-256 of xihomo-$VERSION.dmg: \`$sha\`
+          NOTES
+          gh release create "$GITHUB_REF_NAME" dist/* --draft --verify-tag \
+            --title "xihomo $VERSION" --notes-file notes.md
+
+  install-check:
+    needs: build
+    runs-on: macos-26
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist
+
+      # The real tap, holding the previous release when there is one, so the upgrade from it is
+      # what gets checked. The first release installs fresh.
+      - name: Install with Homebrew
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          dmg=$PWD/dist/xihomo-$version.dmg
+          sha=$(cut -d ' ' -f 1 "$dmg.sha256")
+          brew update --quiet
+          tap="$(brew --repository)/Library/Taps/ross508/homebrew-tap"
+          if gh api repos/ross508/homebrew-tap/contents/Casks/xihomo.rb --silent 2>/dev/null; then
+            brew tap ross508/tap
+            brew install --cask ross508/tap/xihomo
+            echo "Installed the previous release: $(brew list --cask --versions xihomo)"
+            scripts/cask.sh "$version" "$sha" "file://$dmg" > "$tap/Casks/xihomo.rb"
+            brew upgrade --cask ross508/tap/xihomo
+          else
+            brew tap-new --no-git ross508/tap
+            mkdir -p "$tap/Casks"
+            scripts/cask.sh "$version" "$sha" "file://$dmg" > "$tap/Casks/xihomo.rb"
+            brew install --cask ross508/tap/xihomo
+          fi
+          brew list --cask --versions xihomo | grep -qx "xihomo $version"
+
+      - name: Check the installed app
+        run: |
+          app=/Applications/xihomo.app
+          for f in "$app" "$app/Contents/MacOS/mihomo"; do
+            if xattr -p com.apple.quarantine "$f" 2>/dev/null; then
+              echo "::error::$f is quarantined"
+              exit 1
+            fi
+          done
+          codesign --verify --strict "$app"
+
+      # First launch with no core downloaded: the built-in core must start.
+      - name: Launch it once
+        run: |
+          open /Applications/xihomo.app
+          core=$(head -n 1 mihomo-version)
+          secret="$HOME/Library/Application Support/xihomo/state/secret"
+          for _ in $(seq 1 60); do
+            if [ -f "$secret" ] && curl -fs -m 2 -H "Authorization: Bearer $(cat "$secret")" \
+              http://127.0.0.1:11000/version | grep -qF "\"$core\""; then
+              echo "The built-in core $core runs"
+              pkill -TERM -f "xihomo.app/Contents/MacOS/xihomo$"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::The built-in core did not start within 60 s"
+          exit 1
+
+  publish:
+    needs: install-check
+    runs-on: macos-26
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false --latest
+
+      # If this fails, the release is out but the tap still points to the previous one.
+      - name: Point the tap at it
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          sha=$(cut -d ' ' -f 1 "dist/xihomo-$version.dmg.sha256")
+          git clone "https://x-access-token:$TAP_TOKEN@github.com/ross508/homebrew-tap.git" tap
+          mkdir -p tap/Casks
+          scripts/cask.sh "$version" "$sha" > tap/Casks/xihomo.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Casks/xihomo.rb
+          git commit -m "xihomo $version"
+          git push origin HEAD:main
