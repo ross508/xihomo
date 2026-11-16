@@ -1,6 +1,6 @@
-<img src="assets/logo.png" align="right" width="112" alt="Xihomo logo">
-
 # Xihomo
+
+<img src="assets/logo.png" align="right" width="112" alt="Xihomo logo">
 
 [![Release](https://img.shields.io/github/v/release/ross508/xihomo?label=release&logo=github&color=2f6fdb)](https://github.com/ross508/xihomo/releases/latest)
 [![Mihomo core](https://img.shields.io/badge/dynamic/regex?url=https%3A%2F%2Fraw.githubusercontent.com%2Fross508%2Fxihomo%2Fmaster%2Fmihomo-version&search=%5Ev%5B0-9.%5D%2B&label=mihomo&logo=go&logoColor=white&color=0e8a7d)](https://github.com/MetaCubeX/mihomo)
@@ -39,6 +39,10 @@ Neither touches `~/.config/xihomo`, so your settings and profiles stay. Delete i
 - The built-in core is Mihomo's official binary, unmodified.
 
 Verify a download against its `.sha256` file, or build it with [mise](https://mise.jdx.dev): `mise install && scripts/bundle.sh`.
+
+## Acknowledgments
+
+- **[Mihomo Core](https://github.com/MetaCubeX/mihomo)** Without it, Xihomo would be a very weird window that does nothing 😄
 
 ## License
 
