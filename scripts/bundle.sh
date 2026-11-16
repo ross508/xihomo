@@ -1,6 +1,6 @@
 #!/bin/sh
-# Builds a local, ad-hoc signed xihomo.app for personal use.
-# --dev builds the dev channel instead: target/debug/xihomo-dev.app, a separate app with its own
+# Builds a local, ad-hoc signed Xihomo.app for personal use.
+# --dev builds the dev channel instead: "target/debug/Xihomo Dev.app", a separate app with its own
 # bundle identifier, directories and default ports.
 # Both carry the Mihomo core pinned in mihomo-version (its version, then the SHA-256 of its release
 # asset) at Contents/MacOS/mihomo, the official release binary, unmodified, and its version in
@@ -44,18 +44,18 @@ fetch "https://raw.githubusercontent.com/MetaCubeX/mihomo/$core_version/LICENSE"
 id=io.github.ross508.xihomo
 if [ "${1:-}" = "--dev" ]; then
   mise exec -- cargo build
-  name=xihomo-dev profile=debug id=$id.dev
+  name="Xihomo Dev" profile=debug id=$id.dev
 else
   # The last matching prefix wins, so the most specific comes last.
   cargo_home=${CARGO_HOME:-$HOME/.cargo}
   RUSTFLAGS="--remap-path-prefix=$HOME=~ --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=$PWD=/xihomo" \
     mise exec -- cargo build --release
-  name=xihomo profile=release
+  name=Xihomo profile=release
 fi
 app=target/$profile/$name.app
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-# xihomo is MPL-2.0. The bundled Mihomo core is a separate program under GPL-3.0.
+# Xihomo is MPL-2.0. The bundled Mihomo core is a separate program under GPL-3.0.
 cp LICENSE "$app/Contents/Resources/LICENSE"
 cp "$gpl" "$app/Contents/Resources/mihomo-LICENSE"
 cp "target/$profile/xihomo" "$app/Contents/MacOS/xihomo"

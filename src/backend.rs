@@ -845,7 +845,7 @@ impl Actor {
         let mut logs = self.logs.lock().unwrap();
         logs.push(LogLine {
             level: if error { "error" } else { "info" }.into(),
-            text: format!("xihomo: {text}").into(),
+            text: format!("Xihomo: {text}").into(),
         });
         self.log_tx.send_replace(logs.generation);
     }
@@ -1122,7 +1122,7 @@ impl Actor {
             let keys = candidate.ignored.join(", ");
             self.log(
                 false,
-                &format!("Profile {name}: {keys} ignored (set by xihomo)"),
+                &format!("Profile {name}: {keys} ignored (set by Xihomo)"),
             );
         }
         if !candidate.notices.is_empty() {

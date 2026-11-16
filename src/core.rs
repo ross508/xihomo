@@ -49,7 +49,7 @@ pub async fn ensure_ports_free(ports: &[u16], as_root: bool) -> Result<()> {
                 attempt += 1;
                 if attempt >= 6 && !(closing && start.elapsed() < CLOSING_WAIT) {
                     bail!(
-                        "port {port} is in use by another process ({e}), so xihomo will not control it"
+                        "port {port} is in use by another process ({e}), so Xihomo will not control it"
                     );
                 }
                 tokio::time::sleep(Duration::from_millis(60)).await;
@@ -131,7 +131,7 @@ pub fn authorized(exe: &Path) -> bool {
 const AUTHORIZE: [&str; 4] = [
     "on run argv",
     "set p to quoted form of item 1 of argv",
-    "do shell script \"/usr/sbin/chown root:wheel \" & p & \" && /bin/chmod 4755 \" & p with prompt \"xihomo needs administrator rights so Mihomo can turn on TUN.\" with administrator privileges",
+    "do shell script \"/usr/sbin/chown root:wheel \" & p & \" && /bin/chmod 4755 \" & p with prompt \"Xihomo needs administrator rights so Mihomo can turn on TUN.\" with administrator privileges",
     "end run",
 ];
 
@@ -144,7 +144,7 @@ const AUTHORIZE_COPY: [&str; 6] = [
     "set s to quoted form of item 1 of argv",
     "set d to quoted form of item 2 of argv",
     "set p to quoted form of item 3 of argv",
-    "do shell script \"/bin/mkdir -p \" & d & \" && /bin/cp -X \" & s & \" \" & p & \" && /usr/sbin/chown root:wheel \" & p & \" && /bin/chmod 4755 \" & p with prompt \"xihomo needs administrator rights so Mihomo can turn on TUN.\" with administrator privileges",
+    "do shell script \"/bin/mkdir -p \" & d & \" && /bin/cp -X \" & s & \" \" & p & \" && /usr/sbin/chown root:wheel \" & p & \" && /bin/chmod 4755 \" & p with prompt \"Xihomo needs administrator rights so Mihomo can turn on TUN.\" with administrator privileges",
     "end run",
 ];
 

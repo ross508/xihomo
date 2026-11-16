@@ -40,16 +40,16 @@ jobs:
 
       # Checks the core's digest and version, the signature, and that no local path or signing
       # identity is inside.
-      - name: Build xihomo.app
+      - name: Build Xihomo.app
         run: scripts/bundle.sh
 
       - name: Package the DMG
         run: |
           dmg=xihomo-$VERSION.dmg
           mkdir dist stage
-          ditto target/release/xihomo.app stage/xihomo.app
+          ditto target/release/Xihomo.app stage/Xihomo.app
           ln -s /Applications stage/Applications
-          hdiutil create -volname xihomo -srcfolder stage -format UDZO "dist/$dmg"
+          hdiutil create -volname Xihomo -srcfolder stage -format UDZO "dist/$dmg"
           (cd dist && shasum -a 256 "$dmg" > "$dmg.sha256")
           cat "dist/$dmg.sha256"
 
@@ -76,14 +76,14 @@ jobs:
           brew install --cask ross508/tap/xihomo
           \`\`\`
 
-          Or download the DMG below. xihomo is ad-hoc signed and not notarized, so macOS blocks its first launch: allow it in System Settings → Privacy & Security → Open Anyway. See the README's Security section.
+          Or download the DMG below. Xihomo is ad-hoc signed and not notarized, so macOS blocks its first launch: allow it in System Settings → Privacy & Security → Open Anyway. See the README's Security section.
 
           - Version: $VERSION
           - Built-in Mihomo core: $core, the official release binary, unmodified, licensed under GPL-3.0. Source: https://github.com/MetaCubeX/mihomo/tree/$core
           - SHA-256 of xihomo-$VERSION.dmg: \`$sha\`
           NOTES
           gh release create "$GITHUB_REF_NAME" dist/* --draft --verify-tag \
-            --title "xihomo $VERSION" --notes-file notes.md
+            --title "Xihomo $VERSION" --notes-file notes.md
 
   install-check:
     needs: build
@@ -124,7 +124,7 @@ jobs:
 
       - name: Check the installed app
         run: |
-          app=/Applications/xihomo.app
+          app=/Applications/Xihomo.app
           for f in "$app" "$app/Contents/MacOS/mihomo"; do
             if xattr -p com.apple.quarantine "$f" 2>/dev/null; then
               echo "::error::$f is quarantined"
@@ -136,14 +136,14 @@ jobs:
       # First launch with no core downloaded: the built-in core must start.
       - name: Launch it once
         run: |
-          open /Applications/xihomo.app
+          open /Applications/Xihomo.app
           core=$(head -n 1 mihomo-version)
           secret="$HOME/Library/Application Support/xihomo/state/secret"
           for _ in $(seq 1 60); do
             if [ -f "$secret" ] && curl -fs -m 2 -H "Authorization: Bearer $(cat "$secret")" \
               http://127.0.0.1:11000/version | grep -qF "\"$core\""; then
               echo "The built-in core $core runs"
-              pkill -TERM -f "xihomo.app/Contents/MacOS/xihomo$"
+              pkill -TERM -f "Xihomo.app/Contents/MacOS/xihomo$"
               exit 0
             fi
             sleep 1

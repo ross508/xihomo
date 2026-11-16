@@ -100,15 +100,15 @@ pub fn about() {
 pub fn app_menus() -> Vec<Menu> {
     vec![
         Menu {
-            name: "xihomo".into(),
+            name: "Xihomo".into(),
             items: vec![
-                MenuItem::action("About xihomo", About),
+                MenuItem::action("About Xihomo", About),
                 MenuItem::separator(),
-                MenuItem::action("Hide xihomo", Hide),
+                MenuItem::action("Hide Xihomo", Hide),
                 MenuItem::action("Hide Others", HideOthers),
                 MenuItem::action("Show All", ShowAll),
                 MenuItem::separator(),
-                MenuItem::action("Quit xihomo", ui::Quit),
+                MenuItem::action("Quit Xihomo", ui::Quit),
             ],
         },
         Menu {
@@ -165,8 +165,8 @@ mod tests {
             .collect();
         let expected = [
             (
-                "xihomo",
-                "About xihomo, -, Hide xihomo, Hide Others, Show All, -, Quit xihomo",
+                "Xihomo",
+                "About Xihomo, -, Hide Xihomo, Hide Others, Show All, -, Quit Xihomo",
             ),
             ("Edit", "Cut, Copy, Paste, Select All"),
             ("Window", "Control, Connections, Logs, Settings, -, Close"),

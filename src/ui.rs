@@ -2499,7 +2499,7 @@ impl AppState {
             .child(
                 self.note_icon(
                     "profiles-info",
-                    "Ports, API, LAN access and TUN come from xihomo. Profiles cannot change them.",
+                    "Ports, API, LAN access and TUN come from Xihomo. Profiles cannot change them.",
                     p,
                     cx,
                 )

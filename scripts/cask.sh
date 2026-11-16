@@ -11,18 +11,18 @@ cask "xihomo" do
   sha256 "$sha256"
 
   url "$url"
-  name "xihomo"
+  name "Xihomo"
   desc "Native menu bar GUI for Mihomo"
   homepage "https://github.com/ross508/xihomo"
 
   depends_on arch: :arm64
   depends_on macos: :ventura
 
-  app "xihomo.app"
+  app "Xihomo.app"
 
   # Ad-hoc signed and not notarized: without this, Gatekeeper blocks the first launch.
   postflight_steps do
-    run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{appdir}}/xihomo.app"]
+    run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{appdir}}/Xihomo.app"]
   end
 
   # Quitting releases the system proxy and stops the core before the app is replaced.

@@ -484,7 +484,7 @@ local_test!(api_changes_restart_the_core_with_the_new_values, a, _rx, {
             .lock()
             .unwrap()
             .iter()
-            .any(|l| !l.text.starts_with("xihomo"));
+            .any(|l| !l.text.starts_with("Xihomo"));
         if seen {
             break;
         }

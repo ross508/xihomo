@@ -159,7 +159,7 @@ pub fn import(paths: &Paths, source: &Path) -> Result<String> {
 }
 
 /// The smallest profile both `compose` and `mihomo -t` accept; an empty file passes neither.
-const DEFAULT_PROFILE: &str = "# Created by xihomo because profiles/ had no profile.\n# Replace it, or link another YAML file from Settings.\nmode: direct\n";
+const DEFAULT_PROFILE: &str = "# Created by Xihomo because profiles/ had no profile.\n# Replace it, or link another YAML file from Settings.\nmode: direct\n";
 
 /// Gives a first run something to select. Never overwrites: an existing `default.yaml`, valid or
 /// not, already counts as a profile.
@@ -426,7 +426,7 @@ pub fn compose(source: &[u8], overrides: &[u8], rt: &Runtime) -> Result<Composed
     let mut notices = Vec::new();
     if !refused.is_empty() {
         notices.push(format!(
-            "overrides.yaml: {} ignored (set by xihomo)",
+            "overrides.yaml: {} ignored (set by Xihomo)",
             refused.join(", ")
         ));
     }
@@ -440,7 +440,7 @@ pub fn compose(source: &[u8], overrides: &[u8], rt: &Runtime) -> Result<Composed
         if l.iter().any(|l| l.get("type").and_then(Value::as_str) == Some("tun")));
     let ignored = own(&mut map, rt);
     if had_tun {
-        notices.push("TUN listeners were removed: xihomo sets up TUN itself".to_owned());
+        notices.push("TUN listeners were removed: Xihomo sets up TUN itself".to_owned());
     }
     Ok(Composed {
         yaml: yaml_serde::to_string(&map)?,
@@ -567,7 +567,7 @@ mod tests {
         assert_eq!(v["rules"][0].as_str(), Some("MATCH,DIRECT"));
         assert_eq!(
             c.notices,
-            ["overrides.yaml: log-level ignored (set by xihomo)"]
+            ["overrides.yaml: log-level ignored (set by Xihomo)"]
         );
         assert_eq!(
             c.ignored,
@@ -588,7 +588,7 @@ mod tests {
         };
         let c = compose(source, b"tun: {enable: false}\n", &rt).unwrap();
         assert_eq!(c.ignored, ["tun"]);
-        assert_eq!(c.notices, ["overrides.yaml: tun ignored (set by xihomo)"]);
+        assert_eq!(c.notices, ["overrides.yaml: tun ignored (set by Xihomo)"]);
         let on = parsed(&c.yaml);
         assert_eq!(
             on["tun"],
@@ -680,7 +680,7 @@ mod tests {
         assert_eq!(v["log-level"].as_str(), Some("info"));
         assert_eq!(
             c.notices,
-            ["overrides.yaml: mixed-port, secret, port, log-level ignored (set by xihomo)"]
+            ["overrides.yaml: mixed-port, secret, port, log-level ignored (set by Xihomo)"]
         );
         assert_eq!(c.ignored, ["mixed-port"], "only the profile's own keys");
     }
