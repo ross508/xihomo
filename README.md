@@ -24,6 +24,10 @@ Or download the DMG from [Releases](https://github.com/ross508/xihomo/releases) 
 xattr -dr com.apple.quarantine /Applications/xihomo.app
 ```
 
+## Uninstall
+
+`brew uninstall --cask xihomo` removes the app and keeps its data. `brew uninstall --zap --cask xihomo` also removes `~/Library/Application Support/xihomo`, which holds downloaded cores, TUN's root-owned copy and runtime state. Neither touches your settings and profiles in `~/.config/xihomo`, so delete that yourself if you no longer need it.
+
 ## Security
 
 - xihomo is ad-hoc signed and not notarized, so macOS cannot tell who built it.

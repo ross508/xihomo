@@ -28,9 +28,10 @@ cask "xihomo" do
   # Quitting releases the system proxy and stops the core before the app is replaced.
   uninstall quit: "io.github.ross508.xihomo"
 
+  # Never ~/.config/xihomo: it holds the user's settings and profiles, often kept in a dotfiles repo.
   zap trash: [
-    "~/.config/xihomo",
     "~/Library/Application Support/xihomo",
+    "~/Library/Preferences/io.github.ross508.xihomo.plist",
   ]
 end
 CASK
